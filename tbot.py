@@ -10,8 +10,6 @@ try:
 except ImportError:
     readline = None
 
-_ANSI_RE = __import__("re").compile(r'\033\[[0-9;]*[a-zA-Z]')
-
 CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
@@ -372,12 +370,6 @@ def execute_tool_calls(tool_calls, messages, cfg):
 
 # ── UI ──────────────────────────────────────────────────────────
 
-def safe_prompt(s):
-    if readline is None:
-        return s
-    return _ANSI_RE.sub(lambda m: "\001" + m.group(0) + "\002", s)
-
-
 def setup_history():
     if readline is None:
         return
@@ -452,12 +444,18 @@ def main():
 
     setup_history()
     atexit.register(save_history)
+    if readline is not None:
+        readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
     messages = [{"role": "system", "content": cfg["system_prompt"]}] if cfg["system_prompt"] else []
     show_banner(cfg)
 
     while True:
         try:
-            line = input(safe_prompt(f"{C.BOLD}{C.BLUE}>>>{C.RESET} "))
+            if readline is not None:
+                line = input(">>> ")
+            else:
+                line = input(f"{C.BOLD}{C.BLUE}>>>{C.RESET} ")
+            sys.stdout.write(C.RESET)
         except (EOFError, KeyboardInterrupt):
             save_history()
             print(f"\n{C.YELLOW}bye{C.RESET}")
