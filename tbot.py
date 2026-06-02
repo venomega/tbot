@@ -168,7 +168,7 @@ def default_cfg():
         "api_key": "",
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
-        "max_tokens": 1048576,
+        "max_tokens": 524288,
         "system_prompt": "You are a helpful assistant with access to PC tools.",
         "max_history_chars": 200000,
         "tools_enabled": True,
