@@ -2,7 +2,7 @@
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
 import os, sys, json, time, subprocess, platform, re, html
-import argparse, textwrap, atexit
+import argparse, textwrap, atexit, importlib.util
 from pathlib import Path
 import requests
 try:
@@ -13,6 +13,7 @@ except ImportError:
 CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
+SKILLS_DIR = CONFIG_DIR / "skills"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class C:
@@ -257,7 +258,139 @@ TOOL_HANDLERS = {
     "search_web": handle_search_web,
 }
 
-# ── Config ──────────────────────────────────────────────────────
+# ── Skills (SKILL.md v1 — directory format) ───────────────────
+
+_skill_cache = None
+_skill_teardowns = []
+
+
+try:
+    import yaml
+    _has_yaml = True
+except ImportError:
+    _has_yaml = False
+
+
+def _parse_skill_md(path):
+    """Parse SKILL.md with YAML frontmatter (between --- delimiters)."""
+    text = path.read_text(encoding="utf-8")
+    m = re.match(r'^---\s*\n(.*?)\n(?:---|\.\.\.)\s*\n(.*)', text, re.DOTALL)
+    if not m:
+        return None
+    raw_yaml = m.group(1)
+    if _has_yaml:
+        meta = yaml.safe_load(raw_yaml) or {}
+    else:
+        meta = {}
+        for line in raw_yaml.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if ':' in line:
+                key, _, val = line.partition(':')
+                key = key.strip()
+                val = val.strip().strip('"').strip("'")
+                if val.lower() in ('true', 'yes'):
+                    val = True
+                elif val.lower() in ('false', 'no'):
+                    val = False
+                else:
+                    try:
+                        val = int(val)
+                    except ValueError:
+                        pass
+                meta[key] = val
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["_doc"] = m.group(2).strip()
+    return meta
+
+
+def load_skills():
+    global _skill_cache, _skill_teardowns
+    if _skill_cache is not None:
+        return _skill_cache
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    for fn in _skill_teardowns:
+        try:
+            fn()
+        except Exception:
+            pass
+    _skill_teardowns.clear()
+    default_schema = {
+        "type": "object",
+        "properties": {"input": {"type": "string", "description": "Input"}},
+        "required": ["input"],
+    }
+    skills = []
+    for entry in sorted(SKILLS_DIR.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("_"):
+            continue
+        md_path = entry / "SKILL.md"
+        if not md_path.exists():
+            continue
+        meta = _parse_skill_md(md_path)
+        if not meta:
+            continue
+        name = meta.get("name", entry.name)
+        desc = meta.get("description", "") or meta["_doc"][:80] if meta.get("_doc") else name
+        schema = meta.get("schema", default_schema)
+        doc = meta.get("_doc")
+        handler_file = meta.get("handler", "run.py")
+        handler_path = entry / handler_file
+
+        if handler_path.exists():
+            spec = importlib.util.spec_from_file_location(f"tbot_skill_{name}", handler_path)
+            if spec and spec.loader:
+                mod = importlib.util.module_from_spec(spec)
+                try:
+                    spec.loader.exec_module(mod)
+                except Exception:
+                    continue
+                run_fn = getattr(mod, "run", None)
+                if not callable(run_fn):
+                    continue
+                setup_fn = getattr(mod, "setup", None)
+                if callable(setup_fn):
+                    try:
+                        setup_fn()
+                    except Exception:
+                        pass
+                teardown_fn = getattr(mod, "teardown", None)
+                if callable(teardown_fn):
+                    _skill_teardowns.append(teardown_fn)
+                skills.append((name, desc, schema, run_fn, None))
+        elif doc:
+            skills.append((name, desc, schema, None, doc))
+    _skill_cache = skills
+    return skills
+
+
+def clear_skill_cache():
+    global _skill_cache, _skill_teardowns
+    _skill_cache = None
+    _skill_teardowns.clear()
+
+
+def skills_to_tools(skills):
+    return [
+        {"type": "function", "function": {"name": f"skill_{n}", "description": d, "parameters": s}}
+        for n, d, s, *_ in skills
+    ]
+
+
+def skill_tool_handler(name, args, messages=None):
+    for n, desc, schema, run_fn, doc in load_skills():
+        if n == name:
+            if doc and run_fn is None:
+                if messages is not None:
+                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
+                return f"Skill '{name}' loaded. Follow the instructions above."
+            try:
+                return str(run_fn(args))
+            except Exception as e:
+                return f"Skill error: {e}"
+    return f"Skill '{name}' not found"
 
 def default_cfg():
     return {
@@ -439,6 +572,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
         print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{json.dumps(args)[:200]}{C.RESET}")
 
         handler = TOOL_HANDLERS.get(name)
+        if not handler and name.startswith("skill_"):
+            handler = lambda a, _n=name[6:], _msgs=messages: skill_tool_handler(_n, a, _msgs)
         if not handler:
             result = f"Error: unknown tool '{name}'"
         else:
@@ -502,12 +637,19 @@ def print_help():
     print(f"  /edit  [text]      View or replace last user message")
     print(f"  /tools             Toggle tool calling on/off")
     print(f"  /trust             Toggle auto-approve tools")
+    print(f"  /skills            List installed skills")
+    print(f"  /skill add|rm|show  Manage skills")
     print(f"  /exit              Quit")
     print()
-    print(f"{C.CYAN}Available tools:{C.RESET}")
+    print(f"{C.CYAN}Built-in tools:{C.RESET}")
     for t in TOOLS:
         fn = t["function"]
         print(f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description']}{C.RESET}")
+    skills = load_skills()
+    if skills:
+        print(f"\n{C.CYAN}Skills:{C.RESET}")
+        for name, desc, *_ in skills:
+            print(f"  {C.MAGENTA}skill_{name}{C.RESET}  {C.GRAY}{desc}{C.RESET}")
 
 # ── Main ────────────────────────────────────────────────────────
 
@@ -620,6 +762,80 @@ def main():
                 else:
                     print(f"{C.YELLOW}last message:{C.RESET}")
                     print(messages[last_user]["content"])
+            elif cmd == "skills":
+                skills = load_skills()
+                if not skills:
+                    print(f"{C.YELLOW}no skills installed{C.RESET}")
+                    print(f"{C.GRAY}create one: /skill add <name>{C.RESET}")
+                else:
+                    print(f"{C.CYAN}skills ({len(skills)}):{C.RESET}")
+                    for name, desc, *_ in skills:
+                        print(f"  {C.GREEN}{name}{C.RESET}  {C.GRAY}{desc}{C.RESET}")
+            elif cmd == "skill":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if sub_cmd == "add" and sub_arg:
+                    name = sub_arg.strip()
+                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+                        print(f"{C.RED}invalid skill name{C.RESET}")
+                    else:
+                        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+                        skill_dir = SKILLS_DIR / name
+                        if skill_dir.exists():
+                            print(f"{C.RED}skill '{name}' already exists{C.RESET}")
+                        else:
+                            skill_dir.mkdir(parents=True)
+                            md = f'''---
+name: "{name}"
+description: "{name} skill"
+schema:
+  type: object
+  properties:
+    input:
+      type: string
+      description: Input
+  required: [input]
+handler: run.py
+---
+
+# {name}
+
+Replace this with usage documentation.
+'''
+                            (skill_dir / "SKILL.md").write_text(md)
+                            py = '''def run(args):
+    return f"Hello from {args.get('input', '')}"
+'''
+                            (skill_dir / "run.py").write_text(py)
+                            clear_skill_cache()
+                            print(f"{C.GREEN}skill '{name}' created{C.RESET}")
+                            print(f"{C.GRAY}  {skill_dir}/SKILL.md{C.RESET}")
+                            print(f"{C.GRAY}  {skill_dir}/run.py{C.RESET}")
+                elif sub_cmd == "rm" and sub_arg:
+                    skill_dir = SKILLS_DIR / sub_arg.strip()
+                    if not skill_dir.exists() or not skill_dir.is_dir():
+                        print(f"{C.RED}skill '{sub_arg}' not found{C.RESET}")
+                    else:
+                        import shutil
+                        shutil.rmtree(skill_dir)
+                        clear_skill_cache()
+                        print(f"{C.GREEN}skill '{sub_arg}' removed{C.RESET}")
+                elif sub_cmd == "show" and sub_arg:
+                    skill_dir = SKILLS_DIR / sub_arg.strip()
+                    if not skill_dir.exists() or not skill_dir.is_dir():
+                        print(f"{C.RED}skill '{sub_arg}' not found{C.RESET}")
+                    else:
+                        for f in sorted(skill_dir.iterdir()):
+                            print(f"{C.YELLOW}── {f.name} ──{C.RESET}")
+                            print(f.read_text().rstrip())
+                            print()
+                else:
+                    print(f"{C.YELLOW}usage:{C.RESET}")
+                    print(f"  /skill add <name>    create a new skill")
+                    print(f"  /skill rm <name>     delete a skill")
+                    print(f"  /skill show <name>   show skill files")
+                    print(f"  /skills              list all skills")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
@@ -636,7 +852,12 @@ def main():
                     messages.pop(i)
                     break
 
-        tools = TOOLS if cfg["tools_enabled"] else None
+        tools = None
+        if cfg["tools_enabled"]:
+            tools = list(TOOLS)
+            skills = load_skills()
+            if skills:
+                tools += skills_to_tools(skills)
         max_rounds = 12
         round_n = 0
 
