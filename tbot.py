@@ -94,6 +94,22 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Apply a surgical find-and-replace edit to a file. Replaces only the FIRST occurrence of 'find' with 'replace'. Use this instead of write_file when you need to change specific lines while preserving the rest.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to edit"},
+                    "find": {"type": "string", "description": "The exact text to search for (first occurrence)"},
+                    "replace": {"type": "string", "description": "The replacement text"},
+                },
+                "required": ["path", "find", "replace"],
+            },
+        },
+    },
 ]
 
 
@@ -144,6 +160,25 @@ def handle_list_directory(args):
         return f"Error listing directory: {e}"
 
 
+def handle_edit_file(args):
+    path = Path(args["path"]).expanduser().resolve()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
+    find = args["find"]
+    replace = args["replace"]
+    idx = text.find(find)
+    if idx == -1:
+        return f"Error: could not find:\n{find[:200]}"
+    new_text = text[:idx] + replace + text[idx + len(find):]
+    try:
+        path.write_text(new_text, encoding="utf-8")
+    except Exception as e:
+        return f"Error writing file: {e}"
+    return f"Replaced 1 occurrence in {path}"
+
+
 def handle_get_system_info(_args):
     return json.dumps({
         "system": platform.system(),
@@ -164,6 +199,7 @@ TOOL_HANDLERS = {
     "write_file": handle_write_file,
     "list_directory": handle_list_directory,
     "get_system_info": handle_get_system_info,
+    "edit_file": handle_edit_file,
 }
 
 # ── Config ──────────────────────────────────────────────────────
@@ -408,6 +444,7 @@ def print_help():
     print(f"  /model [name]      Show or switch model")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
+    print(f"  /edit  [text]      View or replace last user message")
     print(f"  /tools             Toggle tool calling on/off")
     print(f"  /trust             Toggle auto-approve tools")
     print(f"  /exit              Quit")
@@ -514,6 +551,20 @@ def main():
                 cfg["trust_mode"] = not cfg["trust_mode"]
                 save_cfg(cfg)
                 print(f"{C.GREEN}trust {'on' if cfg['trust_mode'] else 'off'}{C.RESET}")
+            elif cmd == "edit":
+                last_user = -1
+                for i in range(len(messages) - 1, -1, -1):
+                    if messages[i]["role"] == "user":
+                        last_user = i
+                        break
+                if last_user == -1:
+                    print(f"{C.RED}no user message to edit{C.RESET}")
+                elif arg:
+                    messages[last_user]["content"] = arg
+                    print(f"{C.GREEN}last message updated{C.RESET}")
+                else:
+                    print(f"{C.YELLOW}last message:{C.RESET}")
+                    print(messages[last_user]["content"])
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
