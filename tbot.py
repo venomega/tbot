@@ -210,6 +210,24 @@ def resolve_key(cfg):
     return key
 
 
+def show_error(title, detail, hint=""):
+    width = min(72, os.get_terminal_size().columns if hasattr(os, 'get_terminal_size') else 72)
+    print(f"\n{C.RED}╭─{'─' * (width-4)}─╮{C.RESET}")
+    print(f"{C.RED}│{C.RESET} {C.BOLD}{C.RED}✗ {title}{C.RESET}{' ' * (width - len(title) - 7)}{C.RED}│{C.RESET}")
+    print(f"{C.RED}│{C.RESET} {C.RED}{'─' * (width - 6)}{C.RESET} {C.RED}│{C.RESET}")
+    for line in detail.split("\n"):
+        wrapped = textwrap.wrap(line, width - 6)
+        for w in wrapped or [""]:
+            print(f"{C.RED}│{C.RESET} {C.GRAY}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}")
+    if hint:
+        print(f"{C.RED}│{C.RESET} {' ' * (width - 5)}{C.RED}│{C.RESET}")
+        for line in hint.split("\n"):
+            wrapped = textwrap.wrap(line, width - 6)
+            for w in wrapped or [""]:
+                print(f"{C.RED}│{C.RESET} {C.YELLOW}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}")
+    print(f"{C.RED}╰─{'─' * (width-4)}─╯{C.RESET}\n")
+
+
 def chat_completion(messages, cfg, stream=True, tools=None):
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -229,11 +247,25 @@ def chat_completion(messages, cfg, stream=True, tools=None):
     try:
         resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, stream=stream, timeout=120)
     except requests.exceptions.Timeout:
-        return {"error": "Request timed out"}
+        return {"error": "timeout", "title": "Connection timed out",
+                "detail": "The request to OpenRouter took too long to respond.",
+                "hint": "Check your internet connection or try again. If the problem persists, the service may be slow."}
+    except requests.exceptions.SSLError as e:
+        return {"error": "ssl", "title": "SSL certificate error",
+                "detail": f"Could not verify the SSL certificate: {e}",
+                "hint": "Check your system date/time. If on Termux, try: pkg install ca-certificates"}
     except requests.exceptions.ConnectionError:
-        return {"error": "Connection failed"}
+        return {"error": "connection", "title": "Could not connect to OpenRouter",
+                "detail": "No route to host. Your device may be offline or OpenRouter is blocked.",
+                "hint": "Check your internet connection with: ping openrouter.ai\nIf on Termux, try: pkg install openssl && pkg reinstall python"}
+    except requests.exceptions.ProxyError:
+        return {"error": "proxy", "title": "Proxy connection failed",
+                "detail": "Could not connect through the configured proxy.",
+                "hint": "Check your proxy settings or disable the proxy and try again."}
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": "unknown", "title": "Unexpected error",
+                "detail": str(e),
+                "hint": "This is an unexpected error. Check your setup and try again."}
 
     if resp.status_code != 200:
         try:
@@ -242,7 +274,9 @@ def chat_completion(messages, cfg, stream=True, tools=None):
             msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         except Exception:
             msg = resp.text[:300]
-        return {"error": f"HTTP {resp.status_code}: {msg}"}
+        return {"error": f"http_{resp.status_code}", "title": f"HTTP {resp.status_code}",
+                "detail": msg,
+                "hint": "The API returned an error. Check your API key, model name, and OpenRouter status at https://status.openrouter.ai"}
 
     return {"stream": resp}
 
@@ -251,10 +285,17 @@ def chat_completion(messages, cfg, stream=True, tools=None):
 def parse_stream(resp):
     content_parts = []
     tool_calls = {}
-    for raw in resp.iter_lines():
+    try:
+        iterator = resp.iter_lines()
+    except Exception:
+        return None, None
+    for raw in iterator:
         if not raw:
             continue
-        raw = raw.decode("utf-8", errors="replace")
+        try:
+            raw = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
         if not raw.startswith("data: "):
             continue
         chunk = raw[6:].strip()
@@ -462,7 +503,9 @@ def main():
             result = chat_completion(messages, cfg, stream=True, tools=tools)
 
             if "error" in result:
-                print(f"{C.RED}✗ {result['error']}{C.RESET}")
+                show_error(result.get("title", "Error"),
+                          result.get("detail", result["error"]),
+                          result.get("hint", ""))
                 if round_n == 1:
                     messages.pop()
                 break
@@ -483,7 +526,9 @@ def main():
             break
 
         if round_n >= max_rounds:
-            print(f"{C.RED}max tool rounds reached{C.RESET}")
+            show_error("Max tool rounds reached",
+                       f"The model used {max_rounds} consecutive tool calls without producing a final response.",
+                       "This may indicate a bug in the model or an infinite loop. Try a different model.")
 
 
 if __name__ == "__main__":
