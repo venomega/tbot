@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform
+import os, sys, json, time, subprocess, platform, re, html
 import argparse, textwrap, atexit
 from pathlib import Path
 import requests
@@ -97,6 +97,21 @@ TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "search_web",
+            "description": "Search the web using DuckDuckGo. Returns page titles, snippets, and URLs. Use this to get current information, documentation, or answers to questions you don't know.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "max_results": {"type": "integer", "description": "Number of results", "default": 5},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "edit_file",
             "description": "Apply a surgical find-and-replace edit to a file. Replaces only the FIRST occurrence of 'find' with 'replace'. Use this instead of write_file when you need to change specific lines while preserving the rest.",
             "parameters": {
@@ -160,6 +175,45 @@ def handle_list_directory(args):
         return f"Error listing directory: {e}"
 
 
+def handle_search_web(args):
+    query = args["query"]
+    max_results = min(args.get("max_results", 5), 15)
+    current_year = str(time.localtime().tm_year)
+    if current_year not in query:
+        query = f"{query} {current_year}"
+    try:
+        resp = requests.post("https://html.duckduckgo.com/html/", data={"q": query, "df": f"{current_year}-01-01..{current_year}-12-31"}, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+    except Exception as e:
+        return f"Search failed: {e}"
+    results = []
+    blocks = re.split(r'<div[^>]*class="[^"]*result__body[^"]*"', resp.text)[1:]
+    for block in blocks[:max_results]:
+        m = re.search(r'href="(https?://[^"]+)"[^>]*>[^<]*<[^>]+class="result__a"', block)
+        if not m:
+            m = re.search(r'class="result__a"[^>]+href="(https?://[^"]*)"', block)
+        if not m:
+            continue
+        href = html.unescape(m.group(1))
+        tm = re.search(r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL)
+        title = re.sub(r'<[^>]+>', '', tm.group(1)).strip() if tm else ""
+        sm = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', block, re.DOTALL)
+        snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip() if sm else ""
+        title = html.unescape(title)
+        snippet = html.unescape(snippet)
+        if title:
+            results.append((title, snippet, href))
+    if not results:
+        return "No results found."
+    out = []
+    for title, snippet, href in results:
+        out.append(f"• {title}")
+        if snippet:
+            out.append(f"  {snippet[:200]}")
+        out.append(f"  {href}")
+    return "\n".join(out)
+
+
 def handle_edit_file(args):
     path = Path(args["path"]).expanduser().resolve()
     try:
@@ -200,6 +254,7 @@ TOOL_HANDLERS = {
     "list_directory": handle_list_directory,
     "get_system_info": handle_get_system_info,
     "edit_file": handle_edit_file,
+    "search_web": handle_search_web,
 }
 
 # ── Config ──────────────────────────────────────────────────────
