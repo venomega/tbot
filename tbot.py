@@ -858,7 +858,7 @@ Replace this with usage documentation.
             skills = load_skills()
             if skills:
                 tools += skills_to_tools(skills)
-        max_rounds = 12
+        max_rounds = 90
         round_n = 0
 
         while round_n < max_rounds:
