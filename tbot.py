@@ -2,12 +2,19 @@
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
 import os, sys, json, time, subprocess, platform
-import argparse, textwrap
+import argparse, textwrap, atexit
 from pathlib import Path
 import requests
+try:
+    import readline
+except ImportError:
+    readline = None
+
+_ANSI_RE = __import__("re").compile(r'\033\[[0-9;]*[a-zA-Z]')
 
 CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+HISTORY_FILE = CONFIG_DIR / "history.txt"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class C:
@@ -365,6 +372,33 @@ def execute_tool_calls(tool_calls, messages, cfg):
 
 # ── UI ──────────────────────────────────────────────────────────
 
+def safe_prompt(s):
+    if readline is None:
+        return s
+    return _ANSI_RE.sub(lambda m: "\001" + m.group(0) + "\002", s)
+
+
+def setup_history():
+    if readline is None:
+        return
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        readline.read_history_file(str(HISTORY_FILE))
+    except (FileNotFoundError, OSError):
+        pass
+    readline.set_history_length(1000)
+
+
+def save_history():
+    if readline is None:
+        return
+    try:
+        HISTORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(str(HISTORY_FILE))
+    except OSError:
+        pass
+
+
 def show_banner(cfg):
     tools_flag = f"{C.CYAN}tools{C.RESET}" if cfg["tools_enabled"] else f"{C.GRAY}tools off{C.RESET}"
     trust_flag = f"{C.GREEN}trust{C.RESET}" if cfg["trust_mode"] else f"{C.YELLOW}confirm{C.RESET}"
@@ -416,13 +450,16 @@ def main():
     if args.trust:
         cfg["trust_mode"] = True
 
+    setup_history()
+    atexit.register(save_history)
     messages = [{"role": "system", "content": cfg["system_prompt"]}] if cfg["system_prompt"] else []
     show_banner(cfg)
 
     while True:
         try:
-            line = input(f"{C.BOLD}{C.BLUE}>>>{C.RESET} ")
+            line = input(safe_prompt(f"{C.BOLD}{C.BLUE}>>>{C.RESET} "))
         except (EOFError, KeyboardInterrupt):
+            save_history()
             print(f"\n{C.YELLOW}bye{C.RESET}")
             break
 
@@ -437,6 +474,7 @@ def main():
             arg = parts[1] if len(parts) > 1 else ""
 
             if cmd in ("exit", "quit"):
+                save_history()
                 print(f"{C.YELLOW}bye{C.RESET}")
                 break
             elif cmd == "help":
