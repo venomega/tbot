@@ -2,7 +2,7 @@
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
 import os, sys, json, time, subprocess, platform, re, html
-import argparse, textwrap, atexit, importlib.util
+import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
 try:
@@ -27,63 +27,287 @@ class C:
     MAGENTA = "\033[35m"
     GRAY = "\033[90m"
 
-# ── Tool definitions ───────────────────────────────────────────
+# ── Tool definitions (opencode-inspired) ──────────────────────
 
 TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "execute_command",
-            "description": "Run a shell command on the local machine. Returns stdout + stderr.",
+            "name": "invalid",
+            "description": "Reports an invalid tool call. Do not use this tool directly.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute"},
-                    "timeout": {"type": "integer", "description": "Timeout in seconds", "default": 30},
+                    "tool": {"type": "string", "description": "The tool name that was called with invalid arguments"},
+                    "error": {"type": "string", "description": "Description of the validation error"},
                 },
-                "required": ["command"],
+                "required": ["tool", "error"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "read_file",
-            "description": "Read the contents of a file at the given path.",
+            "name": "question",
+            "description": "Ask the user one or more questions and get their answers. Use this when you need clarification or additional information from the user to proceed.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Absolute or relative path to the file"},
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "description": "The complete question to ask"},
+                                "header": {"type": "string", "description": "Very short label (max 30 chars)"},
+                                "options": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "Display text (1-5 words)"},
+                                            "description": {"type": "string", "description": "Explanation of choice"},
+                                        },
+                                        "required": ["label", "description"],
+                                    },
+                                    "description": "Available choices (omit for free-text input)",
+                                },
+                                "multiple": {"type": "boolean", "description": "Allow selecting more than one option"},
+                            },
+                            "required": ["question", "header", "options"],
+                        },
+                        "description": "Questions to ask the user",
+                    },
                 },
-                "required": ["path"],
+                "required": ["questions"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "write_file",
-            "description": "Write content to a file. Creates parent directories if needed.",
+            "name": "bash",
+            "description": "Execute a shell command on the local machine with timeout and working directory support. Runs in the project directory by default. 'cd' commands update the persistent working directory for subsequent tool calls.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path where to write the file"},
-                    "content": {"type": "string", "description": "Content to write"},
+                    "command": {"type": "string", "description": "The command to execute"},
+                    "description": {"type": "string", "description": "Clear concise description of what this command does in 5-10 words"},
+                    "timeout": {"type": "integer", "description": "Timeout in milliseconds (default: 120000)", "default": 120000},
+                    "workdir": {"type": "string", "description": "Working directory (relative paths resolve against current directory). Use this instead of 'cd' commands for one-off directory changes."},
                 },
-                "required": ["path", "content"],
+                "required": ["command", "description"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "list_directory",
-            "description": "List files and directories at the given path.",
+            "name": "read",
+            "description": "Read a file or directory from the local filesystem. Relative paths work fine — do NOT retry with an absolute path if the first call succeeds.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Directory path", "default": "."},
+                    "filePath": {"type": "string", "description": "Path to the file or directory (relative paths resolve against current directory — use them)"},
+                    "offset": {"type": "integer", "description": "The line number to start reading from (1-indexed)"},
+                    "limit": {"type": "integer", "description": "The maximum number of lines to read (defaults to 2000)"},
                 },
+                "required": ["filePath"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Fast file pattern matching tool that works with any codebase size. Supports glob patterns like '**/*.js' or 'src/**/*.ts'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "The glob pattern to match files against"},
+                    "path": {"type": "string", "description": "The directory to search in. Defaults to current working directory."},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Fast content search tool that searches file contents using regular expressions. Returns file paths and line numbers with matches.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "The regex pattern to search for in file contents"},
+                    "path": {"type": "string", "description": "The directory to search in. Defaults to current working directory."},
+                    "include": {"type": "string", "description": "File pattern to include (e.g. '*.js', '*.{ts,tsx}')"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit",
+            "description": "Performs exact string replacements in files. Replaces oldString with newString. Supports replaceAll and multiple fallback strategies for fuzzy matching.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path to the file (relative paths resolve against current directory)"},
+                    "oldString": {"type": "string", "description": "The text to replace"},
+                    "newString": {"type": "string", "description": "The text to replace it with (must be different from oldString)"},
+                    "replaceAll": {"type": "boolean", "description": "Replace all occurrences of oldString (default false)"},
+                },
+                "required": ["filePath", "oldString", "newString"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write",
+            "description": "Writes a file to the local filesystem. Overwrites existing file if one exists. Creates parent directories if needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filePath": {"type": "string", "description": "Path to the file (relative paths resolve against current directory)"},
+                    "content": {"type": "string", "description": "The content to write to the file"},
+                },
+                "required": ["filePath", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Launch a new agent to handle complex multistep tasks autonomously. Use this for tasks that need independent research or processing.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "A short (3-5 words) description of the task"},
+                    "prompt": {"type": "string", "description": "The task for the agent to perform"},
+                    "subagent_type": {
+                        "type": "string",
+                        "enum": ["general", "explore"],
+                        "description": "The type of agent to use: 'general' for research/execution, 'explore' for codebase exploration",
+                    },
+                    "command": {"type": "string", "description": "The command that triggered this task"},
+                },
+                "required": ["description", "prompt", "subagent_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "webfetch",
+            "description": "Fetches content from a specified URL. Returns the content in text, markdown, or HTML format.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "The URL to fetch content from"},
+                    "format": {
+                        "type": "string",
+                        "enum": ["text", "markdown", "html"],
+                        "description": "The format to return the content in (text, markdown, or html). Defaults to markdown.",
+                    },
+                    "timeout": {"type": "integer", "description": "Optional timeout in seconds (max 120)"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "todowrite",
+            "description": "Create and manage a structured task list for your current session. Helps you track progress and organize complex tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "Brief description of the task"},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed", "cancelled"],
+                                    "description": "Current status of the task",
+                                },
+                                "priority": {
+                                    "type": "string",
+                                    "enum": ["high", "medium", "low"],
+                                    "description": "Priority level of the task",
+                                },
+                            },
+                            "required": ["content", "status", "priority"],
+                        },
+                        "description": "The updated todo list",
+                    },
+                },
+                "required": ["todos"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "websearch",
+            "description": "Search the web using DuckDuckGo and fetch page content. Returns page titles, snippets, URLs, and the actual text content of each page.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "numResults": {"type": "integer", "description": "Number of search results to return (default: 8)"},
+                    "livecrawl": {
+                        "type": "string",
+                        "enum": ["fallback", "preferred"],
+                        "description": "Live crawl mode (default: fallback)",
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["auto", "fast", "deep"],
+                        "description": "Search type (default: auto)",
+                    },
+                    "contextMaxCharacters": {
+                        "type": "integer",
+                        "description": "Maximum characters for context string (default: 10000)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill",
+            "description": "Load a specialized skill that provides domain-specific instructions and workflows. The skill will inject detailed instructions into the conversation context.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "The name of the skill to load from installed skills"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_patch",
+            "description": "Apply a unified format patch to one or more files. The patch text must contain standard unified diff hunks with file paths.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "patchText": {"type": "string", "description": "The full unified diff patch text describing all changes to be made"},
+                },
+                "required": ["patchText"],
             },
         },
     },
@@ -98,87 +322,412 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "search_web",
-            "description": "Search the web using DuckDuckGo. Returns page titles, snippets, and URLs. Use this to get current information, documentation, or answers to questions you don't know.",
+            "name": "install_skill",
+            "description": "Download and install a skill from a URL. The URL must point directly to a raw SKILL.md file or a git repository containing SKILL.md files.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Search query"},
-                    "max_results": {"type": "integer", "description": "Number of results", "default": 5},
+                    "url": {"type": "string", "description": "URL to raw SKILL.md, GitHub repo URL, or gh:user/repo"},
                 },
-                "required": ["query"],
+                "required": ["url"],
             },
         },
     },
     {
         "type": "function",
         "function": {
-            "name": "edit_file",
-            "description": "Apply a surgical find-and-replace edit to a file. Replaces only the FIRST occurrence of 'find' with 'replace'. Use this instead of write_file when you need to change specific lines while preserving the rest.",
+            "name": "create_skill",
+            "description": "Create a new skill with instructions. Skills are instruction sets that guide the model on how to perform specific tasks.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Path to the file to edit"},
-                    "find": {"type": "string", "description": "The exact text to search for (first occurrence)"},
-                    "replace": {"type": "string", "description": "The replacement text"},
+                    "name": {"type": "string", "description": "Skill name — lowercase, alphanumeric and underscores only"},
+                    "description": {"type": "string", "description": "Short description of what the skill does"},
+                    "content": {"type": "string", "description": "Markdown instructions for the model"},
+                    "schema": {"type": "object", "description": "Optional JSON Schema for skill parameters"},
                 },
-                "required": ["path", "find", "replace"],
+                "required": ["name", "description", "content"],
             },
         },
     },
 ]
 
+# ── Alias: read_file → read ─────────────────────────────────
+_read_fn = next(t["function"] for t in TOOLS if t["function"]["name"] == "read")
+TOOLS.append({
+    "type": "function",
+    "function": {
+        **_read_fn,
+        "name": "read_file",
+        "description": "Alias for read. Reads a file. Relative paths work fine — do NOT retry with an absolute path.",
+    },
+})
+del _read_fn
 
-def handle_execute_command(args):
-    cmd = args["command"]
-    timeout = args.get("timeout", 30)
+# ── Project directory context ────────────────────────────────
+
+CURRENT_DIR = Path(os.getcwd()).resolve()
+
+
+def _chdir(path):
+    global CURRENT_DIR
+    CURRENT_DIR = Path(path).expanduser().resolve()
+
+
+def _resolve_path(p, *, also_try_cwd=True):
+    p = Path(p)
+    if not p.is_absolute():
+        resolved = (CURRENT_DIR / p).expanduser().resolve()
+        if also_try_cwd and not resolved.exists():
+            alt = (Path(os.getcwd()) / p).expanduser().resolve()
+            if alt.exists():
+                return alt
+        return resolved
+    return p.expanduser().resolve()
+
+
+# ── Handler helpers ──────────────────────────────────────────
+
+MAX_TOOL_OUTPUT = 8000
+
+
+def _truncate_output(text):
+    if len(text) > MAX_TOOL_OUTPUT:
+        return text[:MAX_TOOL_OUTPUT] + f"\n... (truncated, {len(text)} total chars)"
+    return text
+
+
+def _fetch_page_text(url, max_chars=4000):
+    """Fetch a URL and extract readable text content. Returns None on failure."""
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        resp = requests.get(url, timeout=15, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
+            "Accept": "text/html,text/plain,*/*",
+        })
+        resp.raise_for_status()
+        ct = resp.headers.get("Content-Type", "")
+        if "text/html" not in ct and "text/plain" not in ct:
+            return None
+        text = resp.text
+        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = html.unescape(text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        lines = []
+        for line in text.split('\n'):
+            line = line.strip()
+            if line and len(line) > 40:
+                lines.append(line)
+        text = '\n'.join(lines) if lines else text
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n... (truncated)"
+        return text if len(text) > 100 else None
+    except Exception:
+        return None
+
+
+# ── New / upgraded handlers (opencode-inspired) ──────────────
+
+def handle_invalid(args):
+    return f"The arguments provided to the tool '{args.get('tool', '?')}' are invalid: {args.get('error', 'unknown error')}"
+
+
+def handle_question(args):
+    questions = args.get("questions", [])
+    answers = []
+    for q in questions:
+        header = q.get("header", "")
+        question = q.get("question", "")
+        options = q.get("options", [])
+        multiple = q.get("multiple", False)
+        print(f"\n{C.CYAN}── {header} ──{C.RESET}")
+        print(f"{C.BOLD}{question}{C.RESET}")
+        if options:
+            for i, opt in enumerate(options, 1):
+                desc = opt.get("description", "")
+                print(f"  {C.YELLOW}{i}.{C.RESET} {opt['label']}  {C.GRAY}{desc}{C.RESET}")
+            print(f"  {C.YELLOW}0.{C.RESET} Type your own answer")
+            while True:
+                try:
+                    raw = input(f"{C.GREEN}choice{C.RESET} {'(comma-separated)' if multiple else ''}: ").strip()
+                    if not raw:
+                        continue
+                    parts = [p.strip() for p in raw.split(",") if p.strip()]
+                    selected = []
+                    for p in parts:
+                        if p == "0":
+                            custom = input(f"{C.GREEN}your answer:{C.RESET} ").strip()
+                            if custom:
+                                selected.append(custom)
+                        else:
+                            try:
+                                idx = int(p) - 1
+                                if 0 <= idx < len(options):
+                                    selected.append(options[idx]["label"])
+                            except ValueError:
+                                selected.append(p)
+                    if selected:
+                        answers.append(selected)
+                        break
+                except (EOFError, KeyboardInterrupt):
+                    answers.append([])
+                    break
+        else:
+            try:
+                ans = input(f"{C.GREEN}answer:{C.RESET} ").strip()
+                answers.append([ans] if ans else [])
+            except (EOFError, KeyboardInterrupt):
+                answers.append([])
+    formatted = ", ".join(
+        f'"{q.get("question", "")}"="{", ".join(a) if a else "Unanswered"}"'
+        for q, a in zip(questions, answers)
+    )
+    return f"User has answered your questions: {formatted}. You can now continue with the user's answers in mind."
+
+
+_CD_RE = re.compile(r'^\s*cd\s+(.+?)(?:\s*[;&|#]|$)')
+
+
+def _update_cwd(cmd, last_cwd):
+    """Detect `cd <dir>` in command and update CURRENT_DIR."""
+    m = _CD_RE.match(cmd)
+    if not m:
+        return
+    target = m.group(1).strip().strip("'\"")
+    resolved = _resolve_path(target)
+    if resolved.is_dir():
+        _chdir(resolved)
+
+
+def handle_bash(args):
+    cmd = args["command"]
+    desc = args.get("description", "")
+    timeout_ms = args.get("timeout", 120000)
+    workdir = args.get("workdir")
+    timeout_s = timeout_ms / 1000
+    cwd = str(_resolve_path(workdir)) if workdir else str(CURRENT_DIR)
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=cwd)
         out = r.stdout
         if r.stderr:
             out += "\n--- stderr ---\n" + r.stderr
         if r.returncode != 0:
             out += f"\n--- exit code: {r.returncode} ---"
-        return out.strip() or "(no output)"
+        _update_cwd(cmd, cwd)
+        result = out.strip() or "(no output)"
+        return _truncate_output(result + f"\n\n<cwd>{CURRENT_DIR}</cwd>")
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout}s"
+        return f"Command timed out after {timeout_s}s (cwd: {CURRENT_DIR})"
     except Exception as e:
-        return f"Error: {e}"
+        return f"Error: {e} (cwd: {CURRENT_DIR})"
 
 
-def handle_read_file(args):
-    path = Path(args["path"]).expanduser().resolve()
+def handle_read(args):
+    raw = args.get("filePath", "")
+    if not raw:
+        return "Error: filePath is required"
+    filepath = str(_resolve_path(raw))
+    offset = args.get("offset", 1)
+    limit = args.get("limit", 2000)
+    p = Path(filepath)
+    if not p.exists():
+        return (
+            f"Error: file not found: {filepath}\n"
+            f"(raw input: {raw!r}, CURRENT_DIR: {CURRENT_DIR}, "
+            f"os.getcwd(): {os.getcwd()})\n"
+            f"Use an absolute path like {Path(os.getcwd()) / raw}"
+        )
+    if p.is_dir():
+        entries = sorted(
+            f"{e.name}/" if e.is_dir() else e.name
+            for e in p.iterdir()
+        )
+        total = len(entries)
+        start = max(0, offset - 1)
+        sliced = entries[start:start + limit]
+        result = f"<path>{filepath}</path>\n<type>directory</type>\n<entries>\n"
+        result += "\n".join(sliced)
+        if start + len(sliced) < total:
+            result += f"\n(Showing {len(sliced)} of {total} entries. Use 'offset' parameter to read beyond entry {offset + len(sliced)})"
+        else:
+            result += f"\n({total} entries)"
+        result += "\n</entries>"
+        return result
     try:
-        return path.read_text(encoding="utf-8", errors="replace")
+        text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Error reading file: {e}"
+    lines = text.split("\n")
+    total = len(lines)
+    start = max(0, offset - 1)
+    sliced = lines[start:start + limit]
+    result = f"<path>{filepath}</path>\n<type>file</type>\n<content>\n"
+    for i, line in enumerate(sliced, start + 1):
+        result += f"{i}: {line}\n"
+    last = start + len(sliced)
+    if last < total:
+        result += f"\n(Showing lines {offset}-{last} of {total}. Use offset={last + 1} to continue.)"
+    else:
+        result += f"\n(End of file - total {total} lines)"
+    result += "\n</content>"
+    return result
 
 
-def handle_write_file(args):
-    path = Path(args["path"]).expanduser().resolve()
+def handle_glob(args):
+    pattern = args["pattern"]
+    search_path = args.get("path", ".")
+    import glob as glob_mod
+    p = _resolve_path(search_path)
+    matches = sorted(glob_mod.glob(pattern, root_dir=p, recursive=True))
+    if not matches:
+        matches = sorted(glob_mod.glob(str(p / pattern), recursive=True))
+        if matches:
+            matches = [str(Path(m).relative_to(p)) for m in matches]
+    if not matches:
+        return "No files found matching pattern."
+    limit = 200
+    if len(matches) > limit:
+        return "\n".join(matches[:limit]) + f"\n... ({len(matches) - limit} more matches)"
+    return "\n".join(matches)
+
+
+def handle_grep(args):
+    pattern = args["pattern"]
+    search_path = args.get("path", ".")
+    include = args.get("include")
+    root = _resolve_path(search_path)
+    matches = []
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(args["content"], encoding="utf-8")
-        return f"Written {len(args['content'])} bytes to {path}"
+        import subprocess
+        cmd = ["rg", "-n", pattern, str(root)]
+        if include:
+            cmd.extend(["-g", include])
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if r.returncode not in (0, 1):
+            pass
+        if r.stdout:
+            matches = r.stdout.rstrip().split("\n")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    if not matches:
+        for fpath in root.rglob("*"):
+            if fpath.is_file():
+                if include:
+                    import fnmatch
+                    if not fnmatch.fnmatch(fpath.name, include):
+                        continue
+                try:
+                    text = fpath.read_text(encoding="utf-8", errors="replace")
+                    for i, line in enumerate(text.split("\n"), 1):
+                        if re.search(pattern, line):
+                            rel = fpath.relative_to(root)
+                            matches.append(f"{rel}:{i}:{line[:200]}")
+                except Exception:
+                    continue
+    limit = 500
+    if len(matches) > limit:
+        matches = matches[:limit] + [f"... ({len(matches) - limit} more matches)"]
+    return "\n".join(matches) if matches else "No files found"
+
+
+def handle_edit(args):
+    filepath = str(_resolve_path(args["filePath"]))
+    old = args["oldString"]
+    new = args["newString"]
+    replace_all = args.get("replaceAll", False)
+    if old == new:
+        return "No changes to apply: oldString and newString are identical."
+    p = Path(filepath)
+    if not p.exists():
+        return f"Error: file not found: {filepath}"
+    try:
+        text = p.read_text(encoding="utf-8")
+    except Exception as e:
+        return f"Error reading file: {e}"
+    if not old:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(new, encoding="utf-8")
+        return f"Written {len(new)} bytes to {filepath} (new file)"
+    if replace_all:
+        if old not in text:
+            return f"Error: could not find:\n{old[:500]}"
+        count = text.count(old)
+        new_text = text.replace(old, new)
+        p.write_text(new_text, encoding="utf-8")
+        return f"Replaced {count} occurrence(s) in {filepath}"
+    idx = text.find(old)
+    if idx == -1:
+        return f"Error: could not find:\n{old[:500]}"
+    last_idx = text.rfind(old)
+    if idx != last_idx:
+        return "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
+    new_text = text[:idx] + new + text[idx + len(old):]
+    p.write_text(new_text, encoding="utf-8")
+    return f"Replaced 1 occurrence in {filepath}"
+
+
+def handle_write(args):
+    filepath = str(_resolve_path(args["filePath"]))
+    content = args["content"]
+    p = Path(filepath)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+        return f"Written {len(content)} bytes to {filepath}"
     except Exception as e:
         return f"Error writing file: {e}"
 
 
-def handle_list_directory(args):
-    path = Path(args.get("path", ".")).expanduser().resolve()
+def handle_task(args):
+    desc = args.get("description", "task")
+    prompt = args.get("prompt", "")
+    subagent_type = args.get("subagent_type", "general")
+    return (
+        f"Task '{desc}' would be dispatched to a {subagent_type} subagent.\n"
+        f"Subagent support requires recursive tbot execution.\n"
+        f"Prompt: {prompt[:200]}"
+    )
+
+
+def handle_webfetch(args):
+    url = args["url"]
+    fmt = args.get("format", "markdown")
+    timeout = min(args.get("timeout", 30), 120)
+    if not url.startswith(("http://", "https://")):
+        return "URL must start with http:// or https://"
     try:
-        entries = []
-        for p in path.iterdir():
-            suffix = "/" if p.is_dir() else ""
-            entries.append(f"{p.name}{suffix}")
-        return "\n".join(sorted(entries)) if entries else "(empty directory)"
+        resp = requests.get(url, timeout=timeout, headers={
+            "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
+        })
+        resp.raise_for_status()
     except Exception as e:
-        return f"Error listing directory: {e}"
+        return f"Error fetching URL: {e}"
+    if fmt == "html":
+        return _truncate_output(resp.text)
+    if fmt == "text":
+        text = resp.text
+        text = re.sub(r'<[^>]+>', ' ', text)
+        text = html.unescape(text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return _truncate_output(text)
+    text = _fetch_page_text(url)
+    return text or "(no readable content found)"
 
 
-def handle_search_web(args):
+def handle_todowrite(args):
+    todos = args.get("todos", [])
+    return json.dumps(todos, indent=2)
+
+
+def handle_websearch(args):
     query = args["query"]
-    max_results = min(args.get("max_results", 5), 15)
+    num_results = min(args.get("numResults", 8), 15)
     current_year = str(time.localtime().tm_year)
     if current_year not in query:
         query = f"{query} {current_year}"
@@ -189,7 +738,7 @@ def handle_search_web(args):
         return f"Search failed: {e}"
     results = []
     blocks = re.split(r'<div[^>]*class="[^"]*result__body[^"]*"', resp.text)[1:]
-    for block in blocks[:max_results]:
+    for block in blocks[:num_results]:
         m = re.search(r'href="(https?://[^"]+)"[^>]*>[^<]*<[^>]+class="result__a"', block)
         if not m:
             m = re.search(r'class="result__a"[^>]+href="(https?://[^"]*)"', block)
@@ -207,31 +756,134 @@ def handle_search_web(args):
     if not results:
         return "No results found."
     out = []
-    for title, snippet, href in results:
+    for i, (title, snippet, href) in enumerate(results):
         out.append(f"• {title}")
         if snippet:
-            out.append(f"  {snippet[:200]}")
+            out.append(f"  {snippet[:300]}")
         out.append(f"  {href}")
+        if i < 3:
+            page_text = _fetch_page_text(href)
+            if page_text:
+                out.append(f"  ── page content ({len(page_text)} chars) ──")
+                for line in page_text.split('\n')[:15]:
+                    out.append(f"  {line.strip()}")
     return "\n".join(out)
 
 
-def handle_edit_file(args):
-    path = Path(args["path"]).expanduser().resolve()
-    try:
-        text = path.read_text(encoding="utf-8")
-    except Exception as e:
-        return f"Error reading file: {e}"
-    find = args["find"]
-    replace = args["replace"]
-    idx = text.find(find)
-    if idx == -1:
-        return f"Error: could not find:\n{find[:200]}"
-    new_text = text[:idx] + replace + text[idx + len(find):]
-    try:
-        path.write_text(new_text, encoding="utf-8")
-    except Exception as e:
-        return f"Error writing file: {e}"
-    return f"Replaced 1 occurrence in {path}"
+def handle_skill(args):
+    name = args["name"]
+    skills = load_skills()
+    for n, desc, schema, doc in skills:
+        if n == name:
+            return f"Skill '{name}' loaded. Follow the instructions below.\n\n{doc}"
+    return f"Skill '{name}' not found. Use /skills to list available skills."
+
+
+def handle_apply_patch(args):
+    patch_text = args.get("patchText", "")
+    if not patch_text:
+        return "patchText is required"
+    lines = patch_text.split("\n")
+    files = {}
+    current_file = None
+    current_hunk = []
+    in_hunk = False
+    for line in lines:
+        if line.startswith("--- "):
+            continue
+        if line.startswith("+++ "):
+            current_file = line[4:].strip()
+            files.setdefault(current_file, [])
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            if current_hunk and current_file:
+                files[current_file].append(current_hunk)
+            current_hunk = []
+            in_hunk = True
+            continue
+        if in_hunk and current_file:
+            current_hunk.append(line)
+    if current_hunk and current_file:
+        files[current_file].append(current_hunk)
+    applied = 0
+    errors = []
+    for filepath, hunks in files.items():
+        if filepath == "/dev/null":
+            continue
+        fp = _resolve_path(filepath)
+        if not fp.exists():
+            errors.append(f"file not found: {filepath}")
+            continue
+        try:
+            text = fp.read_text(encoding="utf-8")
+        except Exception as e:
+            errors.append(f"cannot read {filepath}: {e}")
+            continue
+        for hunk in hunks:
+            added_lines = [l[1:] for l in hunk if l.startswith("+")]
+            removed_lines = [l[1:] for l in hunk if l.startswith("-")]
+            context_lines = [l[1:] for l in hunk if l.startswith(" ")]
+            if not removed_lines and not context_lines:
+                text += "\n" + "\n".join(added_lines) + "\n"
+                applied += 1
+                continue
+            old_block = "\n".join(
+                l[1:] for l in hunk if l.startswith("-") or l.startswith(" ")
+            )
+            new_block = "\n".join(
+                l[1:] for l in hunk if l.startswith("+") or l.startswith(" ")
+            )
+            idx = text.find(old_block)
+            if idx == -1:
+                errors.append(f"hunk not found in {filepath}")
+                continue
+            text = text[:idx] + new_block + text[idx + len(old_block):]
+            applied += 1
+        fp.write_text(text, encoding="utf-8")
+    result = f"Patch applied: {applied} hunk(s)"
+    if errors:
+        result += "\nErrors:\n" + "\n".join(errors)
+    return result
+
+
+# ── Legacy handlers (kept) ──────────────────────────────────
+
+def handle_install_skill(args):
+    return _install_skill_from_url(args["url"])
+
+
+def handle_create_skill(args):
+    name = args["name"]
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        return f"{C.RED}invalid skill name — use letters, numbers, underscores{C.RESET}"
+    desc = args.get("description", name)
+    content = args.get("content", "")
+    schema = args.get("schema", {
+        "type": "object",
+        "properties": {"input": {"type": "string", "description": "Input"}},
+        "required": ["input"],
+    })
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    skill_dir = SKILLS_DIR / name
+    if skill_dir.exists():
+        return f"{C.RED}skill '{name}' already exists{C.RESET}"
+    skill_dir.mkdir(parents=True)
+    esc_desc = desc.replace("\\", "\\\\").replace('"', '\\"')
+    esc_schema = json.dumps(schema, indent=2)
+    md = f'''---
+name: "{name}"
+description: "{esc_desc}"
+schema: {esc_schema}
+---
+
+# {name}
+
+{content}
+'''
+    (skill_dir / "SKILL.md").write_text(md, encoding="utf-8")
+    clear_skill_cache()
+    return f"{C.GREEN}skill '{name}' created{C.RESET}"
 
 
 def handle_get_system_info(_args):
@@ -249,19 +901,29 @@ def handle_get_system_info(_args):
 
 
 TOOL_HANDLERS = {
-    "execute_command": handle_execute_command,
-    "read_file": handle_read_file,
-    "write_file": handle_write_file,
-    "list_directory": handle_list_directory,
+    "invalid": handle_invalid,
+    "question": handle_question,
+    "bash": handle_bash,
+    "read": handle_read,
+    "read_file": handle_read,
+    "glob": handle_glob,
+    "grep": handle_grep,
+    "edit": handle_edit,
+    "write": handle_write,
+    "task": handle_task,
+    "webfetch": handle_webfetch,
+    "todowrite": handle_todowrite,
+    "websearch": handle_websearch,
+    "skill": handle_skill,
+    "apply_patch": handle_apply_patch,
     "get_system_info": handle_get_system_info,
-    "edit_file": handle_edit_file,
-    "search_web": handle_search_web,
+    "install_skill": handle_install_skill,
+    "create_skill": handle_create_skill,
 }
 
 # ── Skills (SKILL.md v1 — directory format) ───────────────────
 
 _skill_cache = None
-_skill_teardowns = []
 
 
 try:
@@ -271,9 +933,8 @@ except ImportError:
     _has_yaml = False
 
 
-def _parse_skill_md(path):
-    """Parse SKILL.md with YAML frontmatter (between --- delimiters)."""
-    text = path.read_text(encoding="utf-8")
+def _parse_skill_text(text):
+    """Parse SKILL.md text with YAML frontmatter (between --- delimiters)."""
     m = re.match(r'^---\s*\n(.*?)\n(?:---|\.\.\.)\s*\n(.*)', text, re.DOTALL)
     if not m:
         return None
@@ -306,17 +967,16 @@ def _parse_skill_md(path):
     return meta
 
 
+def _parse_skill_md(path):
+    """Parse SKILL.md file with YAML frontmatter."""
+    return _parse_skill_text(path.read_text(encoding="utf-8"))
+
+
 def load_skills():
-    global _skill_cache, _skill_teardowns
+    global _skill_cache
     if _skill_cache is not None:
         return _skill_cache
     SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-    for fn in _skill_teardowns:
-        try:
-            fn()
-        except Exception:
-            pass
-    _skill_teardowns.clear()
     default_schema = {
         "type": "object",
         "properties": {"input": {"type": "string", "description": "Input"}},
@@ -333,43 +993,196 @@ def load_skills():
         if not meta:
             continue
         name = meta.get("name", entry.name)
-        desc = meta.get("description", "") or meta["_doc"][:80] if meta.get("_doc") else name
+        desc = meta.get("description", "") or (meta["_doc"][:80] if meta.get("_doc") else name)
         schema = meta.get("schema", default_schema)
         doc = meta.get("_doc")
-        handler_file = meta.get("handler", "run.py")
-        handler_path = entry / handler_file
-
-        if handler_path.exists():
-            spec = importlib.util.spec_from_file_location(f"tbot_skill_{name}", handler_path)
-            if spec and spec.loader:
-                mod = importlib.util.module_from_spec(spec)
-                try:
-                    spec.loader.exec_module(mod)
-                except Exception:
-                    continue
-                run_fn = getattr(mod, "run", None)
-                if not callable(run_fn):
-                    continue
-                setup_fn = getattr(mod, "setup", None)
-                if callable(setup_fn):
-                    try:
-                        setup_fn()
-                    except Exception:
-                        pass
-                teardown_fn = getattr(mod, "teardown", None)
-                if callable(teardown_fn):
-                    _skill_teardowns.append(teardown_fn)
-                skills.append((name, desc, schema, run_fn, None))
-        elif doc:
-            skills.append((name, desc, schema, None, doc))
+        if doc:
+            skills.append((name, desc, schema, doc))
     _skill_cache = skills
     return skills
 
 
 def clear_skill_cache():
-    global _skill_cache, _skill_teardowns
+    global _skill_cache
     _skill_cache = None
-    _skill_teardowns.clear()
+
+
+def _install_from_skill_url(skill_url):
+    """Install a skill from a direct URL to SKILL.md."""
+    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        resp = requests.get(skill_url, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return f"{C.RED}download failed: {e}{C.RESET}"
+    text = resp.text
+    if text.strip().startswith("<!DOCTYPE") or text.strip().startswith("<html"):
+        return (f"{C.RED}URL returned HTML (web page), not a SKILL.md file{C.RESET}\n"
+                f"{C.GRAY}Use a raw URL (e.g. raw.githubusercontent.com/...) or a git repo URL{C.RESET}")
+    meta = _parse_skill_text(text)
+    if not meta:
+        return f"{C.RED}invalid SKILL.md — no frontmatter{C.RESET}"
+    name = meta.get("name", "")
+    if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+        return f"{C.RED}invalid or missing skill name in SKILL.md frontmatter{C.RESET}"
+    skill_dir = SKILLS_DIR / name
+    if skill_dir.exists():
+        return f"{C.RED}skill '{name}' already exists{C.RESET}"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(text, encoding="utf-8")
+    clear_skill_cache()
+    deps = _install_skill_dependencies(skill_dir)
+    msg = f"{C.GREEN}skill '{name}' installed{C.RESET}"
+    if deps:
+        msg += "\n" + "\n".join(deps)
+    return msg
+
+
+def _install_from_git(repo_url):
+    """Install skill(s) from a Git repository (shallow clone)."""
+    if not shutil.which("git"):
+        return f"{C.RED}git is not installed — install git or use a direct SKILL.md URL{C.RESET}"
+    tmpdir = tempfile.mkdtemp()
+    try:
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        ret = subprocess.run(
+            ["git", "clone", "--depth", "1", repo_url, tmpdir],
+            capture_output=True, text=True, timeout=120, env=env
+        )
+        if ret.returncode != 0:
+            return f"{C.RED}git clone failed: {ret.stderr.strip() or ret.stdout.strip()}{C.RESET}"
+        skill_files = list(Path(tmpdir).rglob("SKILL.md"))
+        if not skill_files:
+            return f"{C.RED}no SKILL.md found in repository{C.RESET}"
+        installed = []
+        for sf in skill_files:
+            meta = _parse_skill_md(sf)
+            if not meta:
+                continue
+            name = meta.get("name", sf.parent.name)
+            if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+                continue
+            target = SKILLS_DIR / name
+            if target.exists():
+                continue
+            target.mkdir(parents=True)
+            for f in sf.parent.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, target / f.name)
+            installed.append(name)
+        if not installed:
+            return f"{C.YELLOW}no new skills to install (already exist or invalid){C.RESET}"
+        clear_skill_cache()
+        names = ", ".join(f"'{n}'" for n in installed)
+        msg = f"{C.GREEN}skills installed: {names}{C.RESET}"
+        for name in installed:
+            deps = _install_skill_dependencies(SKILLS_DIR / name)
+            if deps:
+                msg += f"\n  {C.BOLD}{name}{C.RESET}:"
+                msg += "\n" + "\n".join(deps)
+        return msg
+    except subprocess.TimeoutExpired:
+        return f"{C.RED}git clone timed out{C.RESET}"
+    except Exception as e:
+        return f"{C.RED}error: {e}{C.RESET}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _install_skill_dependencies(skill_dir):
+    """Read SKILL.md, parse ## Dependencies section, and install missing deps."""
+    md_path = skill_dir / "SKILL.md"
+    if not md_path.exists():
+        return []
+    text = md_path.read_text(encoding="utf-8")
+    m = re.search(
+        r'^##\s+Dependenc(?:ies|ias)\s*\n(.*?)(?=\n##\s|\Z)',
+        text, re.MULTILINE | re.DOTALL
+    )
+    if not m:
+        return []
+    results = [f"  {C.CYAN}Dependencies:{C.RESET}"]
+    for line in m.group(1).split('\n'):
+        line = line.strip()
+        if not line.startswith('- '):
+            continue
+        content = line[2:].strip()
+        bt = re.match(r'^`([^`]+)`', content)
+        cmd_str = bt.group(1) if bt else content.split(' - ')[0].split(' — ')[0].split(' – ')[0].strip()
+        if not cmd_str:
+            continue
+        if cmd_str.startswith(('pip install', 'pip3 install')):
+            exe = shutil.which('pip') or shutil.which('pip3')
+            if not exe:
+                results.append(f"    {C.YELLOW}⚠ pip not found{C.RESET}")
+                continue
+            args = shlex.split(cmd_str)
+            pip_args = [exe, *args[1:]]
+            if '--user' not in pip_args:
+                pip_args.append('--user')
+            if '--break-system-packages' not in pip_args:
+                pip_args.append('--break-system-packages')
+            try:
+                r = subprocess.run(pip_args, capture_output=True, text=True, timeout=180)
+                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                if r.returncode != 0:
+                    detail = r.stderr.strip()[-200:]
+                    results.append(f"    {status} {cmd_str} — {detail}")
+                else:
+                    results.append(f"    {status} {cmd_str}")
+            except Exception as e:
+                results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
+        elif cmd_str.startswith(('npm install', 'npm i')):
+            exe = shutil.which('npm')
+            if not exe:
+                results.append(f"    {C.YELLOW}⚠ npm not found{C.RESET}")
+                continue
+            args = shlex.split(cmd_str)
+            try:
+                r = subprocess.run([exe, *args[1:]], capture_output=True, text=True, timeout=120)
+                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                results.append(f"    {status} {cmd_str}")
+            except Exception as e:
+                results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
+        elif cmd_str.startswith(('brew install',)):
+            args = shlex.split(cmd_str)
+            try:
+                r = subprocess.run(args, capture_output=True, text=True, timeout=300)
+                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                results.append(f"    {status} {cmd_str}")
+            except Exception as e:
+                results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
+        else:
+            par = re.search(r'\((`[^`]+`|[^)]+)\)', cmd_str)
+            if par:
+                binary = par.group(1).strip('`')
+                if shutil.which(binary):
+                    results.append(f"    {C.GREEN}✓{C.RESET} {binary} found")
+                else:
+                    results.append(f"    {C.YELLOW}⚠{C.RESET} {binary} not found — install manually")
+            else:
+                results.append(f"    {C.YELLOW}⚠{C.RESET} {cmd_str} — skipped")
+    return results
+
+
+def _install_skill_from_url(url):
+    """Install a skill from a URL or remote Git repository.
+
+    Supports:
+      - Direct URL to SKILL.md (raw content)
+      - GitHub repository URL (auto-discovers SKILL.md files)
+      - gh:user/repo shorthand
+    """
+    url = url.strip()
+    if url.startswith("gh:"):
+        url = f"https://github.com/{url[3:]}.git"
+    has_skill_md = "SKILL.md" in url
+    is_git = url.endswith(".git") or (not has_skill_md and "github.com" in url) or url.startswith("git@")
+    if is_git:
+        return _install_from_git(url)
+    if has_skill_md:
+        return _install_from_skill_url(url)
+    return _install_from_skill_url(url.rstrip("/") + "/SKILL.md")
 
 
 def skills_to_tools(skills):
@@ -380,16 +1193,11 @@ def skills_to_tools(skills):
 
 
 def skill_tool_handler(name, args, messages=None):
-    for n, desc, schema, run_fn, doc in load_skills():
+    for n, desc, schema, doc in load_skills():
         if n == name:
-            if doc and run_fn is None:
-                if messages is not None:
-                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
-                return f"Skill '{name}' loaded. Follow the instructions above."
-            try:
-                return str(run_fn(args))
-            except Exception as e:
-                return f"Skill error: {e}"
+            if messages is not None:
+                messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
+            return f"Skill '{name}' loaded. Follow the instructions above."
     return f"Skill '{name}' not found"
 
 def default_cfg():
@@ -591,6 +1399,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
             else:
                 result = "TOOL_CALL_DECLINED"
 
+        preview = result[:500].replace("\n", "\\n")
+        print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
     return True
 
@@ -641,15 +1451,11 @@ def print_help():
     print(f"  /skill add|rm|show  Manage skills")
     print(f"  /exit              Quit")
     print()
-    print(f"{C.CYAN}Built-in tools:{C.RESET}")
+    print(f"{C.CYAN}Tools ({len(TOOLS)}):{C.RESET}")
     for t in TOOLS:
         fn = t["function"]
-        print(f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description']}{C.RESET}")
-    skills = load_skills()
-    if skills:
-        print(f"\n{C.CYAN}Skills:{C.RESET}")
-        for name, desc, *_ in skills:
-            print(f"  {C.MAGENTA}skill_{name}{C.RESET}  {C.GRAY}{desc}{C.RESET}")
+        print(f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description'].split('.')[0]}.{C.RESET}")
+    print(f"  {C.GRAY}--- skills are injected dynamically via the skill tool ---{C.RESET}")
 
 # ── Main ────────────────────────────────────────────────────────
 
@@ -796,28 +1602,21 @@ schema:
       type: string
       description: Input
   required: [input]
-handler: run.py
 ---
 
 # {name}
 
-Replace this with usage documentation.
+Replace this with instructions for the model.
 '''
                             (skill_dir / "SKILL.md").write_text(md)
-                            py = '''def run(args):
-    return f"Hello from {args.get('input', '')}"
-'''
-                            (skill_dir / "run.py").write_text(py)
                             clear_skill_cache()
                             print(f"{C.GREEN}skill '{name}' created{C.RESET}")
                             print(f"{C.GRAY}  {skill_dir}/SKILL.md{C.RESET}")
-                            print(f"{C.GRAY}  {skill_dir}/run.py{C.RESET}")
                 elif sub_cmd == "rm" and sub_arg:
                     skill_dir = SKILLS_DIR / sub_arg.strip()
                     if not skill_dir.exists() or not skill_dir.is_dir():
                         print(f"{C.RED}skill '{sub_arg}' not found{C.RESET}")
                     else:
-                        import shutil
                         shutil.rmtree(skill_dir)
                         clear_skill_cache()
                         print(f"{C.GREEN}skill '{sub_arg}' removed{C.RESET}")
@@ -830,12 +1629,16 @@ Replace this with usage documentation.
                             print(f"{C.YELLOW}── {f.name} ──{C.RESET}")
                             print(f.read_text().rstrip())
                             print()
+                elif sub_cmd == "install" and sub_arg:
+                    msg = _install_skill_from_url(sub_arg.strip())
+                    print(msg)
                 else:
                     print(f"{C.YELLOW}usage:{C.RESET}")
-                    print(f"  /skill add <name>    create a new skill")
-                    print(f"  /skill rm <name>     delete a skill")
-                    print(f"  /skill show <name>   show skill files")
-                    print(f"  /skills              list all skills")
+                    print(f"  /skill add <name>      create a new skill")
+                    print(f"  /skill rm <name>       delete a skill")
+                    print(f"  /skill show <name>     show skill files")
+                    print(f"  /skill install <url>   install from URL or git repo")
+                    print(f"  /skills                list all skills")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
