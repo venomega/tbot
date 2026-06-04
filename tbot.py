@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html
+import os, sys, json, time, subprocess, platform, re, html, socket
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -1322,47 +1322,72 @@ def chat_completion(messages, cfg, stream=True, tools=None):
 def parse_stream(resp):
     content_parts = []
     tool_calls = {}
+
+    sock = None
+    try:
+        conn = getattr(resp.raw, "connection", None)
+        sock = getattr(conn, "sock", None) if conn else None
+    except Exception:
+        pass
+
     try:
         iterator = resp.iter_lines()
     except Exception:
         return None, None
-    for raw in iterator:
-        if not raw:
-            continue
-        try:
-            raw = raw.decode("utf-8", errors="replace")
-        except Exception:
-            continue
-        if not raw.startswith("data: "):
-            continue
-        chunk = raw[6:].strip()
-        if chunk == "[DONE]":
-            break
-        try:
-            data = json.loads(chunk)
-            choices = data.get("choices", [])
-            if not choices:
+
+    received = False
+    try:
+        for raw in iterator:
+            if not raw:
                 continue
-            delta = choices[0].get("delta", {})
-            c = delta.get("content")
-            if c:
-                content_parts.append(c)
-                print(c, end="", flush=True)
-            for tc in delta.get("tool_calls", []):
-                idx = tc.get("index", 0)
-                if idx not in tool_calls:
-                    tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
-                entry = tool_calls[idx]
-                if "id" in tc:
-                    entry["id"] = tc["id"]
-                if "function" in tc:
-                    fn = tc["function"]
-                    if "name" in fn:
-                        entry["function"]["name"] += fn["name"]
-                    if "arguments" in fn:
-                        entry["function"]["arguments"] += fn["arguments"]
-        except (json.JSONDecodeError, KeyError, IndexError):
-            pass
+            if not received:
+                received = True
+                if sock:
+                    try:
+                        sock.settimeout(3.0)
+                    except Exception:
+                        sock = None
+            try:
+                raw = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not raw.startswith("data: "):
+                continue
+            chunk = raw[6:].strip()
+            if chunk == "[DONE]":
+                try:
+                    resp.raw.drain_conn()
+                except Exception:
+                    pass
+                break
+            try:
+                data = json.loads(chunk)
+                choices = data.get("choices", [])
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                c = delta.get("content")
+                if c:
+                    content_parts.append(c)
+                    print(c, end="", flush=True)
+                for tc in delta.get("tool_calls", []):
+                    idx = tc.get("index", 0)
+                    if idx not in tool_calls:
+                        tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                    entry = tool_calls[idx]
+                    if "id" in tc:
+                        entry["id"] = tc["id"]
+                    if "function" in tc:
+                        fn = tc["function"]
+                        if "name" in fn:
+                            entry["function"]["name"] += fn["name"]
+                        if "arguments" in fn:
+                            entry["function"]["arguments"] += fn["arguments"]
+            except (json.JSONDecodeError, KeyError, IndexError):
+                pass
+    except (socket.timeout, OSError):
+        pass
+
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
     return content, calls
@@ -1677,6 +1702,7 @@ Replace this with instructions for the model.
                 break
 
             content, tool_calls = parse_stream(result["stream"])
+            result["stream"].close()
 
             if tool_calls:
                 if content:
