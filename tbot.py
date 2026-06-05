@@ -1462,6 +1462,10 @@ def setup_history():
     except (FileNotFoundError, OSError):
         pass
     readline.set_history_length(1000)
+    try:
+        readline.parse_and_bind('"\\C-e": "/edit\\C-j"')
+    except Exception:
+        pass
 
 
 def save_history():
@@ -1491,7 +1495,7 @@ def print_help():
     print(f"  /model [name]      Show or switch model")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
-    print(f"  /edit  [text]      View or replace last user message")
+    print(f"  /edit  [text]      Multi-line editor (or Ctrl+E / /edit)")
     print(f"  /tools             Toggle tool calling on/off")
     print(f"  /trust             Toggle auto-approve tools")
     print(f"  /skills            List installed skills")
@@ -1503,6 +1507,24 @@ def print_help():
         fn = t["function"]
         print(f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description'].split('.')[0]}.{C.RESET}")
     print(f"  {C.GRAY}--- skills are injected dynamically via the skill tool ---{C.RESET}")
+
+
+def open_editor(initial_text=""):
+    editor_cmd = shlex.split(os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi')
+    with tempfile.NamedTemporaryFile(suffix='.md', mode='w+', delete=False) as f:
+        f.write(initial_text)
+        f.flush()
+        tmp_path = f.name
+    try:
+        subprocess.run(editor_cmd + [tmp_path], check=True)
+        result = Path(tmp_path).read_text(encoding='utf-8')
+        return result.rstrip('\n')
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"{C.RED}editor error: {e}{C.RESET}")
+        return initial_text
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
 
 # ── Main ────────────────────────────────────────────────────────
 
@@ -1602,19 +1624,39 @@ def main():
                 save_cfg(cfg)
                 print(f"{C.GREEN}trust {'on' if cfg['trust_mode'] else 'off'}{C.RESET}")
             elif cmd == "edit":
-                last_user = -1
-                for i in range(len(messages) - 1, -1, -1):
-                    if messages[i]["role"] == "user":
-                        last_user = i
-                        break
-                if last_user == -1:
-                    print(f"{C.RED}no user message to edit{C.RESET}")
-                elif arg:
-                    messages[last_user]["content"] = arg
-                    print(f"{C.GREEN}last message updated{C.RESET}")
+                if arg:
+                    last_user = -1
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i]["role"] == "user":
+                            last_user = i
+                            break
+                    if last_user == -1:
+                        print(f"{C.RED}no user message to edit{C.RESET}")
+                    else:
+                        messages[last_user]["content"] = arg
+                        print(f"{C.GREEN}last message updated{C.RESET}")
                 else:
-                    print(f"{C.YELLOW}last message:{C.RESET}")
-                    print(messages[last_user]["content"])
+                    last_user = -1
+                    for i in range(len(messages) - 1, -1, -1):
+                        if messages[i]["role"] == "user":
+                            last_user = i
+                            break
+                    initial = messages[last_user]["content"] if last_user != -1 else ""
+                    print(f"{C.YELLOW}opening editor...{C.RESET}")
+                    content = open_editor(initial)
+                    if content:
+                        appended = last_user == -1
+                        if last_user != -1:
+                            messages[last_user]["content"] = content
+                        else:
+                            messages.append({"role": "user", "content": content})
+                        lines = content.split("\n")
+                        print(f"{C.GREEN}message ({len(lines)} lines, {len(content)} chars){C.RESET}")
+                        if len(lines) <= 3:
+                            print(content)
+                        send_conversation(messages, cfg, pop_on_first_error=appended)
+                    else:
+                        print(f"{C.YELLOW}cancelled{C.RESET}")
             elif cmd == "skills":
                 skills = load_skills()
                 if not skills:
@@ -1692,57 +1734,52 @@ Replace this with instructions for the model.
 
         # ── message ──
         messages.append({"role": "user", "content": line})
+        send_conversation(messages, cfg, pop_on_first_error=True)
 
-        # trim history
-        total = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
-        while total > cfg["max_history_chars"] and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
-            for i, m in enumerate(messages):
-                if m["role"] not in ("system", "tool"):
-                    total -= len(m.get("content", ""))
-                    messages.pop(i)
-                    break
 
-        tools = None
-        if cfg["tools_enabled"]:
-            tools = list(TOOLS)
-            skills = load_skills()
-            if skills:
-                tools += skills_to_tools(skills)
-        max_rounds = 15
-        round_n = 0
-
-        while round_n < max_rounds:
-            round_n += 1
-            result = chat_completion(messages, cfg, stream=True, tools=tools)
-
-            if "error" in result:
-                show_error(result.get("title", "Error"),
-                          result.get("detail", result["error"]),
-                          result.get("hint", ""))
-                if round_n == 1:
-                    messages.pop()
+def send_conversation(messages, cfg, pop_on_first_error=False):
+    total = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+    while total > cfg["max_history_chars"] and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
+        for i, m in enumerate(messages):
+            if m["role"] not in ("system", "tool"):
+                total -= len(m.get("content", ""))
+                messages.pop(i)
                 break
-
-            content, tool_calls = parse_stream(result["stream"])
-            result["stream"].close()
-
-            if tool_calls:
-                if content:
-                    print()
-                ok = execute_tool_calls(tool_calls, messages, cfg)
-                if not ok:
-                    break
-                continue
-
+    tools = None
+    if cfg["tools_enabled"]:
+        tools = list(TOOLS)
+        skills = load_skills()
+        if skills:
+            tools += skills_to_tools(skills)
+    max_rounds = 15
+    round_n = 0
+    while round_n < max_rounds:
+        round_n += 1
+        result = chat_completion(messages, cfg, stream=True, tools=tools)
+        if "error" in result:
+            show_error(result.get("title", "Error"),
+                      result.get("detail", result["error"]),
+                      result.get("hint", ""))
+            if round_n == 1 and pop_on_first_error:
+                messages.pop()
+            break
+        content, tool_calls = parse_stream(result["stream"])
+        result["stream"].close()
+        if tool_calls:
             if content:
                 print()
-                messages.append({"role": "assistant", "content": content})
-            break
-
-        if round_n >= max_rounds:
-            show_error("Max tool rounds reached",
-                       f"The model used {max_rounds} consecutive tool calls without producing a final response.",
-                       "This may indicate a bug in the model or an infinite loop. Try a different model.")
+            ok = execute_tool_calls(tool_calls, messages, cfg)
+            if not ok:
+                break
+            continue
+        if content:
+            print()
+            messages.append({"role": "assistant", "content": content})
+        break
+    if round_n >= max_rounds:
+        show_error("Max tool rounds reached",
+                   f"The model used {max_rounds} consecutive tool calls without producing a final response.",
+                   "This may indicate a bug in the model or an infinite loop. Try a different model.")
 
 
 if __name__ == "__main__":
