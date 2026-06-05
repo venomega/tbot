@@ -287,7 +287,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "skill",
-            "description": "Load a specialized skill that provides domain-specific instructions and workflows. The skill will inject detailed instructions into the conversation context.",
+            "description": "[ONE-TIME] Load a specialized skill. Call ONCE per skill — the instructions stay in context. Do NOT reload the same skill.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -503,6 +503,20 @@ def _update_cwd(cmd, last_cwd):
         _chdir(resolved)
 
 
+_output_re = re.compile(r'(?:-(?:o|O|output)\s+|\>\s*|\>\>\s*)(\S+)')
+
+def _list_outputs(cmd, cwd):
+    files = _output_re.findall(cmd)
+    if not files:
+        return ""
+    lines = []
+    for f in files:
+        f = f.strip("\"'")
+        p = Path(f) if f.startswith("/") else Path(cwd) / f
+        if p.exists():
+            lines.append(f"→ {p.name} ({p.stat().st_size} bytes)")
+    return "\n" + "\n".join(lines) if lines else ""
+
 def handle_bash(args):
     cmd = args["command"]
     desc = args.get("description", "")
@@ -515,15 +529,16 @@ def handle_bash(args):
         out = r.stdout
         if r.stderr:
             out += "\n--- stderr ---\n" + r.stderr
-        if r.returncode != 0:
-            out += f"\n--- exit code: {r.returncode} ---"
+        out += f"\n--- exit code: {r.returncode} ---"
+        if r.returncode == 0:
+            out += _list_outputs(cmd, cwd)
         _update_cwd(cmd, cwd)
-        result = out.strip() or "(no output)"
+        result = out.strip() or f"(no output)  [exit {r.returncode}]"
         return _truncate_output(result + f"\n\n<cwd>{CURRENT_DIR}</cwd>")
     except subprocess.TimeoutExpired:
-        return f"Command timed out after {timeout_s}s (cwd: {CURRENT_DIR})"
+        return f"Command timed out after {timeout_s}s (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
     except Exception as e:
-        return f"Error: {e} (cwd: {CURRENT_DIR})"
+        return f"Error: {e} (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
 
 
 def handle_read(args):
@@ -775,7 +790,7 @@ def handle_skill(args):
     skills = load_skills()
     for n, desc, schema, doc in skills:
         if n == name:
-            return f"Skill '{name}' loaded. Follow the instructions below.\n\n{doc}"
+            return f"Skill '{name}' is already loaded — do NOT call this tool again.\n\n{doc}"
     return f"Skill '{name}' not found. Use /skills to list available skills."
 
 
@@ -1186,18 +1201,25 @@ def _install_skill_from_url(url):
 
 
 def skills_to_tools(skills):
-    return [
-        {"type": "function", "function": {"name": f"skill_{n}", "description": d, "parameters": s}}
-        for n, d, s, *_ in skills
-    ]
+    tools = []
+    for n, d, s, *_ in skills:
+        desc = f"[ONE-TIME] Load instructions for '{n}' skill. Call ONCE, then follow the instructions — do NOT call again. {d}"
+        tools.append({"type": "function", "function": {"name": f"skill_{n}", "description": desc[:500], "parameters": s}})
+    return tools
 
 
 def skill_tool_handler(name, args, messages=None):
     for n, desc, schema, doc in load_skills():
         if n == name:
             if messages is not None:
-                messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
-            return f"Skill '{name}' loaded. Follow the instructions above."
+                already = any(
+                    m.get("role") == "system"
+                    and f"## Skill: {name}" in m.get("content", "")
+                    for m in messages[-5:]
+                )
+                if not already:
+                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
+            return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
     return f"Skill '{name}' not found"
 
 def default_cfg():
@@ -1686,7 +1708,7 @@ Replace this with instructions for the model.
             skills = load_skills()
             if skills:
                 tools += skills_to_tools(skills)
-        max_rounds = 90
+        max_rounds = 15
         round_n = 0
 
         while round_n < max_rounds:
