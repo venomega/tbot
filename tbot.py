@@ -1435,12 +1435,20 @@ def execute_tool_calls(tool_calls, messages, cfg):
             if cfg.get("trust_mode"):
                 ok = True
             else:
-                ans = input(f"  {C.YELLOW}run?{C.RESET} [Y/n/q] ").strip().lower()
+                try:
+                    ans = input(f"  {C.YELLOW}run?{C.RESET} [Y/n/q] ").strip().lower()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    return False
                 if ans == "q":
                     return False
                 ok = ans in ("", "y", "yes")
             if ok:
-                result = handler(args)
+                try:
+                    result = handler(args)
+                except KeyboardInterrupt:
+                    print(f"\n  {C.YELLOW}cancelled{C.RESET}")
+                    result = "TOOL_CALL_CANCELLED"
                 if len(result) > 8000:
                     result = result[:8000] + f"\n... (truncated, {len(result)} total chars)"
             else:
@@ -1755,27 +1763,33 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     round_n = 0
     while round_n < max_rounds:
         round_n += 1
-        result = chat_completion(messages, cfg, stream=True, tools=tools)
-        if "error" in result:
-            show_error(result.get("title", "Error"),
-                      result.get("detail", result["error"]),
-                      result.get("hint", ""))
+        try:
+            result = chat_completion(messages, cfg, stream=True, tools=tools)
+            if "error" in result:
+                show_error(result.get("title", "Error"),
+                          result.get("detail", result["error"]),
+                          result.get("hint", ""))
+                if round_n == 1 and pop_on_first_error:
+                    messages.pop()
+                break
+            content, tool_calls = parse_stream(result["stream"])
+            result["stream"].close()
+            if tool_calls:
+                if content:
+                    print()
+                ok = execute_tool_calls(tool_calls, messages, cfg)
+                if not ok:
+                    break
+                continue
+            if content:
+                print()
+                messages.append({"role": "assistant", "content": content})
+            break
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}cancelled{C.RESET}")
             if round_n == 1 and pop_on_first_error:
                 messages.pop()
             break
-        content, tool_calls = parse_stream(result["stream"])
-        result["stream"].close()
-        if tool_calls:
-            if content:
-                print()
-            ok = execute_tool_calls(tool_calls, messages, cfg)
-            if not ok:
-                break
-            continue
-        if content:
-            print()
-            messages.append({"role": "assistant", "content": content})
-        break
     if round_n >= max_rounds:
         show_error("Max tool rounds reached",
                    f"The model used {max_rounds} consecutive tool calls without producing a final response.",
