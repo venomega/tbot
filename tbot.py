@@ -1087,9 +1087,12 @@ def _install_from_skill_url(skill_url):
         return f"{C.RED}skill '{name}' already exists{C.RESET}"
     skill_dir.mkdir(parents=True)
     (skill_dir / "SKILL.md").write_text(text, encoding="utf-8")
+    siblings = _download_github_siblings(skill_url, skill_dir)
     clear_skill_cache()
     deps = _install_skill_dependencies(skill_dir)
     msg = f"{C.GREEN}skill '{name}' installed{C.RESET}"
+    if siblings:
+        msg += f"\n  {C.CYAN}sibling files:{C.RESET} {', '.join(sorted(siblings))}"
     if deps:
         msg += "\n" + "\n".join(deps)
     return msg
@@ -1229,6 +1232,8 @@ def _install_skill_dependencies(skill_dir):
 
 
 _GITHUB_TREE_RE = re.compile(r'https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)')
+_GITHUB_RAW_RE = re.compile(r'https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)')
+
 
 def _github_tree_to_raw(url):
     """Convert GitHub tree URL to raw.githubusercontent.com URL for SKILL.md."""
@@ -1237,6 +1242,45 @@ def _github_tree_to_raw(url):
         owner, repo, branch, path = m.group(1), m.group(2), m.group(3), m.group(4)
         return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}/SKILL.md"
     return None
+
+
+def _download_github_siblings(skill_url, skill_dir):
+    """Download all files from the same GitHub directory as SKILL.md via the GitHub API."""
+    m = _GITHUB_RAW_RE.match(skill_url)
+    if not m:
+        return []
+    owner, repo, branch, path = m.group(1), m.group(2), m.group(3), m.group(4)
+    dir_path = path.rsplit("/", 1)[0] if "/" in path else "."
+    if not dir_path or dir_path == ".":
+        return []
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
+    try:
+        resp = requests.get(api_url, timeout=15, headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "tbot/1.0",
+        })
+        resp.raise_for_status()
+        items = resp.json()
+        if not isinstance(items, list):
+            return []
+        downloaded = []
+        for item in items:
+            name = item.get("name", "")
+            if name == "SKILL.md" or item.get("type") != "file":
+                continue
+            dl_url = item.get("download_url")
+            if not dl_url:
+                continue
+            try:
+                fresp = requests.get(dl_url, timeout=15)
+                if fresp.status_code == 200:
+                    (skill_dir / name).write_bytes(fresp.content)
+                    downloaded.append(name)
+            except Exception:
+                pass
+        return downloaded
+    except Exception:
+        return []
 
 
 def _install_skill_from_url(url):
