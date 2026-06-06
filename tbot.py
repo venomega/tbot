@@ -14,6 +14,7 @@ CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
+SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class C:
@@ -740,7 +741,21 @@ def handle_webfetch(args):
 
 def handle_todowrite(args):
     todos = args.get("todos", [])
-    return json.dumps(todos, indent=2)
+    task_file = CURRENT_DIR / "TASK.md"
+    lines = ["# Task List", ""]
+    for t in todos:
+        status_map = {"pending": " ", "in_progress": "~", "completed": "x", "cancelled": "-"}
+        m = status_map.get(t.get("status", "pending"), " ")
+        priority = t.get("priority", "medium")
+        prio_tag = f" [{priority}]" if priority != "medium" else ""
+        lines.append(f"- [{m}]{prio_tag} {t['content']}")
+    lines.append("")
+    lines.append(f"<!-- Last updated: {time.strftime('%Y-%m-%d %H:%M:%S')} -->")
+    try:
+        task_file.write_text("\n".join(lines), encoding="utf-8")
+        return f"Task list written to {task_file} ({len(todos)} items)"
+    except Exception as e:
+        return f"Error writing task list: {e}"
 
 
 def _resolve_ddg_url(url):
@@ -1255,7 +1270,7 @@ def default_cfg():
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
         "max_tokens": 524288,
-        "system_prompt": "You are a helpful assistant with access to PC tools. Today's date is {date}.",
+        "system_prompt": "",  # empty = load from system_prompt.txt
         "max_history_chars": 200000,
         "tools_enabled": True,
         "trust_mode": False,
@@ -1561,12 +1576,100 @@ def open_editor(initial_text=""):
         Path(tmp_path).unlink(missing_ok=True)
 
 
+# ── System prompt loading ───────────────────────────────────────
+
+SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+
+# Tone and style
+You should be concise, direct, and to the point. Your output is displayed on a command line interface. Use GitHub-flavored markdown for formatting. Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. Never use tool calls or code comments as a way to communicate with the user.
+
+If you cannot or will not help the user with something, do not say why or what it could lead to. Offer helpful alternatives if possible, and keep your response to 1-2 sentences.
+
+Only use emojis if the user explicitly requests it. Avoid emojis in all communication unless asked.
+
+Minimize output tokens as much as possible. Only address the specific query or task at hand. Avoid introductions, conclusions, and explanations. Do not add code explanation summaries after editing a file — just stop.
+
+# Professional objectivity
+Prioritize technical accuracy and truthfulness over validating the user's beliefs. Focus on facts and problem-solving. Disagree when necessary. Whenever there is uncertainty, investigate to find the truth rather than confirming the user's beliefs.
+
+# Tool usage policy
+- Prefer dedicated tools over bash for file operations: use `read` to view files, `edit` to modify files, `write` to create files, `glob` to find files by name, `grep` to search file contents.
+- Reserve `bash` for system commands (git, pip, builds, tests, running scripts).
+- When making multiple independent tool calls, send them in parallel. If one operation depends on another, run sequentially.
+- Use `webfetch` and `websearch` to research external information when needed.
+- Never run interactive shell commands (git rebase -i, etc.). Use non-interactive alternatives.
+- Always explain non-trivial bash commands before running them.
+
+# Task management
+When working on complex multi-step tasks, create and maintain a file called `./TASK.md` in the current working directory. Use the `write` tool to create it and the `edit` tool to update it as you make progress. Track what you have done, what is in progress, and what remains. Mark items as completed as you finish them. Delete the file when the task is complete.
+
+For simple tasks (1-2 steps), you do not need to create TASK.md.
+
+# Following conventions
+When making changes to files, first understand the file's code conventions. Mimic code style, use existing libraries and utilities, and follow existing patterns.
+- NEVER assume a library is available. Check project config (package.json, requirements.txt, etc.) first.
+- When editing, look at surrounding context (especially imports) to understand framework choices.
+- Always follow security best practices. Never expose or log secrets and keys.
+
+# Code style
+- DO NOT ADD COMMENTS unless asked, or unless the code is genuinely non-obvious.
+
+# Doing tasks
+For bugs, features, and refactoring:
+1. Use search tools (glob, grep, read) to understand the codebase.
+2. Implement the solution.
+3. Verify with tests if the project has a test framework.
+4. Run lint/typecheck commands if they are available.
+
+NEVER commit changes unless the user explicitly asks.
+
+# Code references
+When referencing specific functions or pieces of code, include the pattern `file_path:line_number` so the user can navigate to the source.
+
+<example>
+user: Where are errors handled?
+assistant: Errors are handled in `src/handler.py:142`.
+</example>
+
+# Environment
+Today's date: {date}
+Working directory: /Users/maironmartinezdelas/src/tbot
+Platform: darwin"""
+
+
+def load_system_prompt(cfg):
+    """Load system prompt from file (or config override). Injects {date}."""
+    prompt = cfg.get("system_prompt", "")
+    if prompt:
+        # User-provided prompt (via /sys command or config)
+        if "{date}" in prompt:
+            prompt = prompt.replace("{date}", time.strftime("%Y-%m-%d"))
+        return prompt
+
+    # Load from file (create on first run)
+    try:
+        data = SYSTEM_PROMPT_FILE.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        SYSTEM_PROMPT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = SYSTEM_PROMPT_DEFAULT
+        try:
+            SYSTEM_PROMPT_FILE.write_text(data, encoding="utf-8")
+        except OSError:
+            pass
+    except OSError:
+        data = SYSTEM_PROMPT_DEFAULT
+
+    if "{date}" in data:
+        data = data.replace("{date}", time.strftime("%Y-%m-%d"))
+    return data
+
+
 # ── Main ────────────────────────────────────────────────────────
 
 def _init_messages(cfg):
-    prompt = cfg.get("system_prompt", "")
-    if prompt and "{date}" in prompt:
-        prompt = prompt.replace("{date}", time.strftime("%Y-%m-%d"))
+    prompt = load_system_prompt(cfg)
     return [{"role": "system", "content": prompt}] if prompt else []
 
 
@@ -1653,10 +1756,11 @@ def main():
                     cfg["system_prompt"] = arg
                     save_cfg(cfg)
                     if messages and messages[0]["role"] == "system":
-                        messages[0]["content"] = arg
+                        messages[0]["content"] = load_system_prompt(cfg)
                     print(f"{C.GREEN}system prompt updated{C.RESET}")
                 else:
-                    print(f"{C.YELLOW}{cfg['system_prompt']}{C.RESET}")
+                    effective = cfg["system_prompt"] or f"(from {SYSTEM_PROMPT_FILE})"
+                    print(f"{C.YELLOW}{effective}{C.RESET}")
             elif cmd == "tools":
                 cfg["tools_enabled"] = not cfg["tools_enabled"]
                 save_cfg(cfg)
