@@ -1132,11 +1132,17 @@ def _install_from_git(repo_url):
         clear_skill_cache()
         names = ", ".join(f"'{n}'" for n in installed)
         msg = f"{C.GREEN}skills installed: {names}{C.RESET}"
-        for name in installed:
-            deps = _install_skill_dependencies(SKILLS_DIR / name)
-            if deps:
-                msg += f"\n  {C.BOLD}{name}{C.RESET}:"
-                msg += "\n" + "\n".join(deps)
+
+        # Dependencies are optional — install in background, don't block return
+        import threading as _thr
+        def _install_deps_bg():
+            for name in installed:
+                try:
+                    deps = _install_skill_dependencies(SKILLS_DIR / name)
+                except Exception:
+                    pass
+        _thr.Thread(target=_install_deps_bg, daemon=True).start()
+
         return msg
     except subprocess.TimeoutExpired:
         return f"{C.RED}git clone timed out{C.RESET}"
@@ -1180,7 +1186,7 @@ def _install_skill_dependencies(skill_dir):
             if '--break-system-packages' not in pip_args:
                 pip_args.append('--break-system-packages')
             try:
-                r = subprocess.run(pip_args, capture_output=True, text=True, timeout=180)
+                r = subprocess.run(pip_args, capture_output=True, text=True, timeout=60)
                 status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
                 if r.returncode != 0:
                     detail = r.stderr.strip()[-200:]
