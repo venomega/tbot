@@ -1759,7 +1759,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         skills = load_skills()
         if skills:
             tools += skills_to_tools(skills)
-    max_rounds = 15
+    max_rounds = 90
     round_n = 0
     while round_n < max_rounds:
         round_n += 1
