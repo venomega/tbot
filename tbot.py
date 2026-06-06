@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -397,6 +397,21 @@ def _truncate_output(text):
     return text
 
 
+def _clean_html_text(html_text):
+    """Strip HTML tags and extract readable paragraphs from HTML."""
+    text = re.sub(r'<script[^>]*>.*?</script>', '', html_text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r'<[^>]+>', '\n', text)
+    text = html.unescape(text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    filtered = [l for l in lines if len(l) > 40]
+    return '\n'.join(filtered) if filtered else '\n'.join(lines)
+
+
 def _fetch_page_text(url, max_chars=4000):
     """Fetch a URL and extract readable text content. Returns None on failure."""
     try:
@@ -408,21 +423,7 @@ def _fetch_page_text(url, max_chars=4000):
         ct = resp.headers.get("Content-Type", "")
         if "text/html" not in ct and "text/plain" not in ct:
             return None
-        text = resp.text
-        text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', ' ', text)
-        text = html.unescape(text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        lines = []
-        for line in text.split('\n'):
-            line = line.strip()
-            if line and len(line) > 40:
-                lines.append(line)
-        text = '\n'.join(lines) if lines else text
+        text = _clean_html_text(resp.text)
         if len(text) > max_chars:
             text = text[:max_chars] + "\n... (truncated)"
         return text if len(text) > 100 else None
@@ -726,12 +727,14 @@ def handle_webfetch(args):
     if fmt == "html":
         return _truncate_output(resp.text)
     if fmt == "text":
-        text = resp.text
-        text = re.sub(r'<[^>]+>', ' ', text)
+        text = re.sub(r'<script[^>]*>.*?</script>', '', resp.text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '\n', text)
         text = html.unescape(text)
-        text = re.sub(r'\s+', ' ', text).strip()
-        return _truncate_output(text)
-    text = _fetch_page_text(url)
+        text = re.sub(r'[ \t]+', ' ', text)
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        return _truncate_output('\n'.join(lines))
+    text = _clean_html_text(resp.text)
     return text or "(no readable content found)"
 
 
@@ -740,29 +743,53 @@ def handle_todowrite(args):
     return json.dumps(todos, indent=2)
 
 
+def _resolve_ddg_url(url):
+    """Resolve DuckDuckGo redirect URLs to the actual target."""
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    m = re.search(r'[?&]uddg=([^&]+)', url)
+    if m:
+        return urllib.parse.unquote(m.group(1))
+    return url
+
+
 def handle_websearch(args):
     query = args["query"]
     num_results = min(args.get("numResults", 8), 15)
-    current_year = str(time.localtime().tm_year)
-    if current_year not in query:
-        query = f"{query} {current_year}"
     try:
-        resp = requests.post("https://html.duckduckgo.com/html/", data={"q": query, "df": f"{current_year}-01-01..{current_year}-12-31"}, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        sess = requests.Session()
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://duckduckgo.com/",
+            "DNT": "1",
+        })
+        sess.get("https://duckduckgo.com/", timeout=10)
+        resp = sess.post("https://html.duckduckgo.com/html/", data={"q": query}, timeout=15)
         resp.raise_for_status()
     except Exception as e:
         return f"Search failed: {e}"
     results = []
     blocks = re.split(r'<div[^>]*class="[^"]*result__body[^"]*"', resp.text)[1:]
     for block in blocks[:num_results]:
-        m = re.search(r'href="(https?://[^"]+)"[^>]*>[^<]*<[^>]+class="result__a"', block)
-        if not m:
-            m = re.search(r'class="result__a"[^>]+href="(https?://[^"]*)"', block)
-        if not m:
+        href = None
+        for pat in [
+            r'href="(https?://[^"]+)"[^>]*>[^<]*<[^>]+class="result__a"',
+            r'class="result__a"[^>]+href="(https?://[^"]*)"',
+            r'class="result__a"[^>]+href="(//[^"]*)"',
+        ]:
+            m = re.search(pat, block)
+            if m:
+                href = html.unescape(m.group(1))
+                break
+        if not href:
             continue
-        href = html.unescape(m.group(1))
+        href = _resolve_ddg_url(href)
         tm = re.search(r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL)
         title = re.sub(r'<[^>]+>', '', tm.group(1)).strip() if tm else ""
-        sm = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', block, re.DOTALL)
+        sm = re.search(r'class="result__snippet"[^>]*>(.*?)</(?:span|div)>', block, re.DOTALL)
         snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip() if sm else ""
         title = html.unescape(title)
         snippet = html.unescape(snippet)
@@ -1228,7 +1255,7 @@ def default_cfg():
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
         "max_tokens": 524288,
-        "system_prompt": "You are a helpful assistant with access to PC tools.",
+        "system_prompt": "You are a helpful assistant with access to PC tools. Today's date is {date}.",
         "max_history_chars": 200000,
         "tools_enabled": True,
         "trust_mode": False,
@@ -1536,6 +1563,13 @@ def open_editor(initial_text=""):
 
 # ── Main ────────────────────────────────────────────────────────
 
+def _init_messages(cfg):
+    prompt = cfg.get("system_prompt", "")
+    if prompt and "{date}" in prompt:
+        prompt = prompt.replace("{date}", time.strftime("%Y-%m-%d"))
+    return [{"role": "system", "content": prompt}] if prompt else []
+
+
 def main():
     cfg = load_cfg()
     cfg["api_key"] = resolve_key(cfg)
@@ -1563,7 +1597,7 @@ def main():
     atexit.register(save_history)
     if readline is not None:
         readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
-    messages = [{"role": "system", "content": cfg["system_prompt"]}] if cfg["system_prompt"] else []
+    messages = _init_messages(cfg)
     show_banner(cfg)
 
     while True:
@@ -1595,7 +1629,7 @@ def main():
             elif cmd == "help":
                 print_help()
             elif cmd == "new":
-                messages = [{"role": "system", "content": cfg["system_prompt"]}] if cfg["system_prompt"] else []
+                messages = _init_messages(cfg)
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
                 if arg:
