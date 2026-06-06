@@ -1635,17 +1635,17 @@ assistant: Errors are handled in `src/handler.py:142`.
 
 # Environment
 Today's date: {date}
-Working directory: /Users/maironmartinezdelas/src/tbot
-Platform: darwin"""
+Working directory: {cwd}
+Platform: {platform}"""
 
 
 def load_system_prompt(cfg):
-    """Load system prompt from file (or config override). Injects {date}."""
+    """Load system prompt from file (or config override). Injects dynamic vars."""
     prompt = cfg.get("system_prompt", "")
     if prompt:
-        # User-provided prompt (via /sys command or config)
-        if "{date}" in prompt:
-            prompt = prompt.replace("{date}", time.strftime("%Y-%m-%d"))
+        for k, v in _env_vars().items():
+            if "{" + k + "}" in prompt:
+                prompt = prompt.replace("{" + k + "}", v)
         return prompt
 
     # Load from file (create on first run)
@@ -1661,9 +1661,18 @@ def load_system_prompt(cfg):
     except OSError:
         data = SYSTEM_PROMPT_DEFAULT
 
-    if "{date}" in data:
-        data = data.replace("{date}", time.strftime("%Y-%m-%d"))
+    for k, v in _env_vars().items():
+        if "{" + k + "}" in data:
+            data = data.replace("{" + k + "}", v)
     return data
+
+
+def _env_vars():
+    return {
+        "date": time.strftime("%Y-%m-%d"),
+        "cwd": str(Path.cwd()),
+        "platform": platform.system().lower(),
+    }
 
 
 # ── Main ────────────────────────────────────────────────────────
