@@ -342,7 +342,7 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "Skill name — lowercase, alphanumeric and underscores only"},
+                    "name": {"type": "string", "description": "Skill name — lowercase, alphanumeric, underscores and hyphens"},
                     "description": {"type": "string", "description": "Short description of what the skill does"},
                     "content": {"type": "string", "description": "Markdown instructions for the model"},
                     "schema": {"type": "object", "description": "Optional JSON Schema for skill parameters"},
@@ -416,7 +416,7 @@ def _clean_html_text(html_text):
 def _fetch_page_text(url, max_chars=4000):
     """Fetch a URL and extract readable text content. Returns None on failure."""
     try:
-        resp = requests.get(url, timeout=15, headers={
+        resp = requests.get(url, timeout=10, headers={
             "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
             "Accept": "text/html,text/plain,*/*",
         })
@@ -771,7 +771,7 @@ def _resolve_ddg_url(url):
 
 def handle_websearch(args):
     query = args["query"]
-    num_results = min(args.get("numResults", 8), 15)
+    num_results = min(args.get("numResults", 8), 10)
     try:
         sess = requests.Session()
         sess.headers.update({
@@ -781,8 +781,8 @@ def handle_websearch(args):
             "Referer": "https://duckduckgo.com/",
             "DNT": "1",
         })
-        sess.get("https://duckduckgo.com/", timeout=10)
-        resp = sess.post("https://html.duckduckgo.com/html/", data={"q": query}, timeout=15)
+        sess.get("https://duckduckgo.com/", timeout=8)
+        resp = sess.post("https://html.duckduckgo.com/html/", data={"q": query}, timeout=10)
         resp.raise_for_status()
     except Exception as e:
         return f"Search failed: {e}"
@@ -818,11 +818,11 @@ def handle_websearch(args):
         if snippet:
             out.append(f"  {snippet[:300]}")
         out.append(f"  {href}")
-        if i < 3:
-            page_text = _fetch_page_text(href)
+        if i < 2:
+            page_text = _fetch_page_text(href, max_chars=3000)
             if page_text:
                 out.append(f"  ── page content ({len(page_text)} chars) ──")
-                for line in page_text.split('\n')[:15]:
+                for line in page_text.split('\n')[:10]:
                     out.append(f"  {line.strip()}")
     return "\n".join(out)
 
@@ -912,7 +912,7 @@ def handle_install_skill(args):
 
 def handle_create_skill(args):
     name = args["name"]
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
         return f"{C.RED}invalid skill name — use letters, numbers, underscores{C.RESET}"
     desc = args.get("description", name)
     content = args.get("content", "")
@@ -1080,7 +1080,7 @@ def _install_from_skill_url(skill_url):
     if not meta:
         return f"{C.RED}invalid SKILL.md — no frontmatter{C.RESET}"
     name = meta.get("name", "")
-    if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+    if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
         return f"{C.RED}invalid or missing skill name in SKILL.md frontmatter{C.RESET}"
     skill_dir = SKILLS_DIR / name
     if skill_dir.exists():
@@ -1117,7 +1117,7 @@ def _install_from_git(repo_url):
             if not meta:
                 continue
             name = meta.get("name", sf.parent.name)
-            if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+            if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
                 continue
             target = SKILLS_DIR / name
             if target.exists():
@@ -1222,17 +1222,34 @@ def _install_skill_dependencies(skill_dir):
     return results
 
 
+_GITHUB_TREE_RE = re.compile(r'https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)')
+
+def _github_tree_to_raw(url):
+    """Convert GitHub tree URL to raw.githubusercontent.com URL for SKILL.md."""
+    m = _GITHUB_TREE_RE.match(url)
+    if m:
+        owner, repo, branch, path = m.group(1), m.group(2), m.group(3), m.group(4)
+        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}/SKILL.md"
+    return None
+
+
 def _install_skill_from_url(url):
     """Install a skill from a URL or remote Git repository.
 
     Supports:
       - Direct URL to SKILL.md (raw content)
+      - GitHub tree URL (e.g. github.com/owner/repo/tree/branch/path)
       - GitHub repository URL (auto-discovers SKILL.md files)
       - gh:user/repo shorthand
     """
     url = url.strip()
     if url.startswith("gh:"):
         url = f"https://github.com/{url[3:]}.git"
+
+    raw_url = _github_tree_to_raw(url)
+    if raw_url:
+        return _install_from_skill_url(raw_url)
+
     has_skill_md = "SKILL.md" in url
     is_git = url.endswith(".git") or (not has_skill_md and "github.com" in url) or url.startswith("git@")
     if is_git:
@@ -1490,7 +1507,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     result = handler(args)
                 except KeyboardInterrupt:
                     print(f"\n  {C.YELLOW}cancelled{C.RESET}")
-                    result = "TOOL_CALL_CANCELLED"
+                    return False
                 if len(result) > 8000:
                     result = result[:8000] + f"\n... (truncated, {len(result)} total chars)"
             else:
@@ -1716,6 +1733,7 @@ def main():
         try:
             if readline is not None:
                 line = input(">>> ")
+                save_history()
             else:
                 line = input(f"{C.BOLD}{C.BLUE}>>>{C.RESET} ")
             sys.stdout.write(C.RESET)
@@ -1827,7 +1845,7 @@ def main():
                 sub_arg = sub[1] if len(sub) > 1 else ""
                 if sub_cmd == "add" and sub_arg:
                     name = sub_arg.strip()
-                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_]*$', name):
+                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
                         print(f"{C.RED}invalid skill name{C.RESET}")
                     else:
                         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
