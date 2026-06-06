@@ -1091,8 +1091,6 @@ def _install_from_skill_url(skill_url):
     clear_skill_cache()
     deps = _install_skill_dependencies(skill_dir)
     msg = f"{C.GREEN}skill '{name}' installed{C.RESET}"
-    if siblings:
-        msg += f"\n  {C.CYAN}sibling files:{C.RESET} {', '.join(sorted(siblings))}"
     if deps:
         msg += "\n" + "\n".join(deps)
     return msg
@@ -1125,10 +1123,8 @@ def _install_from_git(repo_url):
             target = SKILLS_DIR / name
             if target.exists():
                 continue
-            target.mkdir(parents=True)
-            for f in sf.parent.iterdir():
-                if f.is_file():
-                    shutil.copy2(f, target / f.name)
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(sf.parent, target, dirs_exist_ok=True)
             installed.append(name)
         if not installed:
             return f"{C.YELLOW}no new skills to install (already exist or invalid){C.RESET}"
@@ -1253,34 +1249,43 @@ def _download_github_siblings(skill_url, skill_dir):
     dir_path = path.rsplit("/", 1)[0] if "/" in path else "."
     if not dir_path or dir_path == ".":
         return []
-    api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
-    try:
-        resp = requests.get(api_url, timeout=15, headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "tbot/1.0",
-        })
-        resp.raise_for_status()
-        items = resp.json()
-        if not isinstance(items, list):
-            return []
-        downloaded = []
-        for item in items:
-            name = item.get("name", "")
-            if name == "SKILL.md" or item.get("type") != "file":
-                continue
-            dl_url = item.get("download_url")
-            if not dl_url:
-                continue
-            try:
-                fresp = requests.get(dl_url, timeout=15)
-                if fresp.status_code == 200:
-                    (skill_dir / name).write_bytes(fresp.content)
-                    downloaded.append(name)
-            except Exception:
-                pass
-        return downloaded
-    except Exception:
-        return []
+    downloaded = []
+
+    def _fetch_dir(dir_path, local_dir):
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
+        try:
+            resp = requests.get(api_url, timeout=15, headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "tbot/1.0",
+            })
+            resp.raise_for_status()
+            items = resp.json()
+            if not isinstance(items, list):
+                return
+            for item in items:
+                name = item.get("name", "")
+                if name == "SKILL.md":
+                    continue
+                if item.get("type") == "dir":
+                    subdir = local_dir / name
+                    subdir.mkdir(parents=True, exist_ok=True)
+                    _fetch_dir(f"{dir_path}/{name}", subdir)
+                elif item.get("type") == "file":
+                    dl_url = item.get("download_url")
+                    if not dl_url:
+                        continue
+                    try:
+                        fresp = requests.get(dl_url, timeout=15)
+                        if fresp.status_code == 200:
+                            (local_dir / name).write_bytes(fresp.content)
+                            downloaded.append(name)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    _fetch_dir(dir_path, skill_dir)
+    return downloaded
 
 
 def _install_skill_from_url(url):
