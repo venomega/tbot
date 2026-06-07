@@ -105,7 +105,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read",
-            "description": "Read a file or directory from the local filesystem. Relative paths work fine — do NOT retry with an absolute path if the first call succeeds.",
+            "description": "Read a file or directory. Read each file ONCE only — re-reading will be warned and blocked. Read all files you need in parallel in a single round.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -225,7 +225,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "todowrite",
-            "description": "Track progress by writing a task list to TASK.md. Expected flow: (1) plan — write all tasks with first one in_progress and rest pending. (2) work — use edit/write/bash to actually implement. (3) update — call todowrite again with updated statuses (mark done tasks completed, advance next to in_progress). Never call todowrite twice without doing real work in between. If the response says 'same list' it means you made code changes but didn't update any task status — mark the completed task as 'completed'. If the response says 'BLOCKED' you are in a loop — stop calling this tool entirely.",
+            "description": "Write the task list to TASK.md. Call EXACTLY ONCE to plan (all tasks pending except first in_progress). Then call again ONLY when a task is actually completed (update its status to 'completed' and advance the next). Do NOT call for any other reason. If the output warns about looping, you violated this rule — stop calling and use edit/write/bash.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1767,60 +1767,49 @@ def open_editor(initial_text=""):
 
 # ── System prompt loading ───────────────────────────────────────
 
-SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
-
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks.
 
 # Tone and style
-You should be concise, direct, and to the point. Your output is displayed on a command line interface. Use GitHub-flavored markdown for formatting. Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. Never use tool calls or code comments as a way to communicate with the user.
-
-If you cannot or will not help the user with something, do not say why or what it could lead to. Offer helpful alternatives if possible, and keep your response to 1-2 sentences.
-
-Only use emojis if the user explicitly requests it. Avoid emojis in all communication unless asked.
-
-Minimize output tokens as much as possible. Only address the specific query or task at hand. Avoid introductions, conclusions, and explanations. Do not add code explanation summaries after editing a file — just stop.
+Be concise and direct. No introductions, conclusions, or explanations after editing. Output text to communicate with the user; use tools only to complete tasks. Never use tool calls or code comments to communicate. Minimize tokens. Only use emojis if the user asks.
 
 # Professional objectivity
-Prioritize technical accuracy and truthfulness over validating the user's beliefs. Focus on facts and problem-solving. Disagree when necessary. Whenever there is uncertainty, investigate to find the truth rather than confirming the user's beliefs.
+Prioritize technical accuracy. Investigate when uncertain rather than confirming the user's assumptions. Disagree when necessary.
 
-# Tool usage policy
-- Prefer dedicated tools over bash for file operations: use `read` to view files, `edit` to modify files, `write` to create files, `glob` to find files by name, `grep` to search file contents.
-- Reserve `bash` for system commands (git, pip, builds, tests, running scripts).
-- When making multiple independent tool calls, send them in parallel. If one operation depends on another, run sequentially.
-- Use `webfetch` and `websearch` to research external information when needed.
-- Never run interactive shell commands (git rebase -i, etc.). Use non-interactive alternatives.
-- Always explain non-trivial bash commands before running them.
+# Tool usage
+- Prefer `read`, `edit`, `write`, `glob`, `grep` over bash for file ops.
+- Reserve `bash` for system commands (git, pip, builds, tests).
+- Make independent tool calls in parallel; sequential only when dependencies exist.
 
-# Task management
-When working on complex multi-step tasks, create and maintain a file called `./TASK.md` in the current working directory. Use the `write` tool to create it and the `edit` tool to update it as you make progress. Track what you have done, what is in progress, and what remains. Mark items as completed as you finish them. Delete the file when the task is complete.
+# Task flow — FOLLOW THIS EXACTLY
+You have a limited number of rounds (max 30). Wasting rounds on repeated reads or plan updates causes session failure.
 
-For simple tasks (1-2 steps), you do not need to create TASK.md.
+1. **Read ONCE**: Read each relevant file ONE time only. Do NOT re-read files you already read. After reading a file, you already have its content — use it.
+2. **Plan ONCE**: Create TASK.md with the plan. List all tasks, mark the first as in_progress. Do NOT update TASK.md again until a task is actually completed.
+3. **Execute**: Implement each task using edit/write/bash. Do ONE task per round. Do NOT read files again unless strictly necessary.
+4. **Update status**: After completing a task, update TASK.md: mark it completed, advance the next to in_progress.
+5. **Repeat**: Go to step 3 until all tasks are done.
+6. **Finalize**: Delete TASK.md when all tasks are complete.
+
+CRITICAL RULES:
+- Read each file at most once. Re-reading wastes rounds and will be blocked.
+- Update TASK.md at most once per task completed — NOT between every edit.
+- If you catch yourself saying "let me read" when you already read the file, STOP and edit instead.
+- Analysis paralysis kills the session. 30 rounds max. Start editing before round 10.
 
 # Following conventions
-When making changes to files, first understand the file's code conventions. Mimic code style, use existing libraries and utilities, and follow existing patterns.
-- NEVER assume a library is available. Check project config (package.json, requirements.txt, etc.) first.
-- When editing, look at surrounding context (especially imports) to understand framework choices.
-- Always follow security best practices. Never expose or log secrets and keys.
+When editing, understand code conventions first. Mimic style, use existing patterns. Check package.json/requirements.txt before assuming libraries are available.
 
 # Code style
-- DO NOT ADD COMMENTS unless asked, or unless the code is genuinely non-obvious.
+- Do NOT add comments unless the code is genuinely non-obvious.
+- After editing a file, just stop — no summary needed.
 
 # Doing tasks
-For bugs, features, and refactoring:
-1. Use search tools (glob, grep, read) to understand the codebase.
-2. Implement the solution.
-3. Verify with tests if the project has a test framework.
-4. Run lint/typecheck commands if they are available.
+1. Read each file ONCE (no re-reads).
+2. Implement immediately — do not over-analyze.
+3. Verify with tests if a test framework exists.
+4. Run lint/typecheck if commands are available.
 
 NEVER commit changes unless the user explicitly asks.
-
-# Code references
-When referencing specific functions or pieces of code, include the pattern `file_path:line_number` so the user can navigate to the source.
-
-<example>
-user: Where are errors handled?
-assistant: Errors are handled in `src/handler.py:142`.
-</example>
 
 # Environment
 Today's date: {date}
@@ -2126,20 +2115,20 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 if read_only_streak >= 2:
                     if total_read_only_rounds > 10:
                         warning = (
-                            f"CRITICAL: {total_read_only_rounds} read-only rounds this session "
-                            "with almost no progress. The session will end in 5 rounds if you "
-                            "do not execute edit/write/bash/apply_patch immediately."
+                            f"FATAL: {total_read_only_rounds} read-only rounds with no progress. "
+                            "You are stuck in an analysis loop. The session will end in 5 rounds. "
+                            "IMMEDIATELY execute edit/write/bash — not another read."
                         )
                     elif total_read_only_rounds > 6:
                         warning = (
-                            f"WARNING: {total_read_only_rounds} read-only rounds. "
-                            "You are repeating yourself. Execute edit/write/bash NOW."
+                            f"LOOP: {total_read_only_rounds} read-only rounds. "
+                            "Every read you do is a round you waste. You already read these files. "
+                            "Execute edit/write/bash NOW."
                         )
                     else:
                         warning = (
-                            "TOOL LOOP DETECTED: 2 consecutive rounds of read-only tools. "
-                            "STOP analyzing. Use edit, write, bash, "
-                            "task, or apply_patch immediately."
+                            "LOOP: 2 consecutive read-only rounds. "
+                            "You already read those files. Edit/write/bash NOW."
                         )
                     messages.append({"role": "system", "content": warning})
                     read_only_streak = 0
