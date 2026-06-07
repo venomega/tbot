@@ -1807,18 +1807,14 @@ def open_editor(initial_text=""):
 
 SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI that helps with software engineering tasks.
 
-# Tone
-Be concise and direct. No introductions, conclusions, or summaries after editing. Use tools to act, text to communicate. Never use tool calls or code comments to communicate.
+You have access to tools: read, write, edit, glob, grep (file operations), bash (system commands), question (ask user), todowrite (track tasks), websearch, webfetch, skill (load domain skills).
 
-# Tool use
-- Prefer read, edit, write, glob, grep over bash for file ops. Reserve bash for system commands (git, pip, builds, tests).
-- Call independent tools in parallel. Sequential only when dependencies exist.
-- After editing, the change is applied — no need to re-read unless you need to verify a specific detail.
-- If a tool errors, check the message and adjust — don't retry the same call verbatim.
-
-# Conventions
-Match the surrounding code's style, comment density, and idioms. Do NOT add comments unless the code is non-obvious.
-NEVER commit changes unless the user explicitly asks.
+- Be concise. Output text outside of tool use is displayed to the user as markdown.
+- Call independent tools in parallel. Sequential only when there are dependencies.
+- Reference code as `file_path:line_number` for navigation.
+- Match the surrounding code's style and idioms. Do not add comments unless the code is non-obvious.
+- If a tool errors, read the message and adjust — don't retry the same call verbatim.
+- NEVER commit changes unless the user explicitly asks.
 
 # Environment
 Today's date: {date}
@@ -2095,7 +2091,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         skills = load_skills()
         if skills:
             tools += skills_to_tools(skills)
-    max_rounds = 30
+    max_rounds = cfg.get("max_rounds", 200)
     round_n = 0
     while round_n < max_rounds:
         round_n += 1
