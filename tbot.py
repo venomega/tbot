@@ -554,7 +554,11 @@ def handle_bash(args):
         return f"Error: {e} (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
 
 
+# --- read tracking (anti-loop) ---
+_read_files = set()
+
 def handle_read(args):
+    global _read_files
     raw = args.get("filePath", "")
     if not raw:
         return "Error: filePath is required"
@@ -584,6 +588,9 @@ def handle_read(args):
         else:
             result += f"\n({total} entries)"
         result += "\n</entries>"
+        if filepath in _read_files:
+            result += "\n\n⚠ You already read this directory. Do NOT re-read it."
+        _read_files.add(filepath)
         return result
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
@@ -602,6 +609,9 @@ def handle_read(args):
     else:
         result += f"\n(End of file - total {total} lines)"
     result += "\n</content>"
+    if filepath in _read_files and offset <= 1:
+        result += "\n\n⚠ You already read this file. Do NOT re-read it — you already have the content."
+    _read_files.add(filepath)
     return result
 
 
@@ -2088,7 +2098,9 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             tools += skills_to_tools(skills)
     max_rounds = 30
     read_only_streak = 0
+    total_read_only_rounds = 0
     round_n = 0
+    _read_files.clear()
     while round_n < max_rounds:
         round_n += 1
         try:
@@ -2108,18 +2120,28 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 names = [tc["function"]["name"] for tc in tool_calls]
                 if all(_is_read_only_tool(n) for n in names):
                     read_only_streak += 1
+                    total_read_only_rounds += 1
                 else:
                     read_only_streak = 0
-                if read_only_streak >= 3:
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            "TOOL LOOP DETECTED: 3 consecutive rounds of read-only tools "
-                            "without making changes. STOP analyzing. Use edit, write, bash, "
-                            "task, or apply_patch immediately. Do NOT call read-only tools "
-                            "again until you have made a change."
-                        ),
-                    })
+                if read_only_streak >= 2:
+                    if total_read_only_rounds > 10:
+                        warning = (
+                            f"CRITICAL: {total_read_only_rounds} read-only rounds this session "
+                            "with almost no progress. The session will end in 5 rounds if you "
+                            "do not execute edit/write/bash/apply_patch immediately."
+                        )
+                    elif total_read_only_rounds > 6:
+                        warning = (
+                            f"WARNING: {total_read_only_rounds} read-only rounds. "
+                            "You are repeating yourself. Execute edit/write/bash NOW."
+                        )
+                    else:
+                        warning = (
+                            "TOOL LOOP DETECTED: 2 consecutive rounds of read-only tools. "
+                            "STOP analyzing. Use edit, write, bash, "
+                            "task, or apply_patch immediately."
+                        )
+                    messages.append({"role": "system", "content": warning})
                     read_only_streak = 0
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
