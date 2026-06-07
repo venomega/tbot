@@ -226,7 +226,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "todowrite",
-            "description": "Track progress by writing a task list to TASK.md. Call ONLY when you have actually started or completed work — do NOT call this repeatedly just to restate the same plan without taking action.",
+            "description": "Track progress by writing a task list to TASK.md. Call at most 2-3 times per task: once to plan, optionally during milestones, and once to verify completion. If the output says nothing changed or warns about looping, STOP calling this tool and use edit/write/bash/apply_patch instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -393,7 +393,7 @@ def _resolve_path(p, *, also_try_cwd=True):
 MAX_TOOL_OUTPUT = 8000
 
 _READ_ONLY_TOOLS = frozenset({
-    "read", "read_file", "glob", "grep", "todowrite",
+    "read", "read_file", "glob", "grep",
     "question", "webfetch", "websearch", "get_system_info",
     "skill", "skills", "invalid",
 })
@@ -747,23 +747,80 @@ def handle_webfetch(args):
     return text or "(no readable content found)"
 
 
+# --- todowrite state (loop prevention) ---
+_todo_prev_fingerprint = None
+_todo_noop_count = 0
+_todo_last_call_time = 0
+
+def _todo_fingerprint(todos):
+    return tuple(sorted(
+        (t.get("content", ""), t.get("status", ""), t.get("priority", ""))
+        for t in todos
+    ))
+
 def handle_todowrite(args):
+    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time
+
+    now = time.time()
+
+    # --- rate limiter: <15s since last call = rapid-fire loop ---
+    if 0 < now - _todo_last_call_time < 15:
+        _todo_last_call_time = now
+        return (
+            "TOOL LOOP BLOCKED: todowrite called <15s after previous call. "
+            "TASK.md was NOT updated. Use edit/write/bash/apply_patch to make progress."
+        )
+    _todo_last_call_time = now
+
     todos = args.get("todos", [])
+    fingerprint = _todo_fingerprint(todos)
+
+    # --- loop detection: same content back-to-back ---
+    if fingerprint == _todo_prev_fingerprint:
+        _todo_noop_count += 1
+    else:
+        _todo_noop_count = 0
+        _todo_prev_fingerprint = fingerprint
+
+    if _todo_noop_count >= 2:
+        return (
+            "TOOL LOOP BLOCKED: todowrite called 2+ times with identical task list. "
+            "TASK.md was NOT updated. Stop planning — execute the in_progress task "
+            "using edit/write/bash/apply_patch now."
+        )
+
+    # --- write TASK.md ---
     task_file = CURRENT_DIR / "TASK.md"
     lines = ["# Task List", ""]
+    in_progress = None
+    completed_count = 0
     for t in todos:
         status_map = {"pending": " ", "in_progress": "~", "completed": "x", "cancelled": "-"}
         m = status_map.get(t.get("status", "pending"), " ")
         priority = t.get("priority", "medium")
         prio_tag = f" [{priority}]" if priority != "medium" else ""
         lines.append(f"- [{m}]{prio_tag} {t['content']}")
+        if t.get("status") == "in_progress":
+            in_progress = t["content"]
+        if t.get("status") == "completed":
+            completed_count += 1
     lines.append("")
     lines.append(f"<!-- Last updated: {time.strftime('%Y-%m-%d %H:%M:%S')} -->")
+
     try:
         task_file.write_text("\n".join(lines), encoding="utf-8")
-        return f"Task list written to {task_file} ({len(todos)} items)"
     except Exception as e:
         return f"Error writing task list: {e}"
+
+    # --- build rich response ---
+    response = f"✓ TASK.md updated ({len(todos)} tasks, {completed_count} done)"
+    if _todo_noop_count >= 1:
+        response += " | ⚠ same list as before — take action instead"
+    if in_progress:
+        response += f" | → working on: {in_progress[:80]}"
+    response += " | next: use edit/write/bash to make progress"
+
+    return response
 
 
 def _resolve_ddg_url(url):
@@ -2019,7 +2076,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                             "read-only tool calls without making any changes. "
                             "STOP analyzing and take action now. "
                             "Use edit, write, bash, task, or apply_patch immediately. "
-                            "Do NOT call read, read_file, glob, grep, todowrite, question, "
+                            "Do NOT call read, read_file, glob, grep, question, "
                             "webfetch, or websearch again until you have made a change."
                         ),
                     })
