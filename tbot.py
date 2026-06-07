@@ -529,7 +529,9 @@ def _list_outputs(cmd, cwd):
     return "\n" + "\n".join(lines) if lines else ""
 
 def handle_bash(args):
-    cmd = args["command"]
+    cmd = _pick(args, "command", "cmd")
+    if not cmd:
+        return "Error: command is required"
     desc = args.get("description", "")
     timeout_ms = args.get("timeout", 120000)
     workdir = args.get("workdir")
@@ -604,7 +606,9 @@ def handle_read(args):
 
 
 def handle_glob(args):
-    pattern = args["pattern"]
+    pattern = _pick(args, "pattern")
+    if not pattern:
+        return "Error: pattern is required"
     search_path = args.get("path", ".")
     import glob as glob_mod
     p = _resolve_path(search_path)
@@ -622,7 +626,9 @@ def handle_glob(args):
 
 
 def handle_grep(args):
-    pattern = args["pattern"]
+    pattern = _pick(args, "pattern")
+    if not pattern:
+        return "Error: pattern is required"
     search_path = args.get("path", ".")
     include = args.get("include")
     root = _resolve_path(search_path)
@@ -662,11 +668,24 @@ def handle_grep(args):
     return "\n".join(matches) if matches else "No files found"
 
 
+def _pick(args, *keys):
+    """Return the first matching key's value from args, or None."""
+    for k in keys:
+        if k in args:
+            return args[k]
+    return None
+
 def handle_edit(args):
-    filepath = str(_resolve_path(args["filePath"]))
-    old = args["oldString"]
-    new = args["newString"]
-    replace_all = args.get("replaceAll", False)
+    filepath = str(_resolve_path(args.get("filePath", "")))
+    if not filepath:
+        return "Error: filePath is required"
+    old = _pick(args, "oldString", "old_string")
+    new = _pick(args, "newString", "new_string")
+    if old is None:
+        return "Error: oldString (or old_string) is required"
+    if new is None:
+        return "Error: newString (or new_string) is required"
+    replace_all = args.get("replaceAll", args.get("replace_all", False))
     if old == new:
         return "No changes to apply: oldString and newString are identical."
     p = Path(filepath)
@@ -697,8 +716,12 @@ def handle_edit(args):
 
 
 def handle_write(args):
-    filepath = str(_resolve_path(args["filePath"]))
-    content = args["content"]
+    filepath = str(_resolve_path(args.get("filePath", "")))
+    if not filepath:
+        return "Error: filePath is required"
+    content = _pick(args, "content")
+    if content is None:
+        return "Error: content is required"
     p = Path(filepath)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -720,7 +743,9 @@ def handle_task(args):
 
 
 def handle_webfetch(args):
-    url = args["url"]
+    url = _pick(args, "url")
+    if not url:
+        return "Error: url is required"
     fmt = args.get("format", "markdown")
     timeout = min(args.get("timeout", 30), 120)
     if not url.startswith(("http://", "https://")):
@@ -841,7 +866,9 @@ def _resolve_ddg_url(url):
 
 
 def handle_websearch(args):
-    query = args["query"]
+    query = _pick(args, "query")
+    if not query:
+        return "Error: query is required"
     num_results = min(args.get("numResults", 8), 10)
     try:
         sess = requests.Session()
@@ -899,7 +926,9 @@ def handle_websearch(args):
 
 
 def handle_skill(args):
-    name = args["name"]
+    name = args.get("name", "")
+    if not name:
+        return "Error: name is required"
     skills = load_skills()
     for n, desc, schema, doc in skills:
         if n == name:
@@ -978,11 +1007,16 @@ def handle_apply_patch(args):
 # ── Legacy handlers (kept) ──────────────────────────────────
 
 def handle_install_skill(args):
-    return _install_skill_from_url(args["url"])
+    url = args.get("url", "")
+    if not url:
+        return "Error: url is required"
+    return _install_skill_from_url(url)
 
 
 def handle_create_skill(args):
-    name = args["name"]
+    name = args.get("name", "")
+    if not name:
+        return "Error: name is required"
     if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
         return f"{C.RED}invalid skill name — use letters, numbers, underscores{C.RESET}"
     desc = args.get("description", name)
