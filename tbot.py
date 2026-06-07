@@ -589,7 +589,7 @@ def handle_read(args):
             result += f"\n({total} entries)"
         result += "\n</entries>"
         if filepath in _read_files:
-            result += "\n\n⚠ You already read this directory. Do NOT re-read it."
+            return f"⚠ BLOCKED: You already read this directory ({filepath}). Do NOT re-read."
         _read_files.add(filepath)
         return result
     try:
@@ -610,7 +610,7 @@ def handle_read(args):
         result += f"\n(End of file - total {total} lines)"
     result += "\n</content>"
     if filepath in _read_files and offset <= 1:
-        result += "\n\n⚠ You already read this file. Do NOT re-read it — you already have the content."
+        return f"⚠ BLOCKED: You already read this file ({filepath}). You already have its content. Do NOT re-read."
     _read_files.add(filepath)
     return result
 
@@ -716,7 +716,22 @@ def handle_edit(args):
         return f"Replaced {count} occurrence(s) in {filepath}"
     idx = text.find(old)
     if idx == -1:
-        return f"Error: could not find:\n{old[:500]}"
+        lines = text.split('\n')
+        clue_lines = []
+        for old_line in old.strip().split('\n')[:3]:
+            stripped = old_line.strip()
+            if stripped:
+                for i, fline in enumerate(lines):
+                    if stripped in fline:
+                        start = max(0, i - 2)
+                        end = min(len(lines), i + 3)
+                        ctx = '\n'.join(f'{j+1}: {lines[j]}' for j in range(start, end))
+                        clue_lines.append(f"  Near line {i+1}:\n{ctx}")
+                        break
+        hint = ""
+        if clue_lines:
+            hint = "\nClosest matches in file:\n" + "\n".join(clue_lines[:2])
+        return f"Error: could not find:\n{old[:500]}{hint}"
     last_idx = text.rfind(old)
     if idx != last_idx:
         return "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
@@ -1646,6 +1661,7 @@ def parse_stream(resp):
 # ── Tool execution ──────────────────────────────────────────────
 
 def execute_tool_calls(tool_calls, messages, cfg):
+    global _todo_has_write_since_last
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -1921,6 +1937,7 @@ def main():
                 print_help()
             elif cmd == "new":
                 messages = _init_messages(cfg)
+                _read_files.clear()
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
                 if arg:
@@ -2089,7 +2106,6 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     read_only_streak = 0
     total_read_only_rounds = 0
     round_n = 0
-    _read_files.clear()
     while round_n < max_rounds:
         round_n += 1
         try:
