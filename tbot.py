@@ -225,7 +225,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "todowrite",
-            "description": "Track progress by writing a task list to TASK.md. Call at most 2-3 times per task: once to plan, optionally during milestones, and once to verify completion. If the output says nothing changed or warns about looping, STOP calling this tool and use edit/write/bash/apply_patch instead.",
+            "description": "Track progress by writing a task list to TASK.md. Expected flow: (1) plan — write all tasks with first one in_progress and rest pending. (2) work — use edit/write/bash to actually implement. (3) update — call todowrite again with updated statuses (mark done tasks completed, advance next to in_progress). Never call todowrite twice without doing real work in between. If the response says 'same list' it means you made code changes but didn't update any task status — mark the completed task as 'completed'. If the response says 'BLOCKED' you are in a loop — stop calling this tool entirely.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -392,7 +392,7 @@ def _resolve_path(p, *, also_try_cwd=True):
 MAX_TOOL_OUTPUT = 8000
 
 _READ_ONLY_TOOLS = frozenset({
-    "read", "read_file", "glob", "grep",
+    "read", "read_file", "glob", "grep", "todowrite",
     "question", "webfetch", "websearch", "get_system_info",
     "skill", "skills", "invalid",
 })
@@ -750,6 +750,7 @@ def handle_webfetch(args):
 _todo_prev_fingerprint = None
 _todo_noop_count = 0
 _todo_last_call_time = 0
+_todo_has_write_since_last = False  # set by execute_tool_calls when edit/write/bash runs
 
 def _todo_fingerprint(todos):
     return tuple(sorted(
@@ -758,7 +759,7 @@ def _todo_fingerprint(todos):
     ))
 
 def handle_todowrite(args):
-    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time
+    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time, _todo_has_write_since_last
 
     now = time.time()
 
@@ -784,8 +785,9 @@ def handle_todowrite(args):
     if _todo_noop_count >= 2:
         return (
             "TOOL LOOP BLOCKED: todowrite called 2+ times with identical task list. "
-            "TASK.md was NOT updated. Stop planning — execute the in_progress task "
-            "using edit/write/bash/apply_patch now."
+            "TASK.md was NOT updated. If you made code changes, update the task statuses "
+            "(set completed tasks to 'completed', advance next to 'in_progress'). "
+            "Otherwise stop planning and use edit/write/bash."
         )
 
     # --- write TASK.md ---
@@ -814,10 +816,15 @@ def handle_todowrite(args):
     # --- build rich response ---
     response = f"✓ TASK.md updated ({len(todos)} tasks, {completed_count} done)"
     if _todo_noop_count >= 1:
-        response += " | ⚠ same list as before — take action instead"
+        if _todo_has_write_since_last:
+            response += " | ⚠ You made code changes but no task status changed. Mark done tasks as 'completed' and advance the next to 'in_progress'."
+        else:
+            response += " | ⚠ same list as before — take action instead"
     if in_progress:
         response += f" | → working on: {in_progress[:80]}"
-    response += " | next: use edit/write/bash to make progress"
+    if _todo_has_write_since_last and _todo_noop_count == 0:
+        response += " | progress tracked — continue working"
+    _todo_has_write_since_last = False
 
     return response
 
@@ -1635,6 +1642,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
         preview = result[:500].replace("\n", "\\n")
         print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        if name not in _READ_ONLY_TOOLS and ok:
+            _todo_has_write_since_last = True
     return True
 
 # ── UI ──────────────────────────────────────────────────────────
@@ -2071,12 +2080,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     messages.append({
                         "role": "system",
                         "content": (
-                            "TOOL LOOP DETECTED: You have made 3 consecutive rounds of "
-                            "read-only tool calls without making any changes. "
-                            "STOP analyzing and take action now. "
-                            "Use edit, write, bash, task, or apply_patch immediately. "
-                            "Do NOT call read, read_file, glob, grep, question, "
-                            "webfetch, or websearch again until you have made a change."
+                            "TOOL LOOP DETECTED: 3 consecutive rounds of read-only tools "
+                            "without making changes. STOP analyzing. Use edit, write, bash, "
+                            "task, or apply_patch immediately. Do NOT call read-only tools "
+                            "again until you have made a change."
                         ),
                     })
                     read_only_streak = 0
