@@ -686,9 +686,10 @@ def _pick(args, *keys):
     return None
 
 def handle_edit(args):
-    filepath = str(_resolve_path(args.get("filePath", "")))
-    if not filepath:
+    fp = _pick(args, "filePath", "file_path")
+    if not fp:
         return "Error: filePath is required"
+    filepath = str(_resolve_path(fp))
     old = _pick(args, "oldString", "old_string")
     new = _pick(args, "newString", "new_string")
     if old is None:
@@ -701,6 +702,8 @@ def handle_edit(args):
     p = Path(filepath)
     if not p.exists():
         return f"Error: file not found: {filepath}"
+    if p.is_dir():
+        return f"Error: path is a directory, not a file: {filepath}"
     try:
         text = p.read_text(encoding="utf-8")
     except Exception as e:
@@ -741,9 +744,10 @@ def handle_edit(args):
 
 
 def handle_write(args):
-    filepath = str(_resolve_path(args.get("filePath", "")))
-    if not filepath:
+    fp = _pick(args, "filePath", "file_path")
+    if not fp:
         return "Error: filePath is required"
+    filepath = str(_resolve_path(fp))
     content = _pick(args, "content")
     if content is None:
         return "Error: content is required"
