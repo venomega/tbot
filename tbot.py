@@ -15,7 +15,8 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+#OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_URL = "https://opencode.ai/zen/v1/chat/completions"
 
 class C:
     RESET = "\033[0m"
@@ -225,7 +226,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "todowrite",
-            "description": "Create and manage a structured task list for your current session. Helps you track progress and organize complex tasks.",
+            "description": "Track progress by writing a task list to TASK.md. Call ONLY when you have actually started or completed work — do NOT call this repeatedly just to restate the same plan without taking action.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -390,6 +391,15 @@ def _resolve_path(p, *, also_try_cwd=True):
 # ── Handler helpers ──────────────────────────────────────────
 
 MAX_TOOL_OUTPUT = 8000
+
+_READ_ONLY_TOOLS = frozenset({
+    "read", "read_file", "glob", "grep", "todowrite",
+    "question", "webfetch", "websearch", "get_system_info",
+    "skill", "skills", "invalid",
+})
+
+def _is_read_only_tool(name):
+    return name in _READ_ONLY_TOOLS
 
 
 def _truncate_output(text):
@@ -668,9 +678,7 @@ def handle_edit(args):
     except Exception as e:
         return f"Error reading file: {e}"
     if not old:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(new, encoding="utf-8")
-        return f"Written {len(new)} bytes to {filepath} (new file)"
+        return f"Error: oldString is empty. Use 'write' tool to create new files or provide content to replace."
     if replace_all:
         if old not in text:
             return f"Error: could not find:\n{old[:500]}"
@@ -1979,7 +1987,8 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         skills = load_skills()
         if skills:
             tools += skills_to_tools(skills)
-    max_rounds = 90
+    max_rounds = 30
+    read_only_streak = 0
     round_n = 0
     while round_n < max_rounds:
         round_n += 1
@@ -1997,6 +2006,24 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if tool_calls:
                 if content:
                     print()
+                names = [tc["function"]["name"] for tc in tool_calls]
+                if all(_is_read_only_tool(n) for n in names):
+                    read_only_streak += 1
+                else:
+                    read_only_streak = 0
+                if read_only_streak >= 3:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "TOOL LOOP DETECTED: You have made 3 consecutive rounds of "
+                            "read-only tool calls without making any changes. "
+                            "STOP analyzing and take action now. "
+                            "Use edit, write, bash, task, or apply_patch immediately. "
+                            "Do NOT call read, read_file, glob, grep, todowrite, question, "
+                            "webfetch, or websearch again until you have made a change."
+                        ),
+                    })
+                    read_only_streak = 0
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
                     break
