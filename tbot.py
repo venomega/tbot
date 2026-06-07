@@ -15,8 +15,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
-#OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-OPENROUTER_URL = "https://opencode.ai/zen/v1/chat/completions"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class C:
     RESET = "\033[0m"
