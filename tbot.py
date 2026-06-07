@@ -554,11 +554,34 @@ def handle_bash(args):
         return f"Error: {e} (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
 
 
-# --- read tracking (anti-loop) ---
-_read_files = set()
+# --- doom loop detection ---
+_doom_trail = []
 
+def _check_doom_loop(tool_calls):
+    global _doom_trail
+    for tc in tool_calls:
+        name = tc["function"]["name"]
+        args_raw = tc["function"].get("arguments", "{}")
+        try:
+            normalized = json.dumps(json.loads(args_raw), sort_keys=True)
+        except json.JSONDecodeError:
+            normalized = args_raw
+        _doom_trail.append((name, normalized))
+    if len(_doom_trail) > 9:
+        _doom_trail = _doom_trail[-9:]
+    if len(_doom_trail) >= 3:
+        last_3 = _doom_trail[-3:]
+        if all(t == last_3[0] for t in last_3):
+            _doom_trail.clear()
+            return (
+                f"DOOM LOOP: You called {last_3[0][0]} 3 times with identical arguments. "
+                "This is a loop. The tool was NOT executed. "
+                "Use different arguments, a different tool, or respond with text."
+            )
+    return None
+
+# --- read tool ---
 def handle_read(args):
-    global _read_files
     raw = args.get("filePath", "")
     if not raw:
         return "Error: filePath is required"
@@ -588,9 +611,6 @@ def handle_read(args):
         else:
             result += f"\n({total} entries)"
         result += "\n</entries>"
-        if filepath in _read_files:
-            return f"⚠ BLOCKED: You already read this directory ({filepath}). Do NOT re-read."
-        _read_files.add(filepath)
         return result
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
@@ -599,19 +619,17 @@ def handle_read(args):
     lines = text.split("\n")
     total = len(lines)
     start = max(0, offset - 1)
-    sliced = lines[start:start + limit]
+    end = min(start + limit, total)
+    sliced = lines[start:end]
     result = f"<path>{filepath}</path>\n<type>file</type>\n<content>\n"
     for i, line in enumerate(sliced, start + 1):
         result += f"{i}: {line}\n"
-    last = start + len(sliced)
+    last = end
     if last < total:
         result += f"\n(Showing lines {offset}-{last} of {total}. Use offset={last + 1} to continue.)"
     else:
         result += f"\n(End of file - total {total} lines)"
     result += "\n</content>"
-    if filepath in _read_files and offset <= 1:
-        return f"⚠ BLOCKED: You already read this file ({filepath}). You already have its content. Do NOT re-read."
-    _read_files.add(filepath)
     return result
 
 
@@ -1787,48 +1805,19 @@ def open_editor(initial_text=""):
 
 # ── System prompt loading ───────────────────────────────────────
 
-SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks.
+SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI that helps with software engineering tasks.
 
-# Tone and style
-Be concise and direct. No introductions, conclusions, or explanations after editing. Output text to communicate with the user; use tools only to complete tasks. Never use tool calls or code comments to communicate. Minimize tokens. Only use emojis if the user asks.
+# Tone
+Be concise and direct. No introductions, conclusions, or summaries after editing. Use tools to act, text to communicate. Never use tool calls or code comments to communicate.
 
-# Professional objectivity
-Prioritize technical accuracy. Investigate when uncertain rather than confirming the user's assumptions. Disagree when necessary.
+# Tool use
+- Prefer read, edit, write, glob, grep over bash for file ops. Reserve bash for system commands (git, pip, builds, tests).
+- Call independent tools in parallel. Sequential only when dependencies exist.
+- After editing, the change is applied — no need to re-read unless you need to verify a specific detail.
+- If a tool errors, check the message and adjust — don't retry the same call verbatim.
 
-# Tool usage
-- Prefer `read`, `edit`, `write`, `glob`, `grep` over bash for file ops.
-- Reserve `bash` for system commands (git, pip, builds, tests).
-- Make independent tool calls in parallel; sequential only when dependencies exist.
-
-# Task flow — FOLLOW THIS EXACTLY
-You have a limited number of rounds (max 30). Wasting rounds on repeated reads or plan updates causes session failure.
-
-1. **Read ONCE**: Read each relevant file ONE time only. Do NOT re-read files you already read. After reading a file, you already have its content — use it.
-2. **Plan ONCE**: Create TASK.md with the plan. List all tasks, mark the first as in_progress. Do NOT update TASK.md again until a task is actually completed.
-3. **Execute**: Implement each task using edit/write/bash. Do ONE task per round. Do NOT read files again unless strictly necessary.
-4. **Update status**: After completing a task, update TASK.md: mark it completed, advance the next to in_progress.
-5. **Repeat**: Go to step 3 until all tasks are done.
-6. **Finalize**: Delete TASK.md when all tasks are complete.
-
-CRITICAL RULES:
-- Read each file at most once. Re-reading wastes rounds and will be blocked.
-- Update TASK.md at most once per task completed — NOT between every edit.
-- If you catch yourself saying "let me read" when you already read the file, STOP and edit instead.
-- Analysis paralysis kills the session. 30 rounds max. Start editing before round 10.
-
-# Following conventions
-When editing, understand code conventions first. Mimic style, use existing patterns. Check package.json/requirements.txt before assuming libraries are available.
-
-# Code style
-- Do NOT add comments unless the code is genuinely non-obvious.
-- After editing a file, just stop — no summary needed.
-
-# Doing tasks
-1. Read each file ONCE (no re-reads).
-2. Implement immediately — do not over-analyze.
-3. Verify with tests if a test framework exists.
-4. Run lint/typecheck if commands are available.
-
+# Conventions
+Match the surrounding code's style, comment density, and idioms. Do NOT add comments unless the code is non-obvious.
 NEVER commit changes unless the user explicitly asks.
 
 # Environment
@@ -1941,7 +1930,7 @@ def main():
                 print_help()
             elif cmd == "new":
                 messages = _init_messages(cfg)
-                _read_files.clear()
+                _doom_trail.clear()
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
                 if arg:
@@ -2107,8 +2096,6 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         if skills:
             tools += skills_to_tools(skills)
     max_rounds = 30
-    read_only_streak = 0
-    total_read_only_rounds = 0
     round_n = 0
     while round_n < max_rounds:
         round_n += 1
@@ -2126,32 +2113,11 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if tool_calls:
                 if content:
                     print()
-                names = [tc["function"]["name"] for tc in tool_calls]
-                if all(_is_read_only_tool(n) for n in names):
-                    read_only_streak += 1
-                    total_read_only_rounds += 1
-                else:
-                    read_only_streak = 0
-                if read_only_streak >= 2:
-                    if total_read_only_rounds > 10:
-                        warning = (
-                            f"FATAL: {total_read_only_rounds} read-only rounds with no progress. "
-                            "You are stuck in an analysis loop. The session will end in 5 rounds. "
-                            "IMMEDIATELY execute edit/write/bash — not another read."
-                        )
-                    elif total_read_only_rounds > 6:
-                        warning = (
-                            f"LOOP: {total_read_only_rounds} read-only rounds. "
-                            "Every read you do is a round you waste. You already read these files. "
-                            "Execute edit/write/bash NOW."
-                        )
-                    else:
-                        warning = (
-                            "LOOP: 2 consecutive read-only rounds. "
-                            "You already read those files. Edit/write/bash NOW."
-                        )
-                    messages.append({"role": "system", "content": warning})
-                    read_only_streak = 0
+                doom_warning = _check_doom_loop(tool_calls)
+                if doom_warning:
+                    print(f"\n  {C.YELLOW}{doom_warning[:100]}{C.RESET}")
+                    messages.append({"role": "system", "content": doom_warning})
+                    continue
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
                     break
