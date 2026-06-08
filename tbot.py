@@ -389,7 +389,7 @@ def _resolve_path(p, *, also_try_cwd=True):
 
 # ── Handler helpers ──────────────────────────────────────────
 
-MAX_TOOL_OUTPUT = 8000
+MAX_TOOL_OUTPUT = 32000
 
 _READ_ONLY_TOOLS = frozenset({
     "read", "read_file", "glob", "grep", "todowrite",
@@ -556,6 +556,14 @@ def handle_bash(args):
 
 # --- doom loop detection ---
 _doom_trail = []
+_read_trail = set()
+_todo_blocked_count = 0
+
+def _clear_trails():
+    global _doom_trail, _read_trail, _todo_blocked_count
+    _doom_trail.clear()
+    _read_trail.clear()
+    _todo_blocked_count = 0
 
 def _check_doom_loop(tool_calls):
     global _doom_trail
@@ -582,11 +590,22 @@ def _check_doom_loop(tool_calls):
 
 # --- read tool ---
 def handle_read(args):
+    global _read_trail
     raw = args.get("filePath", "")
     if not raw:
         return "Error: filePath is required"
     filepath = str(_resolve_path(raw))
     offset = args.get("offset", 1)
+    key = (filepath, offset)
+    
+    if key in _read_trail:
+        return (
+            f"You already read '{raw}' at offset {offset} in this turn. "
+            "The content is still in context — read a different file or offset, "
+            "use edit/write/bash to work, or respond with text to the user."
+        )
+    _read_trail.add(key)
+    
     limit = args.get("limit", 2000)
     p = Path(filepath)
     if not p.exists():
@@ -621,15 +640,34 @@ def handle_read(args):
     start = max(0, offset - 1)
     end = min(start + limit, total)
     sliced = lines[start:end]
-    result = f"<path>{filepath}</path>\n<type>file</type>\n<content>\n"
+    
+    header = f"<path>{filepath}</path>\n<type>file</type>\n<content>\n"
+    footer_prefix = "\n</content>"
+    
+    # Reserve ~200 chars for the boundary line so truncation is accurate
+    max_body = MAX_TOOL_OUTPUT - len(header) - 200 - len(footer_prefix)
+    if max_body < 200:
+        max_body = 200
+    
+    result = header
+    shown_lines = 0
     for i, line in enumerate(sliced, start + 1):
-        result += f"{i}: {line}\n"
-    last = end
-    if last < total:
-        result += f"\n(Showing lines {offset}-{last} of {total}. Use offset={last + 1} to continue.)"
+        entry = f"{i}: {line}\n"
+        if len(result) + len(entry) > max_body:
+            # Can't fit this line — show accurate boundary
+            remaining = total - i + 1
+            result += f"\n(Showing lines {offset}-{i - 1} of {total}. Use offset={i} to continue.)"
+            break
+        result += entry
+        shown_lines += 1
     else:
-        result += f"\n(End of file - total {total} lines)"
-    result += "\n</content>"
+        # All requested lines fit
+        if end < total:
+            result += f"\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
+        else:
+            result += f"\n(End of file - total {total} lines)"
+    
+    result += footer_prefix
     return result
 
 
@@ -831,18 +869,25 @@ def _todo_fingerprint(todos):
     ))
 
 def handle_todowrite(args):
-    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time, _todo_has_write_since_last
+    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time, _todo_has_write_since_last, _todo_blocked_count
 
     now = time.time()
 
     # --- rate limiter: <15s since last call = rapid-fire loop ---
     if 0 < now - _todo_last_call_time < 15:
         _todo_last_call_time = now
+        _todo_blocked_count += 1
+        if _todo_blocked_count >= 3:
+            return (
+                "STOP calling todowrite. I said it's blocked. "
+                "Go do real work (edit/write/bash) and respond with text when done."
+            )
         return (
             "TOOL LOOP BLOCKED: todowrite called <15s after previous call. "
             "TASK.md was NOT updated. Use edit/write/bash/apply_patch to make progress."
         )
     _todo_last_call_time = now
+    _todo_blocked_count = 0
 
     todos = args.get("todos", [])
     fingerprint = _todo_fingerprint(todos)
@@ -1484,7 +1529,10 @@ def skill_tool_handler(name, args, messages=None):
                     for m in messages[-5:]
                 )
                 if not already:
-                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}"})
+                    skill_dir = SKILLS_DIR / n
+                    siblings = sorted(f.name for f in skill_dir.iterdir() if f.is_file() and f.suffix in (".md", ".txt", ".py", ".sh", ".json"))
+                    siblings_info = f"\n\nSkill directory: {skill_dir}\n" + (f"Reference files: {', '.join(siblings)}" if siblings else "")
+                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}{siblings_info}"})
             return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
     return f"Skill '{name}' not found"
 
@@ -1716,8 +1764,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
                 except KeyboardInterrupt:
                     print(f"\n  {C.YELLOW}cancelled{C.RESET}")
                     return False
-                if len(result) > 8000:
-                    result = result[:8000] + f"\n... (truncated, {len(result)} total chars)"
+                if len(result) > MAX_TOOL_OUTPUT:
+                    result = result[:MAX_TOOL_OUTPUT] + f"\n... (truncated, {len(result)} total chars)"
             else:
                 result = "TOOL_CALL_DECLINED"
 
@@ -1875,7 +1923,10 @@ You have access to these tools:
 # Environment
 Today's date: {date}
 Working directory: {cwd}
-Platform: {platform}"""
+Platform: {platform}
+Skills directory: {skills_dir}
+
+Use the `skill` tool to load instructions for a specific task. Available skills: {skills_list}"""
 
 
 def load_system_prompt(cfg):
@@ -1907,10 +1958,14 @@ def load_system_prompt(cfg):
 
 
 def _env_vars():
+    skills = load_skills()
+    skills_list = ", ".join(n for n, *_ in skills) if skills else "none"
     return {
         "date": time.strftime("%Y-%m-%d"),
         "cwd": str(Path.cwd()),
         "platform": platform.system().lower(),
+        "skills_dir": str(SKILLS_DIR),
+        "skills_list": skills_list,
     }
 
 
@@ -2134,6 +2189,7 @@ Replace this with instructions for the model.
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
+    _clear_trails()
     total = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
     while total > cfg["max_history_chars"] and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
         for i, m in enumerate(messages):
