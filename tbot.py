@@ -1577,6 +1577,9 @@ def save_cfg(cfg):
 def resolve_key(cfg):
     key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
     if key:
+        if not cfg.get("api_key"):
+            cfg["api_key"] = key
+            save_cfg(cfg)
         return key
     print(f"{C.YELLOW}No API key configured.{C.RESET}")
     print(f"Get one at: {C.CYAN}https://openrouter.ai/keys{C.RESET}")
