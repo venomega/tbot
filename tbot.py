@@ -1118,7 +1118,7 @@ def handle_create_skill(args):
         "properties": {"input": {"type": "string", "description": "Input"}},
         "required": ["input"],
     })
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_skills_dir()
     skill_dir = SKILLS_DIR / name
     if skill_dir.exists():
         return f"{C.RED}skill '{name}' already exists{C.RESET}"
@@ -1230,7 +1230,7 @@ def load_skills():
     global _skill_cache
     if _skill_cache is not None:
         return _skill_cache
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_skills_dir()
     default_schema = {
         "type": "object",
         "properties": {"input": {"type": "string", "description": "Input"}},
@@ -1256,6 +1256,10 @@ def load_skills():
     return skills
 
 
+def ensure_skills_dir():
+    if not SKILLS_DIR.is_dir():
+        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
 def clear_skill_cache():
     global _skill_cache
     _skill_cache = None
@@ -1263,7 +1267,7 @@ def clear_skill_cache():
 
 def _install_from_skill_url(skill_url):
     """Install a skill from a direct URL to SKILL.md."""
-    SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_skills_dir()
     try:
         resp = requests.get(skill_url, timeout=30)
         resp.raise_for_status()
@@ -2128,7 +2132,7 @@ def main():
                     if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
                         print(f"{C.RED}invalid skill name{C.RESET}")
                     else:
-                        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+                        ensure_skills_dir()
                         skill_dir = SKILLS_DIR / name
                         if skill_dir.exists():
                             print(f"{C.RED}skill '{name}' already exists{C.RESET}")
