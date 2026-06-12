@@ -1552,7 +1552,9 @@ def default_cfg():
 def load_cfg():
     if not CONFIG_FILE.exists():
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        return default_cfg()
+        cfg = default_cfg()
+        save_cfg(cfg)
+        return cfg
     try:
         data = json.loads(CONFIG_FILE.read_text())
         base = default_cfg()
