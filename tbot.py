@@ -10,6 +10,8 @@ try:
 except ImportError:
     readline = None
 
+_total_tokens = 0
+
 CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
@@ -1729,9 +1731,17 @@ def chat_completion(messages, cfg, stream=True, tools=None):
 
 # ── Stream parsing ──────────────────────────────────────────────
 
+def _term_size():
+    try:
+        return os.get_terminal_size()
+    except (ValueError, OSError):
+        return None
+
+
 def parse_stream(resp):
     content_parts = []
     tool_calls = {}
+    token_count = 0
 
     sock = None
     try:
@@ -1743,7 +1753,7 @@ def parse_stream(resp):
     try:
         iterator = resp.iter_lines()
     except Exception:
-        return None, None
+        return None, None, 0
 
     received = False
     try:
@@ -1779,6 +1789,7 @@ def parse_stream(resp):
                 c = delta.get("content")
                 if c:
                     content_parts.append(c)
+                    token_count += 1
                     print(c, end="", flush=True)
                 for tc in delta.get("tool_calls", []):
                     idx = tc.get("index", 0)
@@ -1800,7 +1811,7 @@ def parse_stream(resp):
 
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
-    return content, calls
+    return content, calls, token_count
 
 # ── Tool execution ──────────────────────────────────────────────
 
@@ -2235,6 +2246,8 @@ def main():
             elif cmd == "help":
                 print_help()
             elif cmd == "new":
+                global _total_tokens
+                _total_tokens = 0
                 messages = _init_messages(cfg)
                 _doom_trail.clear()
                 print(f"{C.GREEN}reset{C.RESET}")
@@ -2436,8 +2449,11 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 if round_n == 1 and pop_on_first_error:
                     messages.pop()
                 break
-            content, tool_calls = parse_stream(result["stream"])
+            global _total_tokens
+            content, tool_calls, tok_count = parse_stream(result["stream"])
             result["stream"].close()
+            if tok_count:
+                _total_tokens += tok_count
             if tool_calls:
                 if content:
                     print()
@@ -2452,6 +2468,8 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 continue
             if content:
                 print()
+                if _total_tokens:
+                    print(f"{C.GRAY}── {_total_tokens} tokens ──{C.RESET}")
                 messages.append({"role": "assistant", "content": content})
             break
         except KeyboardInterrupt:
