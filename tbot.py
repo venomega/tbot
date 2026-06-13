@@ -1552,12 +1552,37 @@ def skill_tool_handler(name, args, messages=None):
             return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
     return f"Skill '{name}' not found"
 
+# ── Model context cache ─────────────────────────────────────
+
+_model_context_cache = {}  # model_id -> {"context_length": int, "timestamp": float}
+
+def get_model_context(model_id, api_key, max_age=3600):
+    now = time.time()
+    cached = _model_context_cache.get(model_id)
+    if cached and now - cached["timestamp"] < max_age:
+        return cached["context_length"]
+    try:
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=10, headers=headers)
+        if resp.status_code == 200:
+            for m in resp.json().get("data", []):
+                if m.get("id") == model_id:
+                    ctx = m.get("context_length")
+                    if ctx:
+                        _model_context_cache[model_id] = {"context_length": ctx, "timestamp": now}
+                        return ctx
+    except Exception:
+        pass
+    return None
+
+
 def default_cfg():
     return {
         "api_key": "",
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
-        "max_tokens": 524288,
         "system_prompt": "",  # empty = load from system_prompt.txt
         "max_history_chars": 200000,
         "tools_enabled": True,
@@ -1575,6 +1600,7 @@ def load_cfg():
         data = json.loads(CONFIG_FILE.read_text())
         base = default_cfg()
         base.update(data)
+        base.pop("max_tokens", None)
         return base
     except Exception:
         return default_cfg()
@@ -1622,6 +1648,25 @@ def show_error(title, detail, hint=""):
     print(f"{C.RED}╰─{'─' * (width-4)}─╯{C.RESET}\n")
 
 
+def _compute_max_tokens(cfg, messages=None):
+    ctx = cfg.get("_context_length")
+    if not ctx:
+        return 16384
+    if messages:
+        input_chars = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+        estimated_input = input_chars // 4 + 2048
+        available = max(1024, ctx - estimated_input)
+        return min(16384, available)
+    return min(16384, ctx // 8)
+
+
+def _compute_max_history_chars(cfg):
+    ctx = cfg.get("_context_length")
+    if ctx:
+        return int(ctx * 0.5 * 4)
+    return cfg.get("max_history_chars", 200000)
+
+
 def chat_completion(messages, cfg, stream=True, tools=None):
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
@@ -1633,7 +1678,7 @@ def chat_completion(messages, cfg, stream=True, tools=None):
         "model": cfg["model"],
         "messages": messages,
         "temperature": cfg["temperature"],
-        "max_tokens": cfg["max_tokens"],
+        "max_tokens": _compute_max_tokens(cfg, messages),
         "stream": stream,
     }
     if tools:
@@ -1827,11 +1872,21 @@ def save_history():
 def show_banner(cfg):
     tools_flag = f"{C.CYAN}tools{C.RESET}" if cfg["tools_enabled"] else f"{C.GRAY}tools off{C.RESET}"
     trust_flag = f"{C.GREEN}trust{C.RESET}" if cfg["trust_mode"] else f"{C.YELLOW}confirm{C.RESET}"
+    ctx = cfg.get("_context_length")
+    ctx_str = f"  {C.GRAY}ctx:{C.RESET} {C.MAGENTA}{_fmt_context(ctx)}{C.RESET}" if ctx else ""
     print(f"\n{C.BOLD}{C.CYAN}  tbot{C.RESET}  {C.GRAY}— OpenRouter CLI{C.RESET}")
-    print(f"  {C.GRAY}model:{C.RESET} {C.YELLOW}{cfg['model']}{C.RESET}")
+    print(f"  {C.GRAY}model:{C.RESET} {C.YELLOW}{cfg['model']}{C.RESET}{ctx_str}")
     print(f"  {C.GRAY}temp:{C.RESET}  {C.YELLOW}{cfg['temperature']}{C.RESET}  "
           f"{tools_flag}  {trust_flag}")
     print(f"  {C.GRAY}type{C.RESET} {C.BOLD}/help{C.RESET} {C.GRAY}for commands{C.RESET}\n")
+
+
+def _fmt_context(ctx):
+    if ctx >= 1_000_000:
+        return f"{ctx // 1_000_000}M"
+    if ctx >= 1_000:
+        return f"{ctx // 1_000}K"
+    return str(ctx)
 
 
 def print_help():
@@ -2024,6 +2079,9 @@ def main():
     atexit.register(save_history)
     if readline is not None:
         readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
+    ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+    if ctx:
+        cfg["_context_length"] = ctx
     messages = _init_messages(cfg)
     show_banner(cfg)
 
@@ -2063,10 +2121,18 @@ def main():
             elif cmd == "model":
                 if arg:
                     cfg["model"] = arg
+                    cfg.pop("_context_length", None)
                     save_cfg(cfg)
-                    print(f"{C.GREEN}model → {cfg['model']}{C.RESET}")
+                    ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+                    if ctx:
+                        cfg["_context_length"] = ctx
+                        print(f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}")
+                    else:
+                        print(f"{C.GREEN}model → {cfg['model']} (context unknown){C.RESET}")
                 else:
-                    print(f"{C.YELLOW}{cfg['model']}{C.RESET}")
+                    ctx = cfg.get("_context_length")
+                    ctx_str = f" ({_fmt_context(ctx)})" if ctx else ""
+                    print(f"{C.YELLOW}{cfg['model']}{ctx_str}{C.RESET}")
             elif cmd == "temp":
                 if arg:
                     try:
@@ -2212,7 +2278,8 @@ Replace this with instructions for the model.
 def send_conversation(messages, cfg, pop_on_first_error=False):
     _clear_trails()
     total = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
-    while total > cfg["max_history_chars"] and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
+    max_chars = _compute_max_history_chars(cfg)
+    while total > max_chars and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
         for i, m in enumerate(messages):
             if m["role"] not in ("system", "tool"):
                 total -= len(m.get("content", ""))
