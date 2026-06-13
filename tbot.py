@@ -1744,6 +1744,7 @@ def parse_stream(resp):
     token_count = 0
     prompt_tokens = 0
     completion_tokens = 0
+    total_tokens = 0
     interrupted = False
 
     sock = None
@@ -1789,10 +1790,13 @@ def parse_stream(resp):
                 if usage:
                     pt = usage.get("prompt_tokens", 0)
                     ct = usage.get("completion_tokens", 0)
+                    tt = usage.get("total_tokens", 0)
                     if pt:
                         prompt_tokens = pt
                     if ct:
                         completion_tokens = ct
+                    if tt:
+                        total_tokens = tt
                 choices = data.get("choices", [])
                 if not choices:
                     continue
@@ -1824,7 +1828,7 @@ def parse_stream(resp):
         completion_tokens = token_count
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
-    return content, calls, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, interrupted
+    return content, calls, prompt_tokens, completion_tokens, total_tokens, interrupted
 
 # ── Tool execution ──────────────────────────────────────────────
 
@@ -2494,7 +2498,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 continue
             stream_retries = 0
             if _tot:
-                _total_tokens += _tot
+                _total_tokens = _tot
             if tool_calls:
                 if content:
                     print()
