@@ -1929,12 +1929,26 @@ def _render_selector(models, filtered, query, idx, current_id):
             except (ValueError, TypeError, ZeroDivisionError):
                 ps = ""
             buf.append(f"{pre}{mid}{cs}{ps}\r\n")
-    buf.append(f"\r\n{C.GRAY}Ctrl+N/P nav  type filter  ↵ select  Esc exit{C.RESET}")
+    buf.append(f"\r\n{C.GRAY}Ctrl+N/P nav  type filter  ↵ select  Ctrl+C exit{C.RESET}")
     return "".join(buf)
 
 
+def _read_esc(fd):
+    import select
+    seq = ""
+    for _ in range(8):
+        r, _, _ = select.select([sys.stdin], [], [], 0.2)
+        if not r:
+            break
+        b = sys.stdin.read(1)
+        if not b:
+            break
+        seq += b
+    return seq
+
+
 def model_selector(current_id, api_key):
-    import termios, tty, select as selmod
+    import termios, tty
     models = fetch_models(api_key)
     if not models:
         return None
@@ -1944,6 +1958,10 @@ def model_selector(current_id, api_key):
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
     try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
         tty.setraw(fd)
         sys.stdout.write("\033[?25l")
         while True:
@@ -1952,18 +1970,10 @@ def model_selector(current_id, api_key):
             sys.stdout.flush()
             ch = sys.stdin.read(1)
             if ch == "\x1b":
-                ch2 = sys.stdin.read(1) if selmod.select([sys.stdin], [], [], 0.05)[0] else None
-                if ch2 == "[":
-                    ch3 = sys.stdin.read(1)
-                    if ch3 == "A":
-                        idx = max(0, idx - 1)
-                    elif ch3 == "B":
-                        idx = min(len(filtered) - 1, idx + 1)
-                elif ch2 is None:
-                    return None
+                _read_esc(fd)
             elif ch in ("\r", "\n"):
                 return filtered[idx]["id"] if filtered else None
-            elif ch in ("\x03", "q"):
+            elif ch == "\x03":
                 return None
             elif ch == "\x0e":  # Ctrl+N — down
                 idx = min(len(filtered) - 1, idx + 1)
