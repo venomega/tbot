@@ -1928,7 +1928,18 @@ def _render_selector(models, filtered, query, idx, current_id):
                 ps = f" {C.GRAY}${cost:.2f}{C.RESET}" if cost > 0 else ""
             except (ValueError, TypeError, ZeroDivisionError):
                 ps = ""
-            buf.append(f"{pre}{mid}{cs}{ps}\r\n")
+            bs = ""
+            aa = m.get("benchmarks", {}).get("artificial_analysis")
+            if aa:
+                labels = {"intelligence_index": "int", "coding_index": "code", "agentic_index": "agent"}
+                parts = []
+                for k, lbl in labels.items():
+                    v = aa.get(k)
+                    if v is not None:
+                        parts.append(f"{lbl}:{v}")
+                if parts:
+                    bs = f" {C.YELLOW}{' '.join(parts)}{C.RESET}"
+            buf.append(f"{pre}{mid}{cs}{ps}{bs}\r\n")
     buf.append(f"\r\n{C.GRAY}Ctrl+N/P nav  type filter  ↵ select  Ctrl+C exit{C.RESET}")
     return "".join(buf)
 
@@ -1949,7 +1960,8 @@ def _read_esc(fd):
 
 def model_selector(current_id, api_key):
     import termios, tty
-    models = fetch_models(api_key)
+    _TBOT_PARAMS = {"temperature", "max_tokens", "tools"}
+    models = [m for m in fetch_models(api_key) if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))]
     if not models:
         return None
     filtered = list(models)
