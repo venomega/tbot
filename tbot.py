@@ -1744,6 +1744,7 @@ def parse_stream(resp):
     token_count = 0
     prompt_tokens = 0
     completion_tokens = 0
+    interrupted = False
 
     sock = None
     try:
@@ -1755,7 +1756,7 @@ def parse_stream(resp):
     try:
         iterator = resp.iter_lines()
     except Exception:
-        return None, None, 0, 0, 0, 0, 0
+        return None, None, 0, 0, 0, True
 
     received = False
     try:
@@ -1817,13 +1818,13 @@ def parse_stream(resp):
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
     except (socket.timeout, OSError):
-        pass
+        interrupted = True
 
     if not completion_tokens:
         completion_tokens = token_count
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
-    return content, calls, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
+    return content, calls, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, interrupted
 
 # ── Tool execution ──────────────────────────────────────────────
 
@@ -2450,20 +2451,48 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             tools += skills_to_tools(skills)
     max_rounds = cfg.get("max_rounds", 200)
     round_n = 0
+    retryable_errors = {"connection", "timeout", "ssl", "proxy"}
+    max_retries = 3
+    base_delay = 1.0
+    max_stream_retries = 5
+    stream_retries = 0
     while round_n < max_rounds:
         round_n += 1
         try:
-            result = chat_completion(messages, cfg, stream=True, tools=tools)
-            if "error" in result:
+            for attempt in range(max_retries + 1):
+                result = chat_completion(messages, cfg, stream=True, tools=tools)
+                if "error" not in result:
+                    break
+                if attempt < max_retries and result.get("error") in retryable_errors:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"\n  {C.YELLOW}Connection lost ({result['error']}), retrying in {delay:.0f}s... (attempt {attempt+1}/{max_retries}){C.RESET}")
+                    time.sleep(delay)
+                    continue
                 show_error(result.get("title", "Error"),
                           result.get("detail", result["error"]),
                           result.get("hint", ""))
                 if round_n == 1 and pop_on_first_error:
                     messages.pop()
                 break
+            if "error" in result:
+                break
             global _total_tokens
-            content, tool_calls, pt, ct, _tot = parse_stream(result["stream"])
+            content, tool_calls, pt, ct, _tot, interrupted = parse_stream(result["stream"])
             result["stream"].close()
+            if interrupted:
+                stream_retries += 1
+                if stream_retries > max_stream_retries:
+                    show_error("Stream keeps failing",
+                               "The connection was interrupted 5 times in a row.",
+                               "Check your internet connection or try a different model.")
+                    break
+                if content:
+                    print(f"\n{C.YELLOW}  Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}")
+                else:
+                    print(f"\n  {C.YELLOW}Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}")
+                round_n -= 1
+                continue
+            stream_retries = 0
             if _tot:
                 _total_tokens += _tot
             if tool_calls:
