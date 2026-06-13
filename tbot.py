@@ -1742,6 +1742,8 @@ def parse_stream(resp):
     content_parts = []
     tool_calls = {}
     token_count = 0
+    prompt_tokens = 0
+    completion_tokens = 0
 
     sock = None
     try:
@@ -1753,7 +1755,7 @@ def parse_stream(resp):
     try:
         iterator = resp.iter_lines()
     except Exception:
-        return None, None, 0
+        return None, None, 0, 0, 0, 0, 0
 
     received = False
     try:
@@ -1782,6 +1784,14 @@ def parse_stream(resp):
                 break
             try:
                 data = json.loads(chunk)
+                usage = data.get("usage")
+                if usage:
+                    pt = usage.get("prompt_tokens", 0)
+                    ct = usage.get("completion_tokens", 0)
+                    if pt:
+                        prompt_tokens = pt
+                    if ct:
+                        completion_tokens = ct
                 choices = data.get("choices", [])
                 if not choices:
                     continue
@@ -1809,9 +1819,11 @@ def parse_stream(resp):
     except (socket.timeout, OSError):
         pass
 
+    if not completion_tokens:
+        completion_tokens = token_count
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
-    return content, calls, token_count
+    return content, calls, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens
 
 # ── Tool execution ──────────────────────────────────────────────
 
@@ -2450,10 +2462,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     messages.pop()
                 break
             global _total_tokens
-            content, tool_calls, tok_count = parse_stream(result["stream"])
+            content, tool_calls, pt, ct, _tot = parse_stream(result["stream"])
             result["stream"].close()
-            if tok_count:
-                _total_tokens += tok_count
+            if _tot:
+                _total_tokens += _tot
             if tool_calls:
                 if content:
                     print()
@@ -2469,7 +2481,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if content:
                 print()
                 if _total_tokens:
-                    print(f"{C.GRAY}── {_total_tokens} tokens ──{C.RESET}")
+                    print(f"{C.GRAY}── {_total_tokens} tokens (input+output) ──{C.RESET}")
                 messages.append({"role": "assistant", "content": content})
             break
         except KeyboardInterrupt:
