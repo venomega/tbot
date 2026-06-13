@@ -741,6 +741,15 @@ def _pick(args, *keys):
             return args[k]
     return None
 
+def _edit_snippet(filepath, new_text, idx, old_len, new_len, context=4):
+    line_no = new_text[:idx].count('\n') + 1
+    affected_end = new_text[:idx + max(new_len, 1)].count('\n') + 1
+    lines = new_text.split('\n')
+    start = max(0, line_no - 1 - context)
+    end = min(len(lines), affected_end - 1 + context + 1)
+    snippet = '\n'.join(f'{j+1}: {lines[j]}' for j in range(start, end))
+    return f"{filepath}:{line_no}\n{snippet}"
+
 def handle_edit(args):
     fp = _pick(args, "filePath", "file_path")
     if not fp:
@@ -772,7 +781,9 @@ def handle_edit(args):
         count = text.count(old)
         new_text = text.replace(old, new)
         p.write_text(new_text, encoding="utf-8")
-        return f"Replaced {count} occurrence(s) in {filepath}"
+        idx = new_text.find(new)
+        snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
+        return f"Replaced {count} occurrence(s) in {filepath}\n{snip}"
     idx = text.find(old)
     if idx == -1:
         lines = text.split('\n')
@@ -796,7 +807,8 @@ def handle_edit(args):
         return "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
     new_text = text[:idx] + new + text[idx + len(old):]
     p.write_text(new_text, encoding="utf-8")
-    return f"Replaced 1 occurrence in {filepath}"
+    snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
+    return f"Replaced 1 occurrence in {filepath}\n{snip}"
 
 
 def handle_write(args):
