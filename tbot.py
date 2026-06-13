@@ -2514,7 +2514,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if content:
                 print()
                 if _total_tokens:
-                    print(f"{C.GRAY}── {_total_tokens} tokens (input+output) ──{C.RESET}")
+                    print(f"{C.GRAY}── {_total_tokens} tokens ──{C.RESET}")
                 messages.append({"role": "assistant", "content": content})
             break
         except KeyboardInterrupt:
