@@ -1552,29 +1552,37 @@ def skill_tool_handler(name, args, messages=None):
             return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
     return f"Skill '{name}' not found"
 
-# ── Model context cache ─────────────────────────────────────
+# ── Model list cache ────────────────────────────────────────
 
-_model_context_cache = {}  # model_id -> {"context_length": int, "timestamp": float}
+_models_cache = []
+_models_cache_time = 0
 
-def get_model_context(model_id, api_key, max_age=3600):
+def fetch_models(api_key, max_age=3600):
+    global _models_cache, _models_cache_time
     now = time.time()
-    cached = _model_context_cache.get(model_id)
-    if cached and now - cached["timestamp"] < max_age:
-        return cached["context_length"]
+    if _models_cache and now - _models_cache_time < max_age:
+        return _models_cache
     try:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         resp = requests.get("https://openrouter.ai/api/v1/models", timeout=10, headers=headers)
         if resp.status_code == 200:
-            for m in resp.json().get("data", []):
-                if m.get("id") == model_id:
-                    ctx = m.get("context_length")
-                    if ctx:
-                        _model_context_cache[model_id] = {"context_length": ctx, "timestamp": now}
-                        return ctx
+            data = resp.json().get("data", [])
+            _models_cache = data
+            _models_cache_time = now
+            return data
     except Exception:
         pass
+    return _models_cache or []
+
+
+def get_model_context(model_id, api_key):
+    for m in fetch_models(api_key):
+        if m.get("id") == model_id:
+            ctx = m.get("context_length")
+            if ctx:
+                return ctx
     return None
 
 
@@ -1889,6 +1897,89 @@ def _fmt_context(ctx):
     return str(ctx)
 
 
+def _term_width():
+    try:
+        return os.get_terminal_size().columns
+    except (ValueError, OSError):
+        return 70
+
+
+def _render_selector(models, filtered, query, idx, current_id):
+    w = _term_width()
+    sep = f"{C.GRAY}{'─' * (w - 2)}{C.RESET}"
+    buf = [f"{C.BOLD}{C.CYAN}model{C.RESET}  {C.YELLOW}{current_id}{C.RESET}  {C.GRAY}({len(filtered)}/{len(models)}){C.RESET}\r\n"]
+    buf.append(f"{C.CYAN}filter:{C.RESET} {query if query else ''}\r\n")
+    buf.append(f"{sep}\r\n")
+    if not filtered:
+        buf.append(f"{C.GRAY}no matches{C.RESET}\r\n")
+    else:
+        start = max(0, idx - 10)
+        end = min(len(filtered), start + 20)
+        for i in range(start, end):
+            m = filtered[i]
+            pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+            mid = m.get("id", "?")
+            ctx = m.get("context_length", 0)
+            cs = f" {C.MAGENTA}{_fmt_context(ctx)}{C.RESET}" if ctx else ""
+            buf.append(f"{pre}{mid}{cs}\r\n")
+    buf.append(f"\r\n{C.GRAY}↑↓ type filter ↵ select Esc exit{C.RESET}")
+    return "".join(buf)
+
+
+def model_selector(current_id, api_key):
+    import termios, tty, select as selmod
+    models = fetch_models(api_key)
+    if not models:
+        return None
+    filtered = list(models)
+    query = ""
+    idx = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(_render_selector(models, filtered, query, idx, current_id))
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                ch2 = sys.stdin.read(1) if selmod.select([sys.stdin], [], [], 0.05)[0] else None
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "A":
+                        idx = max(0, idx - 1)
+                    elif ch3 == "B":
+                        idx = min(len(filtered) - 1, idx + 1)
+                elif ch2 is None:
+                    return None
+            elif ch in ("\r", "\n"):
+                return filtered[idx]["id"] if filtered else None
+            elif ch in ("\x03", "q"):
+                return None
+            elif ch == "\x0e":  # Ctrl+N — down
+                idx = min(len(filtered) - 1, idx + 1)
+            elif ch == "\x10":  # Ctrl+P — up
+                idx = max(0, idx - 1)
+            elif ch in ("\x7f", "\b"):
+                query = query[:-1]
+                idx = 0
+            elif ch.isprintable():
+                query += ch
+                idx = 0
+            q = query.lower()
+            if query:
+                filtered = [m for m in models if q in m.get("id", "").lower() or q in m.get("name", "").lower()]
+            else:
+                filtered = list(models)
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
 def print_help():
     print(f"{C.CYAN}Commands:{C.RESET}")
     print(f"  /help              This help")
@@ -2130,9 +2221,21 @@ def main():
                     else:
                         print(f"{C.GREEN}model → {cfg['model']} (context unknown){C.RESET}")
                 else:
-                    ctx = cfg.get("_context_length")
-                    ctx_str = f" ({_fmt_context(ctx)})" if ctx else ""
-                    print(f"{C.YELLOW}{cfg['model']}{ctx_str}{C.RESET}")
+                    selected = model_selector(cfg["model"], cfg.get("api_key", ""))
+                    if selected and selected != cfg["model"]:
+                        cfg["model"] = selected
+                        cfg.pop("_context_length", None)
+                        save_cfg(cfg)
+                        ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+                        if ctx:
+                            cfg["_context_length"] = ctx
+                            print(f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}")
+                        else:
+                            print(f"{C.GREEN}model → {cfg['model']}{C.RESET}")
+                    elif selected == cfg["model"]:
+                        pass
+                    else:
+                        print(f"{C.YELLOW}cancelled{C.RESET}")
             elif cmd == "temp":
                 if arg:
                     try:
