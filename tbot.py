@@ -1921,7 +1921,14 @@ def _render_selector(models, filtered, query, idx, current_id):
             mid = m.get("id", "?")
             ctx = m.get("context_length", 0)
             cs = f" {C.MAGENTA}{_fmt_context(ctx)}{C.RESET}" if ctx else ""
-            buf.append(f"{pre}{mid}{cs}\r\n")
+            try:
+                pp = float(m.get("pricing", {}).get("prompt", 0))
+                cp = float(m.get("pricing", {}).get("completion", 0))
+                cost = (pp + cp) / 0.000001
+                ps = f" {C.GRAY}${cost:.2f}{C.RESET}" if cost > 0 else ""
+            except (ValueError, TypeError, ZeroDivisionError):
+                ps = ""
+            buf.append(f"{pre}{mid}{cs}{ps}\r\n")
     buf.append(f"\r\n{C.GRAY}Ctrl+N/P nav  type filter  ↵ select  Esc exit{C.RESET}")
     return "".join(buf)
 
