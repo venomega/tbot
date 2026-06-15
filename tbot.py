@@ -506,7 +506,7 @@ def _log_write(text):
             pass
 
 
-def _clean_html_text(html_text):
+def _clean_html_text(html_text, min_line_length=0):
     """Strip HTML tags and extract readable paragraphs from HTML."""
     text = re.sub(
         r"<script[^>]*>.*?</script>", "", html_text, flags=re.DOTALL | re.IGNORECASE
@@ -523,8 +523,10 @@ def _clean_html_text(html_text):
     text = html.unescape(text)
     text = re.sub(r"[ \t]+", " ", text)
     lines = [l.strip() for l in text.split("\n") if l.strip()]
-    filtered = [l for l in lines if len(l) > 40]
-    return "\n".join(filtered) if filtered else "\n".join(lines)
+    if min_line_length:
+        filtered = [l for l in lines if len(l) > min_line_length]
+        return "\n".join(filtered) if filtered else "\n".join(lines)
+    return "\n".join(lines)
 
 
 def _fetch_page_text(url, max_chars=4000):
@@ -542,7 +544,7 @@ def _fetch_page_text(url, max_chars=4000):
         ct = resp.headers.get("Content-Type", "")
         if "text/html" not in ct and "text/plain" not in ct:
             return None
-        text = _clean_html_text(resp.text)
+        text = _clean_html_text(resp.text, min_line_length=40)
         if len(text) > max_chars:
             text = text[:max_chars] + "\n... (truncated)"
         return text if len(text) > 100 else None
@@ -679,10 +681,7 @@ _todo_blocked_count = 0
 
 
 def _clear_trails():
-    global _doom_trail, _read_trail, _todo_blocked_count
     _doom_trail.clear()
-    _read_trail.clear()
-    _todo_blocked_count = 0
 
 
 def _detect_pattern(trail):
@@ -720,8 +719,8 @@ def _check_doom_loop(tool_calls):
                 "Use different arguments, a different tool, or respond with text."
             )
     if _detect_pattern(_doom_trail):
-        _doom_trail.clear()
         pattern = " → ".join(t[0] for t in _doom_trail[-6:])
+        _doom_trail.clear()
         return (
             f"PATTERN LOOP: Detected repeating tool pattern: {pattern}. "
             "This is a loop — repeating the same sequence of tools. "
@@ -815,7 +814,15 @@ def handle_glob(args):
     import glob as glob_mod
 
     p = _resolve_path(search_path)
-    matches = sorted(glob_mod.glob(pattern, root_dir=p, recursive=True))
+    try:
+        matches = sorted(glob_mod.glob(pattern, root_dir=p, recursive=True))
+    except TypeError:
+        cwd = os.getcwd()
+        os.chdir(p)
+        try:
+            matches = sorted(glob_mod.glob(pattern, recursive=True))
+        finally:
+            os.chdir(cwd)
     if not matches:
         matches = sorted(glob_mod.glob(str(p / pattern), recursive=True))
         if matches:
@@ -855,20 +862,21 @@ def handle_grep(args):
         pass
     if not matches:
         for fpath in root.rglob("*"):
-            if fpath.is_file():
-                if include:
-                    import fnmatch
+            if not fpath.is_file() or fpath.stat().st_size == 0:
+                continue
+            if include:
+                import fnmatch
 
-                    if not fnmatch.fnmatch(fpath.name, include):
-                        continue
-                try:
-                    text = fpath.read_text(encoding="utf-8", errors="replace")
-                    for i, line in enumerate(text.split("\n"), 1):
+                if not fnmatch.fnmatch(fpath.name, include):
+                    continue
+            try:
+                with fpath.open("r", encoding="utf-8", errors="replace") as f:
+                    for i, line in enumerate(f, 1):
                         if re.search(pattern, line):
                             rel = fpath.relative_to(root)
                             matches.append(f"{rel}:{i}:{line[:200]}")
-                except Exception:
-                    continue
+            except Exception:
+                continue
     limit = 500
     if len(matches) > limit:
         matches = matches[:limit] + [f"... ({len(matches) - limit} more matches)"]
@@ -946,7 +954,7 @@ def handle_edit(args):
         hint = ""
         if clue_lines:
             hint = "\nClosest matches in file:\n" + "\n".join(clue_lines[:2])
-        hint += "\nSugerencia: incluye 2-3 líneas de contexto ANTES y DESPUÉS del texto a reemplazar para hacer la coincidencia única."
+        hint += "\nSuggestion: include 2-3 lines of context BEFORE and AFTER the text to replace to make the match unique."
         return f"Error: could not find:\n{old[:500]}{hint}"
     last_idx = text.rfind(old)
     if idx != last_idx:
@@ -958,14 +966,14 @@ def handle_edit(args):
                 ctx = "\n".join(
                     f"{j + 1}: {text.split(chr(10))[j]}" for j in range(start, end)
                 )
-                suggestions.append(f"  Match en línea {i + 1}:\n{ctx}")
+                suggestions.append(f"  Match at line {i + 1}:\n{ctx}")
                 if len(suggestions) >= 2:
                     break
         hint = "\n" + "\n".join(suggestions) if suggestions else ""
         return (
-            f"Error: múltiples coincidencias encontradas.{hint}"
-            f"\nSugerencia: usa replaceAll=true para reemplazar todas, "
-            f"o incluye 2-3 líneas de contexto ANTES y DESPUÉS para hacer la coincidencia única."
+            f"Error: multiple matches found.{hint}"
+            f"\nSuggestion: use replaceAll=true to replace all, "
+            f"or include 2-3 lines of context BEFORE and AFTER to make the match unique."
         )
     new_text = text[:idx] + new + text[idx + len(old) :]
     p.write_text(new_text, encoding="utf-8")
@@ -1043,18 +1051,9 @@ def handle_webfetch(args):
     if fmt == "html":
         return _truncate_output(resp.text)
     if fmt == "text":
-        text = re.sub(
-            r"<script[^>]*>.*?</script>", "", resp.text, flags=re.DOTALL | re.IGNORECASE
-        )
-        text = re.sub(
-            r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE
-        )
-        text = re.sub(r"<[^>]+>", "\n", text)
-        text = html.unescape(text)
-        text = re.sub(r"[ \t]+", " ", text)
-        lines = [l.strip() for l in text.split("\n") if l.strip()]
-        return _truncate_output("\n".join(lines))
-    text = _clean_html_text(resp.text)
+        text = _clean_html_text(resp.text)
+        return _truncate_output(text)
+    text = _clean_html_text(resp.text, min_line_length=40)
     return text or "(no readable content found)"
 
 
@@ -1087,17 +1086,17 @@ def handle_todowrite(args):
     if _todo_blocked_count >= 999:
         return "todowrite BLOQUEADO permanentemente — usa edit/write para modificar TASK.md."
 
-    now = time.time()
+    now = time.monotonic()
 
     # --- rate limiter: <15s since last call = rapid-fire loop ---
     if 0 < now - _todo_last_call_time < 15:
-        _todo_last_call_time = now
         _todo_blocked_count += 1
+        _todo_last_call_time = now
         if _todo_blocked_count >= 3:
             _todo_blocked_count = 999
             return (
-                "todowrite BLOQUEADO permanentemente en esta sesión. "
-                "No se ejecutará más. Usa edit/write para modificar TASK.md directamente."
+                "todowrite BLOCKED for this round — 3 consecutive rapid-fire calls detected. "
+                "Use edit/write to modify TASK.md directly."
             )
         return (
             "TOOL LOOP BLOCKED: todowrite called <15s after previous call. "
@@ -1252,7 +1251,7 @@ def handle_skill(args):
     skills = load_skills()
     for n, desc, schema, doc in skills:
         if n == name:
-            return f"Skill '{name}' is already loaded — do NOT call this tool again.\n\n{doc}"
+            return f"Skill '{name}' found. Use `skill_{name}` to load instructions into context."
     return f"Skill '{name}' not found. Use /skills to list available skills."
 
 
@@ -1815,24 +1814,26 @@ def skill_tool_handler(name, args, messages=None):
                     and f"## Skill: {name}" in m.get("content", "")
                     for m in messages[-5:]
                 )
-                if not already:
-                    skill_dir = SKILLS_DIR / n
-                    siblings = sorted(
-                        f.name
-                        for f in skill_dir.iterdir()
-                        if f.is_file()
-                        and f.suffix in (".md", ".txt", ".py", ".sh", ".json")
-                    )
-                    siblings_info = f"\n\nSkill directory: {skill_dir}\n" + (
-                        f"Reference files: {', '.join(siblings)}" if siblings else ""
-                    )
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": f"## Skill: {name}\n\n{doc}{siblings_info}",
-                        }
-                    )
-            return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
+                if already:
+                    return f"Skill '{name}' is already loaded. Follow the instructions already in context."
+                skill_dir = SKILLS_DIR / n
+                siblings = sorted(
+                    f.name
+                    for f in skill_dir.iterdir()
+                    if f.is_file()
+                    and f.suffix in (".md", ".txt", ".py", ".sh", ".json")
+                )
+                siblings_info = f"\n\nSkill directory: {skill_dir}\n" + (
+                    f"Reference files: {', '.join(siblings)}" if siblings else ""
+                )
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": f"## Skill: {name}\n\n{doc}{siblings_info}",
+                    }
+                )
+                return f"Skill '{name}' instructions loaded. Follow them to complete the task."
+            return f"Skill '{name}' found. Use `skill_{name}` to load instructions."
     return f"Skill '{name}' not found"
 
 
@@ -2154,6 +2155,11 @@ def parse_stream(resp):
         completion_tokens = token_count
     content = "".join(content_parts)
     calls = list(tool_calls.values()) if tool_calls else None
+    if calls:
+        for c in calls:
+            _log_write(
+                f"tool_call: {c['function']['name']}({c['function']['arguments'][:200]})"
+            )
     return content, calls, prompt_tokens, completion_tokens, total_tokens, interrupted
 
 
@@ -2649,10 +2655,12 @@ def main():
             elif cmd == "help":
                 print_help()
             elif cmd == "new":
-                global _total_tokens
+                global _total_tokens, _todo_blocked_count
                 _total_tokens = 0
+                _todo_blocked_count = 0
                 messages = _init_messages(cfg)
                 _doom_trail.clear()
+                _read_trail.clear()
                 _log_reopen()
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
@@ -2838,18 +2846,21 @@ MAX_TOOL_ONLY_ROUNDS = 6
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
-    total = sum(
-        len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str)
-    )
     max_chars = _compute_max_history_chars(cfg)
     while (
-        total > max_chars
+        sum(
+            len(m.get("content", ""))
+            for m in messages
+            if isinstance(m.get("content"), str)
+        )
+        > max_chars
         and sum(1 for m in messages if m["role"] not in ("system",)) > 1
     ):
         for i, m in enumerate(messages):
-            if m["role"] not in ("system", "tool"):
-                total -= len(m.get("content", ""))
+            if m["role"] == "user":
                 messages.pop(i)
+                if i < len(messages) and messages[i]["role"] == "assistant":
+                    messages.pop(i)
                 break
     tools = None
     if cfg["tools_enabled"]:
@@ -2865,6 +2876,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     max_stream_retries = 5
     stream_retries = 0
     tool_only_rounds = 0
+    stuck_rounds = 0
     while round_n < max_rounds:
         _clear_trails()
         round_n += 1
@@ -2944,6 +2956,31 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
                     break
+
+                # --- stuck round detection (todowrite loops) ---
+                last_n = min(len(tool_calls), len(messages))
+                blocked = all(
+                    "BLOCKED" in m.get("content", "")
+                    for m in messages[-last_n:]
+                    if m.get("role") == "tool"
+                )
+                if blocked:
+                    stuck_rounds += 1
+                    if stuck_rounds >= 3:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"CRITICAL: Tools blocked for {stuck_rounds} consecutive rounds. "
+                                    "You MUST stop using tools and respond directly to the user. "
+                                    "Do NOT make any more tool calls."
+                                ),
+                            }
+                        )
+                        break
+                else:
+                    stuck_rounds = 0
+
                 continue
             if content:
                 tool_only_rounds = 0
