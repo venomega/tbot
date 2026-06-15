@@ -1417,15 +1417,28 @@ except ImportError:
     _has_yaml = False
 
 
-def _parse_skill_text(text):
-    """Parse SKILL.md text with YAML frontmatter (between --- delimiters)."""
+def _parse_skill_text(text, source=None):
+    """Parse SKILL.md text with YAML frontmatter (between --- delimiters).
+    Returns dict with metadata keys + '_doc' for the body, or None if no frontmatter.
+    """
     m = re.match(r"^---\s*\n(.*?)\n(?:---|\.\.\.)\s*\n(.*)", text, re.DOTALL)
     if not m:
         return None
     raw_yaml = m.group(1)
+    meta = None
+    yaml_error = None
     if _has_yaml:
-        meta = yaml.safe_load(raw_yaml) or {}
-    else:
+        try:
+            meta = yaml.safe_load(raw_yaml) or {}
+        except Exception as e:
+            yaml_error = e
+    if not meta:
+        if yaml_error:
+            print(
+                f"{C.YELLOW}⚠ YAML parse error in {source or 'SKILL.md'}{C.RESET}"
+                f"\n  {C.GRAY}{yaml_error}{C.RESET}"
+                f"\n  {C.GRAY}Falling back to manual parser{C.RESET}"
+            )
         meta = {}
         for line in raw_yaml.split("\n"):
             line = line.strip()
@@ -1452,8 +1465,12 @@ def _parse_skill_text(text):
 
 
 def _parse_skill_md(path):
-    """Parse SKILL.md file with YAML frontmatter."""
-    return _parse_skill_text(path.read_text(encoding="utf-8"))
+    """Parse SKILL.md file. Returns metadata dict or None."""
+    text = path.read_text(encoding="utf-8")
+    result = _parse_skill_text(text, source=str(path))
+    if result is None:
+        print(f"{C.YELLOW}⚠ SKILL.md has no valid frontmatter: {path}{C.RESET}")
+    return result
 
 
 def load_skills():
