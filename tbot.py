@@ -19,7 +19,7 @@ HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
 LOG_DIR = CONFIG_DIR / "log"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+PROVIDER_URL = "https://openrouter.ai/api/v1"
 
 _log_fh = None
 
@@ -1870,7 +1870,7 @@ def fetch_models(api_key, max_age=3600):
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
         resp = requests.get(
-            "https://openrouter.ai/api/v1/models", timeout=10, headers=headers
+             PROVIDER_URL + "/models", timeout=10, headers=headers
         )
         if resp.status_code == 200:
             data = resp.json().get("data", [])
@@ -2012,7 +2012,7 @@ def chat_completion(messages, cfg, stream=True, tools=None):
         payload["tools"] = tools
     try:
         resp = requests.post(
-            OPENROUTER_URL, headers=headers, json=payload, stream=stream, timeout=120
+            PROVIDER_URL + "/chat/completions", headers=headers, json=payload, stream=stream, timeout=120
         )
     except requests.exceptions.Timeout:
         return {
