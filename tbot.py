@@ -5,6 +5,7 @@ import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
+
 try:
     import readline
 except ImportError:
@@ -17,7 +18,11 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
+LOG_DIR = CONFIG_DIR / "log"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_log_fh = None
+
 
 class C:
     RESET = "\033[0m"
@@ -30,6 +35,7 @@ class C:
     MAGENTA = "\033[35m"
     GRAY = "\033[90m"
 
+
 # ── Tool definitions (opencode-inspired) ──────────────────────
 
 TOOLS = [
@@ -41,8 +47,14 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "tool": {"type": "string", "description": "The tool name that was called with invalid arguments"},
-                    "error": {"type": "string", "description": "Description of the validation error"},
+                    "tool": {
+                        "type": "string",
+                        "description": "The tool name that was called with invalid arguments",
+                    },
+                    "error": {
+                        "type": "string",
+                        "description": "Description of the validation error",
+                    },
                 },
                 "required": ["tool", "error"],
             },
@@ -61,21 +73,36 @@ TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "question": {"type": "string", "description": "The complete question to ask"},
-                                "header": {"type": "string", "description": "Very short label (max 30 chars)"},
+                                "question": {
+                                    "type": "string",
+                                    "description": "The complete question to ask",
+                                },
+                                "header": {
+                                    "type": "string",
+                                    "description": "Very short label (max 30 chars)",
+                                },
                                 "options": {
                                     "type": "array",
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "label": {"type": "string", "description": "Display text (1-5 words)"},
-                                            "description": {"type": "string", "description": "Explanation of choice"},
+                                            "label": {
+                                                "type": "string",
+                                                "description": "Display text (1-5 words)",
+                                            },
+                                            "description": {
+                                                "type": "string",
+                                                "description": "Explanation of choice",
+                                            },
                                         },
                                         "required": ["label", "description"],
                                     },
                                     "description": "Available choices (omit for free-text input)",
                                 },
-                                "multiple": {"type": "boolean", "description": "Allow selecting more than one option"},
+                                "multiple": {
+                                    "type": "boolean",
+                                    "description": "Allow selecting more than one option",
+                                },
                             },
                             "required": ["question", "header", "options"],
                         },
@@ -90,14 +117,27 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "bash",
-            "description": "Execute a shell command on the local machine with timeout and working directory support. Runs in the project directory by default. 'cd' commands update the persistent working directory for subsequent tool calls.",
+            "description": "Execute a shell command on the local machine with timeout and working directory support. Runs in the project directory by default.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "The command to execute"},
-                    "description": {"type": "string", "description": "Clear concise description of what this command does in 5-10 words"},
-                    "timeout": {"type": "integer", "description": "Timeout in milliseconds (default: 120000)", "default": 120000},
-                    "workdir": {"type": "string", "description": "Working directory (relative paths resolve against current directory). Use this instead of 'cd' commands for one-off directory changes."},
+                    "command": {
+                        "type": "string",
+                        "description": "The command to execute",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Clear concise description of what this command does in 5-10 words",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in milliseconds (default: 120000)",
+                        "default": 120000,
+                    },
+                    "workdir": {
+                        "type": "string",
+                        "description": "Working directory. Use this instead of 'cd' cd commands for directory changes.",
+                    },
                 },
                 "required": ["command", "description"],
             },
@@ -107,13 +147,22 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read",
-            "description": "Read a file or directory. Read each file ONCE only — re-reading will be warned and blocked. Read all files you need in parallel in a single round.",
+            "description": "Read a file or directory. Supports offset and limit for partial reads. Re-reading a file you already read this round is allowed (content will be refreshed).",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filePath": {"type": "string", "description": "Path to the file or directory (relative paths resolve against current directory — use them)"},
-                    "offset": {"type": "integer", "description": "The line number to start reading from (1-indexed)"},
-                    "limit": {"type": "integer", "description": "The maximum number of lines to read (defaults to 2000)"},
+                    "filePath": {
+                        "type": "string",
+                        "description": "Path to the file or directory",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "The line number to start reading from (1-indexed)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "The maximum number of lines to read (defaults to 2000)",
+                    },
                 },
                 "required": ["filePath"],
             },
@@ -127,8 +176,14 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The glob pattern to match files against"},
-                    "path": {"type": "string", "description": "The directory to search in. Defaults to current working directory."},
+                    "pattern": {
+                        "type": "string",
+                        "description": "The glob pattern to match files against",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "The directory to search in. Defaults to current working directory.",
+                    },
                 },
                 "required": ["pattern"],
             },
@@ -142,9 +197,18 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string", "description": "The regex pattern to search for in file contents"},
-                    "path": {"type": "string", "description": "The directory to search in. Defaults to current working directory."},
-                    "include": {"type": "string", "description": "File pattern to include (e.g. '*.js', '*.{ts,tsx}')"},
+                    "pattern": {
+                        "type": "string",
+                        "description": "The regex pattern to search for in file contents",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "The directory to search in. Defaults to current working directory.",
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "File pattern to include (e.g. '*.js', '*.{ts,tsx}')",
+                    },
                 },
                 "required": ["pattern"],
             },
@@ -154,14 +218,23 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "edit",
-            "description": "Performs exact string replacements in files. Replaces oldString with newString. Supports replaceAll and multiple fallback strategies for fuzzy matching.",
+            "description": "Performs exact string replacements in files. Replaces oldString with newString. Supports replaceAll.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filePath": {"type": "string", "description": "Path to the file (relative paths resolve against current directory)"},
-                    "oldString": {"type": "string", "description": "The text to replace"},
-                    "newString": {"type": "string", "description": "The text to replace it with (must be different from oldString)"},
-                    "replaceAll": {"type": "boolean", "description": "Replace all occurrences of oldString (default false)"},
+                    "filePath": {"type": "string", "description": "Path to the file"},
+                    "oldString": {
+                        "type": "string",
+                        "description": "The text to replace",
+                    },
+                    "newString": {
+                        "type": "string",
+                        "description": "The text to replace it with (must be different from oldString)",
+                    },
+                    "replaceAll": {
+                        "type": "boolean",
+                        "description": "Replace all occurrences of oldString (default false)",
+                    },
                 },
                 "required": ["filePath", "oldString", "newString"],
             },
@@ -175,8 +248,11 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filePath": {"type": "string", "description": "Path to the file (relative paths resolve against current directory)"},
-                    "content": {"type": "string", "description": "The content to write to the file"},
+                    "filePath": {"type": "string", "description": "Path to the file"},
+                    "content": {
+                        "type": "string",
+                        "description": "The content to write to the file",
+                    },
                 },
                 "required": ["filePath", "content"],
             },
@@ -190,14 +266,23 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "description": {"type": "string", "description": "A short (3-5 words) description of the task"},
-                    "prompt": {"type": "string", "description": "The task for the agent to perform"},
+                    "description": {
+                        "type": "string",
+                        "description": "A short (3-5 words) description of the task",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task for the agent to perform",
+                    },
                     "subagent_type": {
                         "type": "string",
                         "enum": ["general", "explore"],
                         "description": "The type of agent to use: 'general' for research/execution, 'explore' for codebase exploration",
                     },
-                    "command": {"type": "string", "description": "The command that triggered this task"},
+                    "command": {
+                        "type": "string",
+                        "description": "The command that triggered this task",
+                    },
                 },
                 "required": ["description", "prompt", "subagent_type"],
             },
@@ -211,13 +296,19 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "url": {"type": "string", "description": "The URL to fetch content from"},
+                    "url": {
+                        "type": "string",
+                        "description": "The URL to fetch content from",
+                    },
                     "format": {
                         "type": "string",
                         "enum": ["text", "markdown", "html"],
                         "description": "The format to return the content in (text, markdown, or html). Defaults to markdown.",
                     },
-                    "timeout": {"type": "integer", "description": "Optional timeout in seconds (max 120)"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Optional timeout in seconds (max 120)",
+                    },
                 },
                 "required": ["url"],
             },
@@ -227,7 +318,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "todowrite",
-            "description": "Write the task list to TASK.md. Call EXACTLY ONCE to plan (all tasks pending except first in_progress). Then call again ONLY when a task is actually completed (update its status to 'completed' and advance the next). Do NOT call for any other reason. If the output warns about looping, you violated this rule — stop calling and use edit/write/bash.",
+            "description": "Write the task list to TASK.md. Call ONCE to plan, then ONLY when a task completes. If blocked, STOP calling and use edit/write instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -236,10 +327,18 @@ TOOLS = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": {"type": "string", "description": "Brief description of the task"},
+                                "content": {
+                                    "type": "string",
+                                    "description": "Brief description of the task",
+                                },
                                 "status": {
                                     "type": "string",
-                                    "enum": ["pending", "in_progress", "completed", "cancelled"],
+                                    "enum": [
+                                        "pending",
+                                        "in_progress",
+                                        "completed",
+                                        "cancelled",
+                                    ],
                                     "description": "Current status of the task",
                                 },
                                 "priority": {
@@ -266,7 +365,10 @@ TOOLS = [
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search query"},
-                    "numResults": {"type": "integer", "description": "Number of search results to return (default: 8)"},
+                    "numResults": {
+                        "type": "integer",
+                        "description": "Number of search results to return (default: 8)",
+                    },
                     "livecrawl": {
                         "type": "string",
                         "enum": ["fallback", "preferred"],
@@ -294,78 +396,17 @@ TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "name": {"type": "string", "description": "The name of the skill to load from installed skills"},
+                    "name": {
+                        "type": "string",
+                        "description": "The name of the skill to load from installed skills",
+                    },
                 },
                 "required": ["name"],
             },
         },
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "apply_patch",
-            "description": "Apply a unified format patch to one or more files. The patch text must contain standard unified diff hunks with file paths.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "patchText": {"type": "string", "description": "The full unified diff patch text describing all changes to be made"},
-                },
-                "required": ["patchText"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_system_info",
-            "description": "Get OS, architecture, hostname, and other system information.",
-            "parameters": {"type": "object", "properties": {}},
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "install_skill",
-            "description": "Download and install a skill from a URL. The URL must point directly to a raw SKILL.md file or a git repository containing SKILL.md files.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "url": {"type": "string", "description": "URL to raw SKILL.md, GitHub repo URL, or gh:user/repo"},
-                },
-                "required": ["url"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "create_skill",
-            "description": "Create a new skill with instructions. Skills are instruction sets that guide the model on how to perform specific tasks.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string", "description": "Skill name — lowercase, alphanumeric, underscores and hyphens"},
-                    "description": {"type": "string", "description": "Short description of what the skill does"},
-                    "content": {"type": "string", "description": "Markdown instructions for the model"},
-                    "schema": {"type": "object", "description": "Optional JSON Schema for skill parameters"},
-                },
-                "required": ["name", "description", "content"],
-            },
-        },
-    },
 ]
 
-# ── Alias: read_file → read ─────────────────────────────────
-_read_fn = next(t["function"] for t in TOOLS if t["function"]["name"] == "read")
-TOOLS.append({
-    "type": "function",
-    "function": {
-        **_read_fn,
-        "name": "read_file",
-        "description": "Alias for read. Reads a file. Relative paths work fine — do NOT retry with an absolute path.",
-    },
-})
-del _read_fn
 
 # ── Project directory context ────────────────────────────────
 
@@ -393,11 +434,20 @@ def _resolve_path(p, *, also_try_cwd=True):
 
 MAX_TOOL_OUTPUT = 32000
 
-_READ_ONLY_TOOLS = frozenset({
-    "read", "read_file", "glob", "grep", "todowrite",
-    "question", "webfetch", "websearch", "get_system_info",
-    "skill", "skills", "invalid",
-})
+_READ_ONLY_TOOLS = frozenset(
+    {
+        "read",
+        "glob",
+        "grep",
+        "question",
+        "webfetch",
+        "websearch",
+        "skill",
+        "skills",
+        "invalid",
+    }
+)
+
 
 def _is_read_only_tool(name):
     return name in _READ_ONLY_TOOLS
@@ -409,28 +459,85 @@ def _truncate_output(text):
     return text
 
 
+# ── Session log ──────────────────────────────────────────────
+
+
+def _log_path():
+    ts = time.strftime("%Y-%m-%d_%H%M%S")
+    return LOG_DIR / f"{ts}.log"
+
+
+def _log_init():
+    global _log_fh
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _log_fh = open(_log_path(), "a", encoding="utf-8")
+    _log_write("── session started ──")
+
+
+def _log_reopen():
+    global _log_fh
+    if _log_fh is not None:
+        _log_write("── session ended ──")
+        try:
+            _log_fh.close()
+        except Exception:
+            pass
+    _log_fh = open(_log_path(), "a", encoding="utf-8")
+    _log_write("── session started ──")
+
+
+def _log_close():
+    global _log_fh
+    if _log_fh is not None:
+        _log_write("── session ended ──")
+        try:
+            _log_fh.close()
+        except Exception:
+            pass
+        _log_fh = None
+
+
+def _log_write(text):
+    if _log_fh is not None:
+        try:
+            _log_fh.write(text.rstrip("\n") + "\n")
+            _log_fh.flush()
+        except Exception:
+            pass
+
+
 def _clean_html_text(html_text):
     """Strip HTML tags and extract readable paragraphs from HTML."""
-    text = re.sub(r'<script[^>]*>.*?</script>', '', html_text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<nav[^>]*>.*?</nav>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<footer[^>]*>.*?</footer>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<header[^>]*>.*?</header>', '', text, flags=re.DOTALL | re.IGNORECASE)
-    text = re.sub(r'<[^>]+>', '\n', text)
+    text = re.sub(
+        r"<script[^>]*>.*?</script>", "", html_text, flags=re.DOTALL | re.IGNORECASE
+    )
+    text = re.sub(r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<nav[^>]*>.*?</nav>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(
+        r"<footer[^>]*>.*?</footer>", "", text, flags=re.DOTALL | re.IGNORECASE
+    )
+    text = re.sub(
+        r"<header[^>]*>.*?</header>", "", text, flags=re.DOTALL | re.IGNORECASE
+    )
+    text = re.sub(r"<[^>]+>", "\n", text)
     text = html.unescape(text)
-    text = re.sub(r'[ \t]+', ' ', text)
-    lines = [l.strip() for l in text.split('\n') if l.strip()]
+    text = re.sub(r"[ \t]+", " ", text)
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
     filtered = [l for l in lines if len(l) > 40]
-    return '\n'.join(filtered) if filtered else '\n'.join(lines)
+    return "\n".join(filtered) if filtered else "\n".join(lines)
 
 
 def _fetch_page_text(url, max_chars=4000):
     """Fetch a URL and extract readable text content. Returns None on failure."""
     try:
-        resp = requests.get(url, timeout=10, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
-            "Accept": "text/html,text/plain,*/*",
-        })
+        resp = requests.get(
+            url,
+            timeout=10,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
+                "Accept": "text/html,text/plain,*/*",
+            },
+        )
         resp.raise_for_status()
         ct = resp.headers.get("Content-Type", "")
         if "text/html" not in ct and "text/plain" not in ct:
@@ -444,6 +551,7 @@ def _fetch_page_text(url, max_chars=4000):
 
 
 # ── New / upgraded handlers (opencode-inspired) ──────────────
+
 
 def handle_invalid(args):
     return f"The arguments provided to the tool '{args.get('tool', '?')}' are invalid: {args.get('error', 'unknown error')}"
@@ -462,11 +570,15 @@ def handle_question(args):
         if options:
             for i, opt in enumerate(options, 1):
                 desc = opt.get("description", "")
-                print(f"  {C.YELLOW}{i}.{C.RESET} {opt['label']}  {C.GRAY}{desc}{C.RESET}")
+                print(
+                    f"  {C.YELLOW}{i}.{C.RESET} {opt['label']}  {C.GRAY}{desc}{C.RESET}"
+                )
             print(f"  {C.YELLOW}0.{C.RESET} Type your own answer")
             while True:
                 try:
-                    raw = input(f"{C.GREEN}choice{C.RESET} {'(comma-separated)' if multiple else ''}: ").strip()
+                    raw = input(
+                        f"{C.GREEN}choice{C.RESET} {'(comma-separated)' if multiple else ''}: "
+                    ).strip()
                     if not raw:
                         continue
                     parts = [p.strip() for p in raw.split(",") if p.strip()]
@@ -502,7 +614,7 @@ def handle_question(args):
     return f"User has answered your questions: {formatted}. You can now continue with the user's answers in mind."
 
 
-_CD_RE = re.compile(r'^\s*cd\s+(.+?)(?:\s*[;&|#]|$)')
+_CD_RE = re.compile(r"^\s*cd\s+(.+?)(?:\s*[;&|#]|$)")
 
 
 def _update_cwd(cmd, last_cwd):
@@ -516,7 +628,8 @@ def _update_cwd(cmd, last_cwd):
         _chdir(resolved)
 
 
-_output_re = re.compile(r'(?:-(?:o|O|output)\s+|\>\s*|\>\>\s*)(\S+)')
+_output_re = re.compile(r"(?:-(?:o|O|output)\s+|\>\s*|\>\>\s*)(\S+)")
+
 
 def _list_outputs(cmd, cwd):
     files = _output_re.findall(cmd)
@@ -530,6 +643,7 @@ def _list_outputs(cmd, cwd):
             lines.append(f"→ {p.name} ({p.stat().st_size} bytes)")
     return "\n" + "\n".join(lines) if lines else ""
 
+
 def handle_bash(args):
     cmd = _pick(args, "command", "cmd")
     if not cmd:
@@ -540,7 +654,9 @@ def handle_bash(args):
     timeout_s = timeout_ms / 1000
     cwd = str(_resolve_path(workdir)) if workdir else str(CURRENT_DIR)
     try:
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=cwd)
+        r = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=cwd
+        )
         out = r.stdout
         if r.stderr:
             out += "\n--- stderr ---\n" + r.stderr
@@ -561,11 +677,26 @@ _doom_trail = []
 _read_trail = set()
 _todo_blocked_count = 0
 
+
 def _clear_trails():
     global _doom_trail, _read_trail, _todo_blocked_count
     _doom_trail.clear()
     _read_trail.clear()
     _todo_blocked_count = 0
+
+
+def _detect_pattern(trail):
+    if len(trail) < 6:
+        return False
+    names_only = [t[0] for t in trail[-6:]]
+    # A,B,A,B,A,B
+    if names_only[:2] == names_only[2:4] == names_only[4:6]:
+        return True
+    # A,B,C,A,B,C
+    if len(trail) >= 6 and names_only[:3] == names_only[3:6]:
+        return True
+    return False
+
 
 def _check_doom_loop(tool_calls):
     global _doom_trail
@@ -577,8 +708,8 @@ def _check_doom_loop(tool_calls):
         except json.JSONDecodeError:
             normalized = args_raw
         _doom_trail.append((name, normalized))
-    if len(_doom_trail) > 9:
-        _doom_trail = _doom_trail[-9:]
+    if len(_doom_trail) > 12:
+        _doom_trail = _doom_trail[-12:]
     if len(_doom_trail) >= 3:
         last_3 = _doom_trail[-3:]
         if all(t == last_3[0] for t in last_3):
@@ -588,7 +719,16 @@ def _check_doom_loop(tool_calls):
                 "This is a loop. The tool was NOT executed. "
                 "Use different arguments, a different tool, or respond with text."
             )
+    if _detect_pattern(_doom_trail):
+        _doom_trail.clear()
+        pattern = " → ".join(t[0] for t in _doom_trail[-6:])
+        return (
+            f"PATTERN LOOP: Detected repeating tool pattern: {pattern}. "
+            "This is a loop — repeating the same sequence of tools. "
+            "Stop and respond with text to the user."
+        )
     return None
+
 
 # --- read tool ---
 def handle_read(args):
@@ -599,15 +739,11 @@ def handle_read(args):
     filepath = str(_resolve_path(raw))
     offset = args.get("offset", 1)
     key = (filepath, offset)
-    
-    if key in _read_trail:
-        return (
-            f"You already read '{raw}' at offset {offset} in this turn. "
-            "The content is still in context — read a different file or offset, "
-            "use edit/write/bash to work, or respond with text to the user."
-        )
-    _read_trail.add(key)
-    
+
+    is_rerun = key in _read_trail
+    if not is_rerun:
+        _read_trail.add(key)
+
     limit = args.get("limit", 2000)
     p = Path(filepath)
     if not p.exists():
@@ -618,13 +754,10 @@ def handle_read(args):
             f"Use an absolute path like {Path(os.getcwd()) / raw}"
         )
     if p.is_dir():
-        entries = sorted(
-            f"{e.name}/" if e.is_dir() else e.name
-            for e in p.iterdir()
-        )
+        entries = sorted(f"{e.name}/" if e.is_dir() else e.name for e in p.iterdir())
         total = len(entries)
         start = max(0, offset - 1)
-        sliced = entries[start:start + limit]
+        sliced = entries[start : start + limit]
         result = f"<path>{filepath}</path>\n<type>directory</type>\n<entries>\n"
         result += "\n".join(sliced)
         if start + len(sliced) < total:
@@ -642,16 +775,17 @@ def handle_read(args):
     start = max(0, offset - 1)
     end = min(start + limit, total)
     sliced = lines[start:end]
-    
+
     header = f"<path>{filepath}</path>\n<type>file</type>\n<content>\n"
     footer_prefix = "\n</content>"
-    
+
     # Reserve ~200 chars for the boundary line so truncation is accurate
     max_body = MAX_TOOL_OUTPUT - len(header) - 200 - len(footer_prefix)
     if max_body < 200:
         max_body = 200
-    
-    result = header
+
+    re_read_prefix = f"(Re-read of '{raw}' at offset {offset})\n" if is_rerun else ""
+    result = re_read_prefix + header
     shown_lines = 0
     for i, line in enumerate(sliced, start + 1):
         entry = f"{i}: {line}\n"
@@ -668,7 +802,7 @@ def handle_read(args):
             result += f"\n(Showing lines {offset}-{end} of {total}. Use offset={end + 1} to continue.)"
         else:
             result += f"\n(End of file - total {total} lines)"
-    
+
     result += footer_prefix
     return result
 
@@ -679,6 +813,7 @@ def handle_glob(args):
         return "Error: pattern is required"
     search_path = args.get("path", ".")
     import glob as glob_mod
+
     p = _resolve_path(search_path)
     matches = sorted(glob_mod.glob(pattern, root_dir=p, recursive=True))
     if not matches:
@@ -689,7 +824,9 @@ def handle_glob(args):
         return "No files found matching pattern."
     limit = 200
     if len(matches) > limit:
-        return "\n".join(matches[:limit]) + f"\n... ({len(matches) - limit} more matches)"
+        return (
+            "\n".join(matches[:limit]) + f"\n... ({len(matches) - limit} more matches)"
+        )
     return "\n".join(matches)
 
 
@@ -703,6 +840,7 @@ def handle_grep(args):
     matches = []
     try:
         import subprocess
+
         cmd = ["rg", "-n", pattern, str(root)]
         if include:
             cmd.extend(["-g", include])
@@ -720,6 +858,7 @@ def handle_grep(args):
             if fpath.is_file():
                 if include:
                     import fnmatch
+
                     if not fnmatch.fnmatch(fpath.name, include):
                         continue
                 try:
@@ -743,14 +882,16 @@ def _pick(args, *keys):
             return args[k]
     return None
 
+
 def _edit_snippet(filepath, new_text, idx, old_len, new_len, context=4):
-    line_no = new_text[:idx].count('\n') + 1
-    affected_end = new_text[:idx + max(new_len, 1)].count('\n') + 1
-    lines = new_text.split('\n')
+    line_no = new_text[:idx].count("\n") + 1
+    affected_end = new_text[: idx + max(new_len, 1)].count("\n") + 1
+    lines = new_text.split("\n")
     start = max(0, line_no - 1 - context)
     end = min(len(lines), affected_end - 1 + context + 1)
-    snippet = '\n'.join(f'{j+1}: {lines[j]}' for j in range(start, end))
+    snippet = "\n".join(f"{j + 1}: {lines[j]}" for j in range(start, end))
     return f"{filepath}:{line_no}\n{snippet}"
+
 
 def handle_edit(args):
     fp = _pick(args, "filePath", "file_path")
@@ -788,26 +929,45 @@ def handle_edit(args):
         return f"Replaced {count} occurrence(s) in {filepath}\n{snip}"
     idx = text.find(old)
     if idx == -1:
-        lines = text.split('\n')
+        lines = text.split("\n")
         clue_lines = []
-        for old_line in old.strip().split('\n')[:3]:
+        for old_line in old.strip().split("\n")[:3]:
             stripped = old_line.strip()
             if stripped:
                 for i, fline in enumerate(lines):
                     if stripped in fline:
                         start = max(0, i - 2)
                         end = min(len(lines), i + 3)
-                        ctx = '\n'.join(f'{j+1}: {lines[j]}' for j in range(start, end))
-                        clue_lines.append(f"  Near line {i+1}:\n{ctx}")
+                        ctx = "\n".join(
+                            f"{j + 1}: {lines[j]}" for j in range(start, end)
+                        )
+                        clue_lines.append(f"  Near line {i + 1}:\n{ctx}")
                         break
         hint = ""
         if clue_lines:
             hint = "\nClosest matches in file:\n" + "\n".join(clue_lines[:2])
+        hint += "\nSugerencia: incluye 2-3 líneas de contexto ANTES y DESPUÉS del texto a reemplazar para hacer la coincidencia única."
         return f"Error: could not find:\n{old[:500]}{hint}"
     last_idx = text.rfind(old)
     if idx != last_idx:
-        return "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
-    new_text = text[:idx] + new + text[idx + len(old):]
+        suggestions = []
+        for i, line in enumerate(text.split("\n")):
+            if old.strip() in line:
+                start = max(0, i - 1)
+                end = min(len(text.split("\n")), i + 2)
+                ctx = "\n".join(
+                    f"{j + 1}: {text.split(chr(10))[j]}" for j in range(start, end)
+                )
+                suggestions.append(f"  Match en línea {i + 1}:\n{ctx}")
+                if len(suggestions) >= 2:
+                    break
+        hint = "\n" + "\n".join(suggestions) if suggestions else ""
+        return (
+            f"Error: múltiples coincidencias encontradas.{hint}"
+            f"\nSugerencia: usa replaceAll=true para reemplazar todas, "
+            f"o incluye 2-3 líneas de contexto ANTES y DESPUÉS para hacer la coincidencia única."
+        )
+    new_text = text[:idx] + new + text[idx + len(old) :]
     p.write_text(new_text, encoding="utf-8")
     snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
     return f"Replaced 1 occurrence in {filepath}\n{snip}"
@@ -831,14 +991,34 @@ def handle_write(args):
 
 
 def handle_task(args):
+    depth = int(os.environ.get("TBOT_DEPTH", "0"))
+    if depth >= 3:
+        return "Error: máxima profundidad de subagente (3) alcanzada. No se puede lanzar más tareas anidadas."
     desc = args.get("description", "task")
     prompt = args.get("prompt", "")
-    subagent_type = args.get("subagent_type", "general")
-    return (
-        f"Task '{desc}' would be dispatched to a {subagent_type} subagent.\n"
-        f"Subagent support requires recursive tbot execution.\n"
-        f"Prompt: {prompt[:200]}"
-    )
+    if not prompt:
+        return "Error: prompt is required"
+    cfg = load_cfg()
+    cfg["api_key"] = resolve_key(cfg)
+    cmd = [sys.executable, sys.argv[0], "-m", cfg["model"], "-x", prompt]
+    if not cfg.get("tools_enabled", True):
+        cmd.append("--no-tools")
+    if cfg.get("trust_mode"):
+        cmd.append("--trust")
+    env = {**os.environ, "TBOT_DEPTH": str(depth + 1)}
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+        out = r.stdout
+        if r.stderr:
+            out += "\n--- stderr ---\n" + r.stderr[-1000:]
+        out += f"\n--- exit code: {r.returncode} ---"
+        if r.returncode != 0:
+            return f"Task '{desc}' failed (exit {r.returncode}):\n{out[:3000]}"
+        return f"Task '{desc}' returned:\n{_truncate_output(out.strip())}"
+    except subprocess.TimeoutExpired:
+        return f"Task '{desc}' timed out after 300s"
+    except Exception as e:
+        return f"Task '{desc}' error: {e}"
 
 
 def handle_webfetch(args):
@@ -850,22 +1030,30 @@ def handle_webfetch(args):
     if not url.startswith(("http://", "https://")):
         return "URL must start with http:// or https://"
     try:
-        resp = requests.get(url, timeout=timeout, headers={
-            "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
-        })
+        resp = requests.get(
+            url,
+            timeout=timeout,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; tbot/1.0; +https://github.com/user/tbot)",
+            },
+        )
         resp.raise_for_status()
     except Exception as e:
         return f"Error fetching URL: {e}"
     if fmt == "html":
         return _truncate_output(resp.text)
     if fmt == "text":
-        text = re.sub(r'<script[^>]*>.*?</script>', '', resp.text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<style[^>]*>.*?</style>', '', text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r'<[^>]+>', '\n', text)
+        text = re.sub(
+            r"<script[^>]*>.*?</script>", "", resp.text, flags=re.DOTALL | re.IGNORECASE
+        )
+        text = re.sub(
+            r"<style[^>]*>.*?</style>", "", text, flags=re.DOTALL | re.IGNORECASE
+        )
+        text = re.sub(r"<[^>]+>", "\n", text)
         text = html.unescape(text)
-        text = re.sub(r'[ \t]+', ' ', text)
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        return _truncate_output('\n'.join(lines))
+        text = re.sub(r"[ \t]+", " ", text)
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        return _truncate_output("\n".join(lines))
     text = _clean_html_text(resp.text)
     return text or "(no readable content found)"
 
@@ -874,16 +1062,30 @@ def handle_webfetch(args):
 _todo_prev_fingerprint = None
 _todo_noop_count = 0
 _todo_last_call_time = 0
-_todo_has_write_since_last = False  # set by execute_tool_calls when edit/write/bash runs
+_todo_has_write_since_last = (
+    False  # set by execute_tool_calls when edit/write/bash runs
+)
+
 
 def _todo_fingerprint(todos):
-    return tuple(sorted(
-        (t.get("content", ""), t.get("status", ""), t.get("priority", ""))
-        for t in todos
-    ))
+    return tuple(
+        sorted(
+            (t.get("content", ""), t.get("status", ""), t.get("priority", ""))
+            for t in todos
+        )
+    )
+
 
 def handle_todowrite(args):
-    global _todo_prev_fingerprint, _todo_noop_count, _todo_last_call_time, _todo_has_write_since_last, _todo_blocked_count
+    global \
+        _todo_prev_fingerprint, \
+        _todo_noop_count, \
+        _todo_last_call_time, \
+        _todo_has_write_since_last, \
+        _todo_blocked_count
+
+    if _todo_blocked_count >= 999:
+        return "todowrite BLOQUEADO permanentemente — usa edit/write para modificar TASK.md."
 
     now = time.time()
 
@@ -892,13 +1094,14 @@ def handle_todowrite(args):
         _todo_last_call_time = now
         _todo_blocked_count += 1
         if _todo_blocked_count >= 3:
+            _todo_blocked_count = 999
             return (
-                "STOP calling todowrite. I said it's blocked. "
-                "Go do real work (edit/write/bash) and respond with text when done."
+                "todowrite BLOQUEADO permanentemente en esta sesión. "
+                "No se ejecutará más. Usa edit/write para modificar TASK.md directamente."
             )
         return (
             "TOOL LOOP BLOCKED: todowrite called <15s after previous call. "
-            "TASK.md was NOT updated. Use edit/write/bash/apply_patch to make progress."
+            "TASK.md was NOT updated. Use edit/write/bash to make progress."
         )
     _todo_last_call_time = now
     _todo_blocked_count = 0
@@ -927,7 +1130,12 @@ def handle_todowrite(args):
     in_progress = None
     completed_count = 0
     for t in todos:
-        status_map = {"pending": " ", "in_progress": "~", "completed": "x", "cancelled": "-"}
+        status_map = {
+            "pending": " ",
+            "in_progress": "~",
+            "completed": "x",
+            "cancelled": "-",
+        }
         m = status_map.get(t.get("status", "pending"), " ")
         priority = t.get("priority", "medium")
         prio_tag = f" [{priority}]" if priority != "medium" else ""
@@ -965,7 +1173,7 @@ def _resolve_ddg_url(url):
     url = url.strip()
     if url.startswith("//"):
         url = "https:" + url
-    m = re.search(r'[?&]uddg=([^&]+)', url)
+    m = re.search(r"[?&]uddg=([^&]+)", url)
     if m:
         return urllib.parse.unquote(m.group(1))
     return url
@@ -978,15 +1186,19 @@ def handle_websearch(args):
     num_results = min(args.get("numResults", 8), 10)
     try:
         sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://duckduckgo.com/",
-            "DNT": "1",
-        })
+        sess.headers.update(
+            {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://duckduckgo.com/",
+                "DNT": "1",
+            }
+        )
         sess.get("https://duckduckgo.com/", timeout=8)
-        resp = sess.post("https://html.duckduckgo.com/html/", data={"q": query}, timeout=10)
+        resp = sess.post(
+            "https://html.duckduckgo.com/html/", data={"q": query}, timeout=10
+        )
         resp.raise_for_status()
     except Exception as e:
         return f"Search failed: {e}"
@@ -1007,9 +1219,11 @@ def handle_websearch(args):
             continue
         href = _resolve_ddg_url(href)
         tm = re.search(r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL)
-        title = re.sub(r'<[^>]+>', '', tm.group(1)).strip() if tm else ""
-        sm = re.search(r'class="result__snippet"[^>]*>(.*?)</(?:span|div)>', block, re.DOTALL)
-        snippet = re.sub(r'<[^>]+>', '', sm.group(1)).strip() if sm else ""
+        title = re.sub(r"<[^>]+>", "", tm.group(1)).strip() if tm else ""
+        sm = re.search(
+            r'class="result__snippet"[^>]*>(.*?)</(?:span|div)>', block, re.DOTALL
+        )
+        snippet = re.sub(r"<[^>]+>", "", sm.group(1)).strip() if sm else ""
         title = html.unescape(title)
         snippet = html.unescape(snippet)
         if title:
@@ -1026,7 +1240,7 @@ def handle_websearch(args):
             page_text = _fetch_page_text(href, max_chars=3000)
             if page_text:
                 out.append(f"  ── page content ({len(page_text)} chars) ──")
-                for line in page_text.split('\n')[:10]:
+                for line in page_text.split("\n")[:10]:
                     out.append(f"  {line.strip()}")
     return "\n".join(out)
 
@@ -1101,7 +1315,7 @@ def handle_apply_patch(args):
             if idx == -1:
                 errors.append(f"hunk not found in {filepath}")
                 continue
-            text = text[:idx] + new_block + text[idx + len(old_block):]
+            text = text[:idx] + new_block + text[idx + len(old_block) :]
             applied += 1
         fp.write_text(text, encoding="utf-8")
     result = f"Patch applied: {applied} hunk(s)"
@@ -1111,6 +1325,7 @@ def handle_apply_patch(args):
 
 
 # ── Legacy handlers (kept) ──────────────────────────────────
+
 
 def handle_install_skill(args):
     url = args.get("url", "")
@@ -1123,15 +1338,18 @@ def handle_create_skill(args):
     name = args.get("name", "")
     if not name:
         return "Error: name is required"
-    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
         return f"{C.RED}invalid skill name — use letters, numbers, underscores{C.RESET}"
     desc = args.get("description", name)
     content = args.get("content", "")
-    schema = args.get("schema", {
-        "type": "object",
-        "properties": {"input": {"type": "string", "description": "Input"}},
-        "required": ["input"],
-    })
+    schema = args.get(
+        "schema",
+        {
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "Input"}},
+            "required": ["input"],
+        },
+    )
     ensure_skills_dir()
     skill_dir = SKILLS_DIR / name
     if skill_dir.exists():
@@ -1155,17 +1373,20 @@ schema: {esc_schema}
 
 
 def handle_get_system_info(_args):
-    return json.dumps({
-        "system": platform.system(),
-        "release": platform.release(),
-        "version": platform.version(),
-        "machine": platform.machine(),
-        "processor": platform.processor(),
-        "hostname": platform.node(),
-        "cwd": os.getcwd(),
-        "user": os.environ.get("USER") or os.environ.get("USERNAME", ""),
-        "home": str(Path.home()),
-    }, indent=2)
+    return json.dumps(
+        {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+            "hostname": platform.node(),
+            "cwd": os.getcwd(),
+            "user": os.environ.get("USER") or os.environ.get("USERNAME", ""),
+            "home": str(Path.home()),
+        },
+        indent=2,
+    )
 
 
 TOOL_HANDLERS = {
@@ -1173,7 +1394,6 @@ TOOL_HANDLERS = {
     "question": handle_question,
     "bash": handle_bash,
     "read": handle_read,
-    "read_file": handle_read,
     "glob": handle_glob,
     "grep": handle_grep,
     "edit": handle_edit,
@@ -1183,10 +1403,6 @@ TOOL_HANDLERS = {
     "todowrite": handle_todowrite,
     "websearch": handle_websearch,
     "skill": handle_skill,
-    "apply_patch": handle_apply_patch,
-    "get_system_info": handle_get_system_info,
-    "install_skill": handle_install_skill,
-    "create_skill": handle_create_skill,
 }
 
 # ── Skills (SKILL.md v1 — directory format) ───────────────────
@@ -1196,6 +1412,7 @@ _skill_cache = None
 
 try:
     import yaml
+
     _has_yaml = True
 except ImportError:
     _has_yaml = False
@@ -1203,7 +1420,7 @@ except ImportError:
 
 def _parse_skill_text(text):
     """Parse SKILL.md text with YAML frontmatter (between --- delimiters)."""
-    m = re.match(r'^---\s*\n(.*?)\n(?:---|\.\.\.)\s*\n(.*)', text, re.DOTALL)
+    m = re.match(r"^---\s*\n(.*?)\n(?:---|\.\.\.)\s*\n(.*)", text, re.DOTALL)
     if not m:
         return None
     raw_yaml = m.group(1)
@@ -1211,17 +1428,17 @@ def _parse_skill_text(text):
         meta = yaml.safe_load(raw_yaml) or {}
     else:
         meta = {}
-        for line in raw_yaml.split('\n'):
+        for line in raw_yaml.split("\n"):
             line = line.strip()
-            if not line or line.startswith('#'):
+            if not line or line.startswith("#"):
                 continue
-            if ':' in line:
-                key, _, val = line.partition(':')
+            if ":" in line:
+                key, _, val = line.partition(":")
                 key = key.strip()
                 val = val.strip().strip('"').strip("'")
-                if val.lower() in ('true', 'yes'):
+                if val.lower() in ("true", "yes"):
                     val = True
-                elif val.lower() in ('false', 'no'):
+                elif val.lower() in ("false", "no"):
                     val = False
                 else:
                     try:
@@ -1261,7 +1478,9 @@ def load_skills():
         if not meta:
             continue
         name = meta.get("name", entry.name)
-        desc = meta.get("description", "") or (meta["_doc"][:80] if meta.get("_doc") else name)
+        desc = meta.get("description", "") or (
+            meta["_doc"][:80] if meta.get("_doc") else name
+        )
         schema = meta.get("schema", default_schema)
         doc = meta.get("_doc")
         if doc:
@@ -1273,6 +1492,7 @@ def load_skills():
 def ensure_skills_dir():
     if not SKILLS_DIR.is_dir():
         SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 def clear_skill_cache():
     global _skill_cache
@@ -1289,13 +1509,15 @@ def _install_from_skill_url(skill_url):
         return f"{C.RED}download failed: {e}{C.RESET}"
     text = resp.text
     if text.strip().startswith("<!DOCTYPE") or text.strip().startswith("<html"):
-        return (f"{C.RED}URL returned HTML (web page), not a SKILL.md file{C.RESET}\n"
-                f"{C.GRAY}Use a raw URL (e.g. raw.githubusercontent.com/...) or a git repo URL{C.RESET}")
+        return (
+            f"{C.RED}URL returned HTML (web page), not a SKILL.md file{C.RESET}\n"
+            f"{C.GRAY}Use a raw URL (e.g. raw.githubusercontent.com/...) or a git repo URL{C.RESET}"
+        )
     meta = _parse_skill_text(text)
     if not meta:
         return f"{C.RED}invalid SKILL.md — no frontmatter{C.RESET}"
     name = meta.get("name", "")
-    if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
+    if not name or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
         return f"{C.RED}invalid or missing skill name in SKILL.md frontmatter{C.RESET}"
     skill_dir = SKILLS_DIR / name
     if skill_dir.exists():
@@ -1320,7 +1542,10 @@ def _install_from_git(repo_url):
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         ret = subprocess.run(
             ["git", "clone", "--depth", "1", repo_url, tmpdir],
-            capture_output=True, text=True, timeout=120, env=env
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
         )
         if ret.returncode != 0:
             return f"{C.RED}git clone failed: {ret.stderr.strip() or ret.stdout.strip()}{C.RESET}"
@@ -1333,7 +1558,7 @@ def _install_from_git(repo_url):
             if not meta:
                 continue
             name = meta.get("name", sf.parent.name)
-            if not name or not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
+            if not name or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
                 continue
             target = SKILLS_DIR / name
             if target.exists():
@@ -1349,12 +1574,14 @@ def _install_from_git(repo_url):
 
         # Dependencies are optional — install in background, don't block return
         import threading as _thr
+
         def _install_deps_bg():
             for name in installed:
                 try:
                     deps = _install_skill_dependencies(SKILLS_DIR / name)
                 except Exception:
                     pass
+
         _thr.Thread(target=_install_deps_bg, daemon=True).start()
 
         return msg
@@ -1373,35 +1600,44 @@ def _install_skill_dependencies(skill_dir):
         return []
     text = md_path.read_text(encoding="utf-8")
     m = re.search(
-        r'^##\s+Dependenc(?:ies|ias)\s*\n(.*?)(?=\n##\s|\Z)',
-        text, re.MULTILINE | re.DOTALL
+        r"^##\s+Dependenc(?:ies|ias)\s*\n(.*?)(?=\n##\s|\Z)",
+        text,
+        re.MULTILINE | re.DOTALL,
     )
     if not m:
         return []
     results = [f"  {C.CYAN}Dependencies:{C.RESET}"]
-    for line in m.group(1).split('\n'):
+    for line in m.group(1).split("\n"):
         line = line.strip()
-        if not line.startswith('- '):
+        if not line.startswith("- "):
             continue
         content = line[2:].strip()
-        bt = re.match(r'^`([^`]+)`', content)
-        cmd_str = bt.group(1) if bt else content.split(' - ')[0].split(' — ')[0].split(' – ')[0].strip()
+        bt = re.match(r"^`([^`]+)`", content)
+        cmd_str = (
+            bt.group(1)
+            if bt
+            else content.split(" - ")[0].split(" — ")[0].split(" – ")[0].strip()
+        )
         if not cmd_str:
             continue
-        if cmd_str.startswith(('pip install', 'pip3 install')):
-            exe = shutil.which('pip') or shutil.which('pip3')
+        if cmd_str.startswith(("pip install", "pip3 install")):
+            exe = shutil.which("pip") or shutil.which("pip3")
             if not exe:
                 results.append(f"    {C.YELLOW}⚠ pip not found{C.RESET}")
                 continue
             args = shlex.split(cmd_str)
             pip_args = [exe, *args[1:]]
-            if '--user' not in pip_args:
-                pip_args.append('--user')
-            if '--break-system-packages' not in pip_args:
-                pip_args.append('--break-system-packages')
+            if "--user" not in pip_args:
+                pip_args.append("--user")
+            if "--break-system-packages" not in pip_args:
+                pip_args.append("--break-system-packages")
             try:
                 r = subprocess.run(pip_args, capture_output=True, text=True, timeout=60)
-                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                status = (
+                    f"{C.GREEN}✓{C.RESET}"
+                    if r.returncode == 0
+                    else f"{C.RED}✗{C.RESET}"
+                )
                 if r.returncode != 0:
                     detail = r.stderr.strip()[-200:]
                     results.append(f"    {status} {cmd_str} — {detail}")
@@ -1409,41 +1645,55 @@ def _install_skill_dependencies(skill_dir):
                     results.append(f"    {status} {cmd_str}")
             except Exception as e:
                 results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
-        elif cmd_str.startswith(('npm install', 'npm i')):
-            exe = shutil.which('npm')
+        elif cmd_str.startswith(("npm install", "npm i")):
+            exe = shutil.which("npm")
             if not exe:
                 results.append(f"    {C.YELLOW}⚠ npm not found{C.RESET}")
                 continue
             args = shlex.split(cmd_str)
             try:
-                r = subprocess.run([exe, *args[1:]], capture_output=True, text=True, timeout=120)
-                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                r = subprocess.run(
+                    [exe, *args[1:]], capture_output=True, text=True, timeout=120
+                )
+                status = (
+                    f"{C.GREEN}✓{C.RESET}"
+                    if r.returncode == 0
+                    else f"{C.RED}✗{C.RESET}"
+                )
                 results.append(f"    {status} {cmd_str}")
             except Exception as e:
                 results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
-        elif cmd_str.startswith(('brew install',)):
+        elif cmd_str.startswith(("brew install",)):
             args = shlex.split(cmd_str)
             try:
                 r = subprocess.run(args, capture_output=True, text=True, timeout=300)
-                status = f"{C.GREEN}✓{C.RESET}" if r.returncode == 0 else f"{C.RED}✗{C.RESET}"
+                status = (
+                    f"{C.GREEN}✓{C.RESET}"
+                    if r.returncode == 0
+                    else f"{C.RED}✗{C.RESET}"
+                )
                 results.append(f"    {status} {cmd_str}")
             except Exception as e:
                 results.append(f"    {C.RED}✗{C.RESET} {cmd_str}: {e}")
         else:
-            par = re.search(r'\((`[^`]+`|[^)]+)\)', cmd_str)
+            par = re.search(r"\((`[^`]+`|[^)]+)\)", cmd_str)
             if par:
-                binary = par.group(1).strip('`')
+                binary = par.group(1).strip("`")
                 if shutil.which(binary):
                     results.append(f"    {C.GREEN}✓{C.RESET} {binary} found")
                 else:
-                    results.append(f"    {C.YELLOW}⚠{C.RESET} {binary} not found — install manually")
+                    results.append(
+                        f"    {C.YELLOW}⚠{C.RESET} {binary} not found — install manually"
+                    )
             else:
                 results.append(f"    {C.YELLOW}⚠{C.RESET} {cmd_str} — skipped")
     return results
 
 
-_GITHUB_TREE_RE = re.compile(r'https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)')
-_GITHUB_RAW_RE = re.compile(r'https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)')
+_GITHUB_TREE_RE = re.compile(r"https://github\.com/([^/]+)/([^/]+)/tree/([^/]+)/(.+)")
+_GITHUB_RAW_RE = re.compile(
+    r"https://raw\.githubusercontent\.com/([^/]+)/([^/]+)/([^/]+)/(.+)"
+)
 
 
 def _github_tree_to_raw(url):
@@ -1451,7 +1701,9 @@ def _github_tree_to_raw(url):
     m = _GITHUB_TREE_RE.match(url)
     if m:
         owner, repo, branch, path = m.group(1), m.group(2), m.group(3), m.group(4)
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}/SKILL.md"
+        return (
+            f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{path}/SKILL.md"
+        )
     return None
 
 
@@ -1469,10 +1721,14 @@ def _download_github_siblings(skill_url, skill_dir):
     def _fetch_dir(dir_path, local_dir):
         api_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{dir_path}?ref={branch}"
         try:
-            resp = requests.get(api_url, timeout=15, headers={
-                "Accept": "application/vnd.github+json",
-                "User-Agent": "tbot/1.0",
-            })
+            resp = requests.get(
+                api_url,
+                timeout=15,
+                headers={
+                    "Accept": "application/vnd.github+json",
+                    "User-Agent": "tbot/1.0",
+                },
+            )
             resp.raise_for_status()
             items = resp.json()
             if not isinstance(items, list):
@@ -1521,7 +1777,11 @@ def _install_skill_from_url(url):
         return _install_from_skill_url(raw_url)
 
     has_skill_md = "SKILL.md" in url
-    is_git = url.endswith(".git") or (not has_skill_md and "github.com" in url) or url.startswith("git@")
+    is_git = (
+        url.endswith(".git")
+        or (not has_skill_md and "github.com" in url)
+        or url.startswith("git@")
+    )
     if is_git:
         return _install_from_git(url)
     if has_skill_md:
@@ -1533,7 +1793,16 @@ def skills_to_tools(skills):
     tools = []
     for n, d, s, *_ in skills:
         desc = f"[ONE-TIME] Load instructions for '{n}' skill. Call ONCE, then follow the instructions — do NOT call again. {d}"
-        tools.append({"type": "function", "function": {"name": f"skill_{n}", "description": desc[:500], "parameters": s}})
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": f"skill_{n}",
+                    "description": desc[:500],
+                    "parameters": s,
+                },
+            }
+        )
     return tools
 
 
@@ -1548,16 +1817,30 @@ def skill_tool_handler(name, args, messages=None):
                 )
                 if not already:
                     skill_dir = SKILLS_DIR / n
-                    siblings = sorted(f.name for f in skill_dir.iterdir() if f.is_file() and f.suffix in (".md", ".txt", ".py", ".sh", ".json"))
-                    siblings_info = f"\n\nSkill directory: {skill_dir}\n" + (f"Reference files: {', '.join(siblings)}" if siblings else "")
-                    messages.append({"role": "system", "content": f"## Skill: {name}\n\n{doc}{siblings_info}"})
+                    siblings = sorted(
+                        f.name
+                        for f in skill_dir.iterdir()
+                        if f.is_file()
+                        and f.suffix in (".md", ".txt", ".py", ".sh", ".json")
+                    )
+                    siblings_info = f"\n\nSkill directory: {skill_dir}\n" + (
+                        f"Reference files: {', '.join(siblings)}" if siblings else ""
+                    )
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"## Skill: {name}\n\n{doc}{siblings_info}",
+                        }
+                    )
             return f"Skill '{name}' instructions are already in context. Do NOT call this tool again — just follow the instructions."
     return f"Skill '{name}' not found"
+
 
 # ── Model list cache ────────────────────────────────────────
 
 _models_cache = []
 _models_cache_time = 0
+
 
 def fetch_models(api_key, max_age=3600):
     global _models_cache, _models_cache_time
@@ -1568,7 +1851,9 @@ def fetch_models(api_key, max_age=3600):
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        resp = requests.get("https://openrouter.ai/api/v1/models", timeout=10, headers=headers)
+        resp = requests.get(
+            "https://openrouter.ai/api/v1/models", timeout=10, headers=headers
+        )
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             _models_cache = data
@@ -1620,7 +1905,9 @@ def save_cfg(cfg):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
 
+
 # ── API ─────────────────────────────────────────────────────────
+
 
 def resolve_key(cfg):
     key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
@@ -1641,21 +1928,29 @@ def resolve_key(cfg):
 
 
 def show_error(title, detail, hint=""):
-    width = min(72, os.get_terminal_size().columns if hasattr(os, 'get_terminal_size') else 72)
-    print(f"\n{C.RED}╭─{'─' * (width-4)}─╮{C.RESET}")
-    print(f"{C.RED}│{C.RESET} {C.BOLD}{C.RED}✗ {title}{C.RESET}{' ' * (width - len(title) - 7)}{C.RED}│{C.RESET}")
+    width = min(
+        72, os.get_terminal_size().columns if hasattr(os, "get_terminal_size") else 72
+    )
+    print(f"\n{C.RED}╭─{'─' * (width - 4)}─╮{C.RESET}")
+    print(
+        f"{C.RED}│{C.RESET} {C.BOLD}{C.RED}✗ {title}{C.RESET}{' ' * (width - len(title) - 7)}{C.RED}│{C.RESET}"
+    )
     print(f"{C.RED}│{C.RESET} {C.RED}{'─' * (width - 6)}{C.RESET} {C.RED}│{C.RESET}")
     for line in detail.split("\n"):
         wrapped = textwrap.wrap(line, width - 6)
         for w in wrapped or [""]:
-            print(f"{C.RED}│{C.RESET} {C.GRAY}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}")
+            print(
+                f"{C.RED}│{C.RESET} {C.GRAY}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}"
+            )
     if hint:
         print(f"{C.RED}│{C.RESET} {' ' * (width - 5)}{C.RED}│{C.RESET}")
         for line in hint.split("\n"):
             wrapped = textwrap.wrap(line, width - 6)
             for w in wrapped or [""]:
-                print(f"{C.RED}│{C.RESET} {C.YELLOW}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}")
-    print(f"{C.RED}╰─{'─' * (width-4)}─╯{C.RESET}\n")
+                print(
+                    f"{C.RED}│{C.RESET} {C.YELLOW}{w}{C.RESET}{' ' * (width - len(w) - 5)}{C.RED}│{C.RESET}"
+                )
+    print(f"{C.RED}╰─{'─' * (width - 4)}─╯{C.RESET}\n")
 
 
 def _compute_max_tokens(cfg, messages=None):
@@ -1663,7 +1958,11 @@ def _compute_max_tokens(cfg, messages=None):
     if not ctx:
         return 16384
     if messages:
-        input_chars = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+        input_chars = sum(
+            len(m.get("content", ""))
+            for m in messages
+            if isinstance(m.get("content"), str)
+        )
         estimated_input = input_chars // 4 + 2048
         available = max(1024, ctx - estimated_input)
         return min(16384, available)
@@ -1694,27 +1993,44 @@ def chat_completion(messages, cfg, stream=True, tools=None):
     if tools:
         payload["tools"] = tools
     try:
-        resp = requests.post(OPENROUTER_URL, headers=headers, json=payload, stream=stream, timeout=120)
+        resp = requests.post(
+            OPENROUTER_URL, headers=headers, json=payload, stream=stream, timeout=120
+        )
     except requests.exceptions.Timeout:
-        return {"error": "timeout", "title": "Connection timed out",
-                "detail": "The request to OpenRouter took too long to respond.",
-                "hint": "Check your internet connection or try again. If the problem persists, the service may be slow."}
+        return {
+            "error": "timeout",
+            "title": "Connection timed out",
+            "detail": "The request to OpenRouter took too long to respond.",
+            "hint": "Check your internet connection or try again. If the problem persists, the service may be slow.",
+        }
     except requests.exceptions.SSLError as e:
-        return {"error": "ssl", "title": "SSL certificate error",
-                "detail": f"Could not verify the SSL certificate: {e}",
-                "hint": "Check your system date/time. If on Termux, try: pkg install ca-certificates"}
+        return {
+            "error": "ssl",
+            "title": "SSL certificate error",
+            "detail": f"Could not verify the SSL certificate: {e}",
+            "hint": "Check your system date/time. If on Termux, try: pkg install ca-certificates",
+        }
     except requests.exceptions.ConnectionError:
-        return {"error": "connection", "title": "Could not connect to OpenRouter",
-                "detail": "No route to host. Your device may be offline or OpenRouter is blocked.",
-                "hint": "Check your internet connection with: ping openrouter.ai\nIf on Termux, try: pkg install openssl && pkg reinstall python"}
+        return {
+            "error": "connection",
+            "title": "Could not connect to OpenRouter",
+            "detail": "No route to host. Your device may be offline or OpenRouter is blocked.",
+            "hint": "Check your internet connection with: ping openrouter.ai\nIf on Termux, try: pkg install openssl && pkg reinstall python",
+        }
     except requests.exceptions.ProxyError:
-        return {"error": "proxy", "title": "Proxy connection failed",
-                "detail": "Could not connect through the configured proxy.",
-                "hint": "Check your proxy settings or disable the proxy and try again."}
+        return {
+            "error": "proxy",
+            "title": "Proxy connection failed",
+            "detail": "Could not connect through the configured proxy.",
+            "hint": "Check your proxy settings or disable the proxy and try again.",
+        }
     except Exception as e:
-        return {"error": "unknown", "title": "Unexpected error",
-                "detail": str(e),
-                "hint": "This is an unexpected error. Check your setup and try again."}
+        return {
+            "error": "unknown",
+            "title": "Unexpected error",
+            "detail": str(e),
+            "hint": "This is an unexpected error. Check your setup and try again.",
+        }
 
     if resp.status_code != 200:
         try:
@@ -1723,13 +2039,18 @@ def chat_completion(messages, cfg, stream=True, tools=None):
             msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         except Exception:
             msg = resp.text[:300]
-        return {"error": f"http_{resp.status_code}", "title": f"HTTP {resp.status_code}",
-                "detail": msg,
-                "hint": "The API returned an error. Check your API key, model name, and OpenRouter status at https://status.openrouter.ai"}
+        return {
+            "error": f"http_{resp.status_code}",
+            "title": f"HTTP {resp.status_code}",
+            "detail": msg,
+            "hint": "The API returned an error. Check your API key, model name, and OpenRouter status at https://status.openrouter.ai",
+        }
 
     return {"stream": resp}
 
+
 # ── Stream parsing ──────────────────────────────────────────────
+
 
 def _term_size():
     try:
@@ -1806,10 +2127,15 @@ def parse_stream(resp):
                     content_parts.append(c)
                     token_count += 1
                     print(c, end="", flush=True)
+                    _log_write(c)
                 for tc in delta.get("tool_calls", []):
                     idx = tc.get("index", 0)
                     if idx not in tool_calls:
-                        tool_calls[idx] = {"id": "", "type": "function", "function": {"name": "", "arguments": ""}}
+                        tool_calls[idx] = {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
                     entry = tool_calls[idx]
                     if "id" in tc:
                         entry["id"] = tc["id"]
@@ -1830,22 +2156,45 @@ def parse_stream(resp):
     calls = list(tool_calls.values()) if tool_calls else None
     return content, calls, prompt_tokens, completion_tokens, total_tokens, interrupted
 
+
 # ── Tool execution ──────────────────────────────────────────────
+
+
+MAX_TOOLS_PER_ROUND = 10
+
 
 def execute_tool_calls(tool_calls, messages, cfg):
     global _todo_has_write_since_last
+    if len(tool_calls) > MAX_TOOLS_PER_ROUND:
+        discarded = tool_calls[MAX_TOOLS_PER_ROUND:]
+        tool_calls = tool_calls[:MAX_TOOLS_PER_ROUND]
+        messages.append(
+            {
+                "role": "system",
+                "content": f"Solo se ejecutaron {MAX_TOOLS_PER_ROUND} de tus tool calls. "
+                f"Los otros {len(discarded)} fueron ignorados. Reduce tool calls paralelos.",
+            }
+        )
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
-            args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+            args = (
+                json.loads(tc["function"]["arguments"])
+                if tc["function"]["arguments"]
+                else {}
+            )
         except json.JSONDecodeError:
             args = {}
 
-        print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{json.dumps(args)[:200]}{C.RESET}")
+        args_str = json.dumps(args)[:200]
+        print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{args_str}{C.RESET}")
+        _log_write(f"── {name} {args_str}")
 
         handler = TOOL_HANDLERS.get(name)
         if not handler and name.startswith("skill_"):
-            handler = lambda a, _n=name[6:], _msgs=messages: skill_tool_handler(_n, a, _msgs)
+            handler = lambda a, _n=name[6:], _msgs=messages: skill_tool_handler(
+                _n, a, _msgs
+            )
         if not handler:
             result = f"Error: unknown tool '{name}'"
         else:
@@ -1867,18 +2216,24 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     print(f"\n  {C.YELLOW}cancelled{C.RESET}")
                     return False
                 if len(result) > MAX_TOOL_OUTPUT:
-                    result = result[:MAX_TOOL_OUTPUT] + f"\n... (truncated, {len(result)} total chars)"
+                    result = (
+                        result[:MAX_TOOL_OUTPUT]
+                        + f"\n... (truncated, {len(result)} total chars)"
+                    )
             else:
                 result = "TOOL_CALL_DECLINED"
 
         preview = result[:500].replace("\n", "\\n")
         print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
+        _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         if name not in _READ_ONLY_TOOLS and ok:
             _todo_has_write_since_last = True
     return True
 
+
 # ── UI ──────────────────────────────────────────────────────────
+
 
 def setup_history():
     if readline is None:
@@ -1906,15 +2261,31 @@ def save_history():
 
 
 def show_banner(cfg):
-    tools_flag = f"{C.CYAN}tools{C.RESET}" if cfg["tools_enabled"] else f"{C.GRAY}tools off{C.RESET}"
-    trust_flag = f"{C.GREEN}trust{C.RESET}" if cfg["trust_mode"] else f"{C.YELLOW}confirm{C.RESET}"
+    tools_flag = (
+        f"{C.CYAN}tools{C.RESET}"
+        if cfg["tools_enabled"]
+        else f"{C.GRAY}tools off{C.RESET}"
+    )
+    trust_flag = (
+        f"{C.GREEN}trust{C.RESET}"
+        if cfg["trust_mode"]
+        else f"{C.YELLOW}confirm{C.RESET}"
+    )
     ctx = cfg.get("_context_length")
-    ctx_str = f"  {C.GRAY}ctx:{C.RESET} {C.MAGENTA}{_fmt_context(ctx)}{C.RESET}" if ctx else ""
+    ctx_str = (
+        f"  {C.GRAY}ctx:{C.RESET} {C.MAGENTA}{_fmt_context(ctx)}{C.RESET}"
+        if ctx
+        else ""
+    )
     print(f"\n{C.BOLD}{C.CYAN}  tbot{C.RESET}  {C.GRAY}— OpenRouter CLI{C.RESET}")
     print(f"  {C.GRAY}model:{C.RESET} {C.YELLOW}{cfg['model']}{C.RESET}{ctx_str}")
-    print(f"  {C.GRAY}temp:{C.RESET}  {C.YELLOW}{cfg['temperature']}{C.RESET}  "
-          f"{tools_flag}  {trust_flag}")
-    print(f"  {C.GRAY}type{C.RESET} {C.BOLD}/help{C.RESET} {C.GRAY}for commands{C.RESET}\n")
+    print(
+        f"  {C.GRAY}temp:{C.RESET}  {C.YELLOW}{cfg['temperature']}{C.RESET}  "
+        f"{tools_flag}  {trust_flag}"
+    )
+    print(
+        f"  {C.GRAY}type{C.RESET} {C.BOLD}/help{C.RESET} {C.GRAY}for commands{C.RESET}\n"
+    )
 
 
 def _fmt_context(ctx):
@@ -1935,7 +2306,9 @@ def _term_width():
 def _render_selector(models, filtered, query, idx, current_id):
     w = _term_width()
     sep = f"{C.GRAY}{'─' * (w - 2)}{C.RESET}"
-    buf = [f"{C.BOLD}{C.CYAN}model{C.RESET}  {C.YELLOW}{current_id}{C.RESET}  {C.GRAY}({len(filtered)}/{len(models)}){C.RESET}\r\n"]
+    buf = [
+        f"{C.BOLD}{C.CYAN}model{C.RESET}  {C.YELLOW}{current_id}{C.RESET}  {C.GRAY}({len(filtered)}/{len(models)}){C.RESET}\r\n"
+    ]
     buf.append(f"{C.CYAN}filter:{C.RESET} {query if query else ''}\r\n")
     buf.append(f"{sep}\r\n")
     if not filtered:
@@ -1959,7 +2332,11 @@ def _render_selector(models, filtered, query, idx, current_id):
             bs = ""
             aa = m.get("benchmarks", {}).get("artificial_analysis")
             if aa:
-                labels = {"intelligence_index": "int", "coding_index": "code", "agentic_index": "agent"}
+                labels = {
+                    "intelligence_index": "int",
+                    "coding_index": "code",
+                    "agentic_index": "agent",
+                }
                 parts = []
                 for k, lbl in labels.items():
                     v = aa.get(k)
@@ -1974,6 +2351,7 @@ def _render_selector(models, filtered, query, idx, current_id):
 
 def _read_esc(fd):
     import select
+
     seq = ""
     for _ in range(8):
         r, _, _ = select.select([sys.stdin], [], [], 0.2)
@@ -1988,8 +2366,13 @@ def _read_esc(fd):
 
 def model_selector(current_id, api_key):
     import termios, tty
+
     _TBOT_PARAMS = {"temperature", "max_tokens", "tools"}
-    models = [m for m in fetch_models(api_key) if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))]
+    models = [
+        m
+        for m in fetch_models(api_key)
+        if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))
+    ]
     if not models:
         return None
     filtered = list(models)
@@ -2027,7 +2410,11 @@ def model_selector(current_id, api_key):
                 idx = 0
             q = query.lower()
             if query:
-                filtered = [m for m in models if q in m.get("id", "").lower() or q in m.get("name", "").lower()]
+                filtered = [
+                    m
+                    for m in models
+                    if q in m.get("id", "").lower() or q in m.get("name", "").lower()
+                ]
             else:
                 filtered = list(models)
     finally:
@@ -2054,20 +2441,26 @@ def print_help():
     print(f"{C.CYAN}Tools ({len(TOOLS)}):{C.RESET}")
     for t in TOOLS:
         fn = t["function"]
-        print(f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description'].split('.')[0]}.{C.RESET}")
-    print(f"  {C.GRAY}--- skills are injected dynamically via the skill tool ---{C.RESET}")
+        print(
+            f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description'].split('.')[0]}.{C.RESET}"
+        )
+    print(
+        f"  {C.GRAY}--- skills are injected dynamically via the skill tool ---{C.RESET}"
+    )
 
 
 def open_editor(initial_text=""):
-    editor_cmd = shlex.split(os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi')
-    with tempfile.NamedTemporaryFile(suffix='.md', mode='w+', delete=False) as f:
+    editor_cmd = shlex.split(
+        os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
+    )
+    with tempfile.NamedTemporaryFile(suffix=".md", mode="w+", delete=False) as f:
         f.write(initial_text)
         f.flush()
         tmp_path = f.name
     try:
         subprocess.run(editor_cmd + [tmp_path], check=True)
-        result = Path(tmp_path).read_text(encoding='utf-8')
-        return result.rstrip('\n')
+        result = Path(tmp_path).read_text(encoding="utf-8")
+        return result.rstrip("\n")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"{C.RED}editor error: {e}{C.RESET}")
         return initial_text
@@ -2077,72 +2470,39 @@ def open_editor(initial_text=""):
 
 # ── System prompt loading ───────────────────────────────────────
 
-SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks. Use the instructions below and the tools available to you to assist the user.
+SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks.
 
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming.
 
-# Tone and style
-You should be concise, direct, and to the point. When you run a non-trivial bash command, you should explain what the command does and why you are running it, to make sure the user understands what you are doing (this is especially important when you are running a command that will make changes to the user's system).
-Remember that your output will be displayed on a command line interface. Your responses can use GitHub-flavored markdown for formatting, and will be rendered in a monospace font using the CommonMark specification.
-Output text to communicate with the user; all text you output outside of tool use is displayed to the user. Only use tools to complete tasks. Never use tools like Bash or code comments as means to communicate with the user during the session.
-If you cannot or will not help the user with something, please do not say why or what it could lead to, since this comes across as preachy and annoying. Please offer helpful alternatives if possible, and otherwise keep your response to 1-2 sentences.
-Only use emojis if the user explicitly requests it. Avoid using emojis in all communication unless asked.
-IMPORTANT: You should minimize output tokens as much as possible while maintaining helpfulness, quality, and accuracy. Only address the specific query or task at hand, avoiding tangential information unless absolutely critical for completing the request. If you can answer in 1-3 sentences or a short paragraph, please do.
-IMPORTANT: You should NOT answer with unnecessary preamble or postamble (such as explaining your code or summarizing your action), unless the user asks you to.
-IMPORTANT: Keep your responses short, since they will be displayed on a command line interface. You MUST answer concisely with fewer than 4 lines (not including tool use or code generation), unless user asks for detail. Answer the user's question directly, without elaboration, explanation, or details. One word answers are best. Avoid introductions, conclusions, and explanations. You MUST avoid text before/after your response, such as "The answer is <answer>.", "Here is the content of the file..." or "Based on the information provided, the answer is..." or "Here is what I will do next...".
+# BEHAVIOR HIERARCHY (read in order — earlier rules take precedence)
+1. RESPOND TO THE USER FIRST. Your text output is the primary channel.
+2. Use tools ONLY when necessary to complete a task the user asked for.
+3. After tool execution, ALWAYS produce text to communicate results.
+4. The system will FORCE you to respond if you make 6+ consecutive tool-only rounds.
+5. Be concise but complete — explain what matters, skip what doesn't. No minimum line count.
+6. Do not add code explanation summaries unless the user asks.
 
-# Proactiveness
-You are allowed to be proactive, but only when the user asks you to do something. You should strive to strike a balance between:
-1. Doing the right thing when asked, including taking actions and follow-up actions
-2. Not surprising the user with actions you take without asking
-For example, if the user asks you how to approach something, you should do your best to answer their question first, and not immediately jump into taking actions.
-3. Do not add additional code explanation summary unless requested by the user. After working on a file, just stop, rather than providing an explanation of what you did.
+# Tone
+- Output text to communicate with the user; tool results are displayed automatically.
+- Your responses render as GitHub-flavored markdown in a terminal.
+- Only use emojis if the user explicitly asks. Never use Bash/code comments to communicate.
+- If you cannot help, offer alternatives briefly (1-2 sentences). Do not explain why.
+- Reference code as `file_path:line_number` for clickable navigation.
 
 # Following conventions
-When making changes to files, first understand the file's code conventions. Mimic code style, use existing libraries and utilities, and follow existing patterns.
-- NEVER assume that a given library is available, even if it is well known. Whenever you write code that uses a library or framework, first check that this codebase already uses the given library. For example, you might look at neighboring files, or check the package.json (or cargo.toml, and so on depending on the language).
-- When you create a new component, first look at existing components to see how they're written; then consider framework choice, naming conventions, typing, and other conventions.
-- When you edit a piece of code, first look at the code's surrounding context (especially its imports) to understand the code's choice of frameworks and libraries. Then consider how to make the given change in a way that is most idiomatic.
-- Always follow security best practices. Never introduce code that exposes or logs secrets and keys. Never commit secrets or keys to the repository.
+- Understand code conventions before editing. Mimic existing style, libraries, and patterns.
+- Check if a library is already used before adding a dependency.
+- Never expose secrets or commit them to the repository.
+- DO NOT ADD COMMENTS to code unless asked.
 
-# Code style
-- IMPORTANT: DO NOT ADD ANY COMMENTS unless asked
-
-# Doing tasks
-The user will primarily request you perform software engineering tasks. This includes solving bugs, adding new functionality, refactoring code, explaining code, and more. For these tasks the following steps are recommended:
-- Use the available search tools to understand the codebase and the user's query. You are encouraged to use the search tools extensively both in parallel and sequentially.
-- Implement the solution using all tools available to you
-- Verify the solution if possible with tests. NEVER assume specific test framework or test script. Check the README or search codebase to determine the testing approach.
-- When you have completed a task, run the lint and typecheck commands (e.g. npm run lint, npm run typecheck, ruff, etc.) with Bash if they were provided to you to ensure your code is correct.
-NEVER commit changes unless the user explicitly asks you to. It is VERY IMPORTANT to only commit when explicitly asked, otherwise the user will feel that you are being too proactive.
-
-- Tool results and user messages may include <system-reminder> tags. <system-reminder> tags contain useful information and reminders. They are NOT part of the user's provided input or the tool result.
-
-# Tool usage policy
-- When doing file search, prefer to use Grep and Glob tools.
-- You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. When making multiple bash tool calls, you MUST send a single message with multiple tools calls to run the calls in parallel. For example, if you need to run "git status" and "git diff", send a single message with two tool calls to run the calls in parallel.
-
-# Code References
-When referencing specific functions or pieces of code include the pattern `file_path:line_number` to allow the user to easily navigate to the source code location.
-
-<example>
-user: Where are errors from the client handled?
-assistant: Clients are marked as failed in the `connectToServer` function in src/services/process.ts:712.
-</example>
-
-# Tools available
-You have access to these tools:
-- **read** — Read file contents
-- **write** — Create new files (prefer editing existing files when possible)
-- **edit** — Edit existing files with exact string replacement
-- **glob** — Find files by pattern
-- **grep** — Search file contents with regex
-- **bash** — Run system commands (git, npm, build, test, etc.)
-- **question** — Ask the user questions when you need clarification
-- **todowrite** — Track and plan tasks
-- **websearch** — Search the web for current information
-- **webfetch** — Fetch content from URLs
-- **skill** — Load specialized domain skills
+# Tools
+Available: read, write, edit, glob, grep, bash, question, todowrite, websearch, webfetch, skill.
+- Do NOT call todowrite repeatedly. If blocked, use edit/write for TASK.md directly.
+- Re-reading a file is allowed — previous content is stale, re-read is fresh.
+- Parallelize independent tool calls in one response. Prefer grep/glob for search.
+- When running commands, describe what you're doing and why.
+- After editing files, stop — no explanation summary unless asked.
+- NEVER commit changes unless the user explicitly asks.
 
 # Environment
 Today's date: {date}
@@ -2195,6 +2555,7 @@ def _env_vars():
 
 # ── Main ────────────────────────────────────────────────────────
 
+
 def _init_messages(cfg):
     prompt = load_system_prompt(cfg)
     return [{"role": "system", "content": prompt}] if prompt else []
@@ -2204,12 +2565,21 @@ def main():
     cfg = load_cfg()
     cfg["api_key"] = resolve_key(cfg)
 
-    parser = argparse.ArgumentParser(description="tbot - Terminal chatbot for OpenRouter")
-    parser.add_argument("-m", "--model", help="Model slug (e.g. deepseek/deepseek-chat)")
+    parser = argparse.ArgumentParser(
+        description="tbot - Terminal chatbot for OpenRouter"
+    )
+    parser.add_argument(
+        "-m", "--model", help="Model slug (e.g. deepseek/deepseek-chat)"
+    )
     parser.add_argument("-t", "--temperature", type=float, help="Temperature 0.0-2.0")
     parser.add_argument("-s", "--system", help="System prompt")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling")
-    parser.add_argument("--trust", action="store_true", help="Auto-approve tool execution")
+    parser.add_argument(
+        "--trust", action="store_true", help="Auto-approve tool execution"
+    )
+    parser.add_argument(
+        "-x", "--task", help="Run a single task non-interactively and exit"
+    )
     args = parser.parse_args()
 
     if args.model:
@@ -2223,6 +2593,20 @@ def main():
     if args.trust:
         cfg["trust_mode"] = True
 
+    # ── non-interactive task mode ──
+    if args.task:
+        cfg["tools_enabled"] = True
+        cfg["trust_mode"] = True
+        messages = _init_messages(cfg)
+        _log_init()
+        atexit.register(_log_close)
+        _log_write(f">>> {args.task}")
+        messages.append({"role": "user", "content": args.task})
+        send_conversation(messages, cfg)
+        return
+
+    _log_init()
+    atexit.register(_log_close)
     setup_history()
     atexit.register(save_history)
     if readline is not None:
@@ -2250,6 +2634,8 @@ def main():
         if not line:
             continue
 
+        _log_write(f">>> {line}")
+
         # ── commands ──
         if line.startswith("/"):
             parts = line[1:].strip().split(maxsplit=1)
@@ -2267,6 +2653,7 @@ def main():
                 _total_tokens = 0
                 messages = _init_messages(cfg)
                 _doom_trail.clear()
+                _log_reopen()
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
                 if arg:
@@ -2276,9 +2663,13 @@ def main():
                     ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
                     if ctx:
                         cfg["_context_length"] = ctx
-                        print(f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}")
+                        print(
+                            f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}"
+                        )
                     else:
-                        print(f"{C.GREEN}model → {cfg['model']} (context unknown){C.RESET}")
+                        print(
+                            f"{C.GREEN}model → {cfg['model']} (context unknown){C.RESET}"
+                        )
                 else:
                     selected = model_selector(cfg["model"], cfg.get("api_key", ""))
                     if selected and selected != cfg["model"]:
@@ -2288,7 +2679,9 @@ def main():
                         ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
                         if ctx:
                             cfg["_context_length"] = ctx
-                            print(f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}")
+                            print(
+                                f"{C.GREEN}model → {cfg['model']} ({_fmt_context(ctx)}){C.RESET}"
+                            )
                         else:
                             print(f"{C.GREEN}model → {cfg['model']}{C.RESET}")
                     elif selected == cfg["model"]:
@@ -2318,7 +2711,9 @@ def main():
             elif cmd == "tools":
                 cfg["tools_enabled"] = not cfg["tools_enabled"]
                 save_cfg(cfg)
-                print(f"{C.GREEN}tools {'on' if cfg['tools_enabled'] else 'off'}{C.RESET}")
+                print(
+                    f"{C.GREEN}tools {'on' if cfg['tools_enabled'] else 'off'}{C.RESET}"
+                )
             elif cmd == "trust":
                 cfg["trust_mode"] = not cfg["trust_mode"]
                 save_cfg(cfg)
@@ -2351,7 +2746,9 @@ def main():
                         else:
                             messages.append({"role": "user", "content": content})
                         lines = content.split("\n")
-                        print(f"{C.GREEN}message ({len(lines)} lines, {len(content)} chars){C.RESET}")
+                        print(
+                            f"{C.GREEN}message ({len(lines)} lines, {len(content)} chars){C.RESET}"
+                        )
                         if len(lines) <= 3:
                             print(content)
                         send_conversation(messages, cfg, pop_on_first_error=appended)
@@ -2372,7 +2769,7 @@ def main():
                 sub_arg = sub[1] if len(sub) > 1 else ""
                 if sub_cmd == "add" and sub_arg:
                     name = sub_arg.strip()
-                    if not re.match(r'^[a-zA-Z_][a-zA-Z0-9_-]*$', name):
+                    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
                         print(f"{C.RED}invalid skill name{C.RESET}")
                     else:
                         ensure_skills_dir()
@@ -2437,11 +2834,18 @@ Replace this with instructions for the model.
         send_conversation(messages, cfg, pop_on_first_error=True)
 
 
+MAX_TOOL_ONLY_ROUNDS = 6
+
+
 def send_conversation(messages, cfg, pop_on_first_error=False):
-    _clear_trails()
-    total = sum(len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str))
+    total = sum(
+        len(m.get("content", "")) for m in messages if isinstance(m.get("content"), str)
+    )
     max_chars = _compute_max_history_chars(cfg)
-    while total > max_chars and sum(1 for m in messages if m["role"] not in ("system",)) > 1:
+    while (
+        total > max_chars
+        and sum(1 for m in messages if m["role"] not in ("system",)) > 1
+    ):
         for i, m in enumerate(messages):
             if m["role"] not in ("system", "tool"):
                 total -= len(m.get("content", ""))
@@ -2460,7 +2864,9 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     base_delay = 1.0
     max_stream_retries = 5
     stream_retries = 0
+    tool_only_rounds = 0
     while round_n < max_rounds:
+        _clear_trails()
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
@@ -2468,40 +2874,68 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 if "error" not in result:
                     break
                 if attempt < max_retries and result.get("error") in retryable_errors:
-                    delay = base_delay * (2 ** attempt)
-                    print(f"\n  {C.YELLOW}Connection lost ({result['error']}), retrying in {delay:.0f}s... (attempt {attempt+1}/{max_retries}){C.RESET}")
+                    delay = base_delay * (2**attempt)
+                    print(
+                        f"\n  {C.YELLOW}Connection lost ({result['error']}), retrying in {delay:.0f}s... (attempt {attempt + 1}/{max_retries}){C.RESET}"
+                    )
                     time.sleep(delay)
                     continue
-                show_error(result.get("title", "Error"),
-                          result.get("detail", result["error"]),
-                          result.get("hint", ""))
+                show_error(
+                    result.get("title", "Error"),
+                    result.get("detail", result["error"]),
+                    result.get("hint", ""),
+                )
                 if round_n == 1 and pop_on_first_error:
                     messages.pop()
                 break
             if "error" in result:
                 break
             global _total_tokens
-            content, tool_calls, pt, ct, _tot, interrupted = parse_stream(result["stream"])
+            content, tool_calls, pt, ct, _tot, interrupted = parse_stream(
+                result["stream"]
+            )
             result["stream"].close()
             if interrupted:
                 stream_retries += 1
                 if stream_retries > max_stream_retries:
-                    show_error("Stream keeps failing",
-                               "The connection was interrupted 5 times in a row.",
-                               "Check your internet connection or try a different model.")
+                    show_error(
+                        "Stream keeps failing",
+                        "The connection was interrupted 5 times in a row.",
+                        "Check your internet connection or try a different model.",
+                    )
                     break
                 if content:
-                    print(f"\n{C.YELLOW}  Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}")
+                    print(
+                        f"\n{C.YELLOW}  Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
+                    )
                 else:
-                    print(f"\n  {C.YELLOW}Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}")
+                    print(
+                        f"\n  {C.YELLOW}Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
+                    )
                 round_n -= 1
                 continue
-            stream_retries = 0
+            if _tot or content or tool_calls:
+                stream_retries = 0
             if _tot:
                 _total_tokens = _tot
             if tool_calls:
                 if content:
+                    tool_only_rounds = 0
                     print()
+                else:
+                    tool_only_rounds += 1
+                    if tool_only_rounds >= MAX_TOOL_ONLY_ROUNDS:
+                        messages.append(
+                            {
+                                "role": "system",
+                                "content": (
+                                    f"LÍMITE ALCANZADO: Llevas sin responder texto al usuario durante "
+                                    f"{MAX_TOOL_ONLY_ROUNDS} rondas. El sistema BLOQUEARÁ cualquier "
+                                    "nuevo tool call. DEBES responder ahora directamente al usuario."
+                                ),
+                            }
+                        )
+                        break
                 doom_warning = _check_doom_loop(tool_calls)
                 if doom_warning:
                     print(f"\n  {C.YELLOW}{doom_warning[:100]}{C.RESET}")
@@ -2512,6 +2946,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     break
                 continue
             if content:
+                tool_only_rounds = 0
                 print()
                 if _total_tokens:
                     print(f"{C.GRAY}── {_total_tokens} tokens ──{C.RESET}")
@@ -2523,9 +2958,11 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 messages.pop()
             break
     if round_n >= max_rounds:
-        show_error("Max tool rounds reached",
-                   f"The model used {max_rounds} consecutive tool calls without producing a final response.",
-                   "This may indicate a bug in the model or an infinite loop. Try a different model.")
+        show_error(
+            "Max tool rounds reached",
+            f"The model used {max_rounds} consecutive tool calls without producing a final response.",
+            "This may indicate a bug in the model or an infinite loop. Try a different model.",
+        )
 
 
 if __name__ == "__main__":
