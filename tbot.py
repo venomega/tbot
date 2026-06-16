@@ -2560,6 +2560,7 @@ def default_cfg():
         "max_history_chars": 200000,
         "tools_enabled": True,
         "trust_mode": False,
+        "resp_color": "95",
     }
 
 
@@ -2753,7 +2754,7 @@ def _term_size():
         return None
 
 
-def parse_stream(resp):
+def parse_stream(resp, resp_color="95"):
     content_parts = []
     tool_calls = {}
     token_count = 0
@@ -2762,6 +2763,8 @@ def parse_stream(resp):
     total_tokens = 0
     cost = 0
     interrupted = False
+    _color_on = f"\033[{resp_color}m"
+    _color_printed = False
 
     sock = None
     try:
@@ -2824,6 +2827,9 @@ def parse_stream(resp):
                 if c:
                     content_parts.append(c)
                     token_count += 1
+                    if not _color_printed:
+                        print(_color_on, end="", flush=True)
+                        _color_printed = True
                     print(c, end="", flush=True)
                     if _log_fh is not None:
                         try:
@@ -2852,6 +2858,9 @@ def parse_stream(resp):
                 pass
     except (socket.timeout, OSError):
         interrupted = True
+
+    if _color_printed and not interrupted:
+        print(C.RESET, end="", flush=True)
 
     if content_parts and _log_fh is not None and not interrupted:
         try:
@@ -2888,6 +2897,7 @@ MAX_TOOLS_PER_ROUND = 10
 
 def execute_tool_calls(tool_calls, messages, cfg):
     global _todo_has_write_since_last
+    pending_system = []
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -2923,11 +2933,15 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     return False
                 ok = ans in ("", "y", "yes")
             if ok:
+                before = len(messages)
                 try:
                     result = handler(args)
                 except KeyboardInterrupt:
                     print(f"\n  {C.YELLOW}cancelled{C.RESET}")
                     return False
+                after = len(messages)
+                for _ in range(after - before):
+                    pending_system.append(messages.pop())
                 if len(result) > MAX_TOOL_OUTPUT:
                     result = (
                         result[:MAX_TOOL_OUTPUT]
@@ -2958,6 +2972,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
             )
         if name not in _READ_ONLY_TOOLS and ok:
             _todo_has_write_since_last = True
+    for msg in pending_system:
+        messages.append(msg)
     return True
 
 
@@ -3002,7 +3018,9 @@ def _completer(text, state):
                     c = c.strip()
                     if not c:
                         continue
-                    basename = c[len(dir_part) :] if dir_part and c.startswith(dir_part) else c
+                    basename = (
+                        c[len(dir_part) :] if dir_part and c.startswith(dir_part) else c
+                    )
                     p = Path(c) if c.startswith("/") else Path(prefix).parent / c
                     if p.exists() and p.is_dir():
                         matches.append(basename + "/")
@@ -3647,51 +3665,75 @@ def open_editor(initial_text=""):
 
 # ── System prompt loading ───────────────────────────────────────
 
-SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks.
+SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps users with software engineering tasks. Use the tools available to assist the user with their requests.
 
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming.
-
-# BEHAVIOR HIERARCHY (read in order — earlier rules take precedence)
+# Core Rules (highest priority — read in order)
 1. RESPOND TO THE USER FIRST. Your text output is the primary channel.
 2. Use tools ONLY when necessary to complete a task the user asked for.
 3. After tool execution, ALWAYS produce text to communicate results.
-4. The system will FORCE you to respond if you make 6+ consecutive tool-only rounds.
-5. Be concise but complete — explain what matters, skip what doesn't. No minimum line count.
-6. Do not add code explanation summaries unless the user asks.
+4. Be concise but complete — explain what matters, skip what doesn't. No minimum line count.
+5. Do not add code explanation summaries unless the user asks.
 
-# Tone
+# Security & Integrity
+- NEVER expose secrets, API keys, tokens, or credentials.
+- NEVER read, modify, or commit files like `.env`, `credentials.json`, `*.pem`, `*.key`.
+- NEVER commit changes unless the user explicitly asks.
+- NEVER generate or guess URLs for the user unless you are confident they are legitimate.
+
+# Communication Style
 - Output text to communicate with the user; tool results are displayed automatically.
 - Your responses render as GitHub-flavored markdown in a terminal.
 - Only use emojis if the user explicitly asks. Never use Bash/code comments to communicate.
-- If you cannot help, offer alternatives briefly (1-2 sentences). Do not explain why.
+- If you cannot help, offer alternatives briefly (1-2 sentences). Explain WHY briefly when it helps the user understand.
 - Reference code as `file_path:line_number` for clickable navigation.
+- When you need clarification, use the `question` tool — do NOT guess critical details.
+- Use `webfetch` for reading specific URLs, `websearch` for finding information.
 
-# Following conventions
+# Coding Conventions
 - Understand code conventions before editing. Mimic existing style, libraries, and patterns.
-- Check if a library is already used before adding a dependency.
-- Never expose secrets or commit them to the repository.
+- Check if a library is already used before adding a dependency (check package.json, imports, etc.).
 - DO NOT ADD COMMENTS to code unless asked.
+- ALWAYS read a file BEFORE editing it (the edit tool enforces this).
+- Prefer `edit` for small surgical changes, `write` for new files or complete rewrites.
+- After running non-trivial commands, describe what you did and why.
 
-# Tools
-Available: {tools}
-- rag_index/rag_search/rag_status: codebase RAG (BM25). Index first, then search.
-- Do NOT call todowrite repeatedly. If blocked, use edit/write for TASK.md directly.
-- Re-reading a file is allowed — previous content is stale, re-read is fresh.
-- Parallelize independent tool calls in one response. Prefer grep/glob for search.
-- When running commands, describe what you're doing and why.
-- After editing files, stop — no explanation summary unless asked.
-- NEVER commit changes unless the user explicitly asks.
+# Tool Usage & Constraints
+Available tools: {tools}
+
+General rules:
+- Parallelize independent tool calls (multiple in one response). Chain dependent calls sequentially.
+- Tool output is truncated at {max_tool_output} characters. If you hit the limit, paginate (read with offset) or refine your query.
+- Re-reading a file is allowed — content from previous rounds is stale, re-read is fresh.
+- Prefer grep/glob for code search; prefer RAG for semantic/concept search across the codebase.
+
+RAG ({has_rag}):
+- `rag_index` builds a BM25 keyword index. Index once before searching.
+- `rag_search` searches the index. Use for conceptual queries ("how does auth work?").
+- `grep` is better for exact pattern matching, `glob` for filename patterns.
+
+subagent (`task` tool, depth {subagent_depth}/3):
+- Use for complex multi-step tasks that need independent research or processing.
+- Maximum nesting depth is 3 (current: {subagent_depth}). Do not exceed.
+
+todowrite:
+- Call ONCE to plan, then call again ONLY when a task completes or status changes.
+- If blocked by loop protection, use edit/write to modify TASK.md directly.
+
+Loop prevention — the system detects and BLOCKS these patterns:
+- Calling the same tool with identical arguments 3+ times in a row.
+- Alternating tools in a pattern (A-B-A-B-A-B or A-B-C-A-B-C).
+- Calling todowrite with the same list back-to-back, or faster than once per 15 seconds.
+If blocked, stop and respond with text — do not retry the same sequence.
 
 # Environment
-Today's date: {date}
-Working directory: {cwd}
-Platform: {platform}
-Skills directory: {skills_dir}
+Date: {date}  |  Model: {model}  |  Provider: {provider}  |  Trust mode: {trust_mode}
+CWD: {cwd}  |  OS: {os}
+Skills: {skills_dir}
 
 Skills are loaded in two steps:
   1. `skill(name)` — checks if a skill exists (returns the loader function name)
   2. `skill_<name>()` — actually loads the skill's instructions into your context
-Call the `skill_<name>()` variant directly if you know the skill exists. Available skills: {skills_list}
+Call `skill_<name>()` directly if you know the skill exists. Available skills: {skills_list}
 
 Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices."""
 
@@ -3700,7 +3742,7 @@ def load_system_prompt(cfg):
     """Load system prompt from file (or config override). Injects dynamic vars."""
     prompt = cfg.get("system_prompt", "")
     if prompt:
-        for k, v in _env_vars().items():
+        for k, v in _env_vars(cfg).items():
             if "{" + k + "}" in prompt:
                 prompt = prompt.replace("{" + k + "}", v)
         return prompt
@@ -3718,25 +3760,37 @@ def load_system_prompt(cfg):
     except OSError:
         data = SYSTEM_PROMPT_DEFAULT
 
-    for k, v in _env_vars().items():
+    for k, v in _env_vars(cfg).items():
         if "{" + k + "}" in data:
             data = data.replace("{" + k + "}", v)
     return data
 
 
-def _env_vars():
+def _env_vars(cfg=None):
     skills = load_skills()
     skills_list = ", ".join(n for n, *_ in skills) if skills else "none"
     tool_names = [
         t["function"]["name"] for t in TOOLS if t["function"]["name"] != "invalid"
     ]
+    has_rag = "yes" if _rag_binary() else "no"
+    depth = os.environ.get("TBOT_DEPTH", "0")
+    model = cfg.get("model", "unknown") if cfg else "unknown"
+    provider = cfg.get("provider", "unknown") if cfg else "unknown"
+    trust_mode = str(cfg.get("trust_mode", False)) if cfg else "unknown"
     return {
         "date": time.strftime("%Y-%m-%d"),
         "cwd": str(Path.cwd()),
         "platform": platform.system().lower(),
+        "os": f"{platform.system()} {platform.release()}",
         "skills_dir": str(SKILLS_DIR),
         "skills_list": skills_list,
         "tools": ", ".join(tool_names),
+        "model": model,
+        "provider": provider,
+        "trust_mode": trust_mode,
+        "max_tool_output": str(MAX_TOOL_OUTPUT),
+        "subagent_depth": depth,
+        "has_rag": has_rag,
     }
 
 
@@ -4271,7 +4325,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 break
             global _total_tokens, _last_cost, _acc_cost
             content, tool_calls, pt, ct, _tot, _cost, interrupted = parse_stream(
-                result["stream"]
+                result["stream"], resp_color=cfg.get("resp_color", "95")
             )
             result["stream"].close()
             if interrupted:
