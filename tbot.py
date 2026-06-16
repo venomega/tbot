@@ -87,6 +87,121 @@ class C:
     GRAY = "\033[90m"
 
 
+# ── File picker ───────────────────────────────────────────────
+
+_FILE_SELECTOR_SKIP_DIRS = frozenset(
+    {
+        ".git",
+        "__pycache__",
+        "node_modules",
+        ".venv",
+        "venv",
+        "dist",
+        "build",
+        ".tox",
+        ".eggs",
+        "egg-info",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".gitlab",
+        ".github",
+        ".vscode",
+        ".idea",
+    }
+)
+
+_BINARY_EXTS = frozenset(
+    {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".bmp",
+        ".ico",
+        ".webp",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".otf",
+        ".pdf",
+        ".doc",
+        ".docx",
+        ".xls",
+        ".xlsx",
+        ".ppt",
+        ".pptx",
+        ".zip",
+        ".tar",
+        ".gz",
+        ".bz2",
+        ".xz",
+        ".7z",
+        ".rar",
+        ".zst",
+        ".pyc",
+        ".pyo",
+        ".pyd",
+        ".so",
+        ".dll",
+        ".dylib",
+        ".o",
+        ".a",
+        ".lib",
+        ".obj",
+        ".exe",
+        ".bin",
+        ".msi",
+        ".deb",
+        ".rpm",
+        ".apk",
+        ".dat",
+        ".db",
+        ".sqlite",
+        ".sqlite3",
+        ".class",
+        ".jar",
+        ".war",
+        ".iso",
+        ".img",
+        ".dmg",
+        ".mp3",
+        ".mp4",
+        ".avi",
+        ".mov",
+        ".mkv",
+        ".DS_Store",
+    }
+)
+
+_FILE_RE = re.compile(r"@@(\S*)")
+
+
+def _collect_files():
+    files = []
+    for f in CURRENT_DIR.rglob("*"):
+        if f.is_dir() and f.name in _FILE_SELECTOR_SKIP_DIRS:
+            continue
+        if not f.is_file():
+            continue
+        if any(
+            p.name in _FILE_SELECTOR_SKIP_DIRS
+            for p in f.relative_to(CURRENT_DIR).parents
+        ):
+            continue
+        if f.suffix.lower() in _BINARY_EXTS:
+            continue
+        if f.stat().st_size > 1_000_000:
+            continue
+        try:
+            rel = f.relative_to(CURRENT_DIR)
+        except ValueError:
+            continue
+        files.append({"path": str(rel), "size": f.stat().st_size})
+    return sorted(files, key=lambda x: x["path"])
+
+
 # ── Tool definitions (opencode-inspired) ──────────────────────
 
 TOOLS = [
@@ -457,7 +572,6 @@ TOOLS = [
         },
     },
 ]
-
 
 # ── Project directory context ────────────────────────────────
 
@@ -2148,7 +2262,7 @@ def default_cfg():
         "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
-        "system_prompt": "",  # empty = load from system_prompt.txt
+        "system_prompt": "",
         "max_history_chars": 200000,
         "tools_enabled": True,
         "trust_mode": False,
@@ -2841,6 +2955,132 @@ def print_help():
     )
 
 
+def _render_file_selector(files, filtered, query, idx, selected):
+    w = _term_width()
+    sep = f"{C.GRAY}{'─' * (w - 2)}{C.RESET}"
+    sel_count = len(selected)
+    sel_tag = f"  {C.GREEN}{sel_count} selected{C.RESET}" if sel_count else ""
+    buf = [
+        f"{C.BOLD}{C.CYAN}file picker{C.RESET}  {C.GRAY}({len(filtered)}/{len(files)} files){C.RESET}{sel_tag}\r\n"
+    ]
+    buf.append(f"{C.CYAN}filter:{C.RESET} {query}\r\n")
+    buf.append(f"{sep}\r\n")
+    if not filtered:
+        buf.append(f"{C.GRAY}no matches{C.RESET}\r\n")
+    else:
+        start = max(0, idx - 10)
+        end = min(len(filtered), start + 20)
+        for i in range(start, end):
+            f = filtered[i]
+            p = f["path"]
+            checked = f"{C.GREEN}✓{C.RESET}" if p in selected else " "
+            pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+            s = f["size"]
+            if s < 1024:
+                sz = f"{s}B"
+            elif s < 1024 * 1024:
+                sz = f"{s / 1024:.0f}K"
+            else:
+                sz = f"{s / 1024 / 1024:.1f}M"
+            buf.append(f"{pre}[{checked}] {p}  {C.GRAY}{sz}{C.RESET}\r\n")
+    buf.append(
+        f"\r\n{C.GRAY}Space toggle  ↵ confirm  Ctrl+N/P nav  type filter  Ctrl+C cancel{C.RESET}"
+    )
+    return "".join(buf)
+
+
+def file_selector(initial_query=""):
+    import termios, tty
+
+    all_files = _collect_files()
+    if not all_files:
+        print(f"\r{C.YELLOW}no files found in project{C.RESET}")
+        return None
+
+    filtered = list(all_files)
+    query = initial_query
+    idx = 0
+    selected = set()
+
+    if query:
+        q = query.lower()
+        filtered = [f for f in all_files if q in f["path"].lower()]
+        if idx >= len(filtered):
+            idx = max(0, len(filtered) - 1)
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(
+                _render_file_selector(all_files, filtered, query, idx, selected)
+            )
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                _read_esc(fd)
+            elif ch == " ":
+                if filtered and idx < len(filtered):
+                    p = filtered[idx]["path"]
+                    if p in selected:
+                        selected.discard(p)
+                    else:
+                        selected.add(p)
+            elif ch in ("\r", "\n"):
+                if selected:
+                    return ",".join(sorted(selected))
+                if filtered:
+                    return filtered[idx]["path"]
+                return None
+            elif ch == "\x03":
+                return None
+            elif ch == "\x0e":
+                idx = min(len(filtered) - 1, idx + 1) if filtered else 0
+            elif ch == "\x10":
+                idx = max(0, idx - 1)
+            elif ch in ("\x7f", "\b"):
+                query = query[:-1]
+                idx = 0
+            elif ch.isprintable():
+                query += ch
+                idx = 0
+            q = query.lower()
+            if query:
+                filtered = [f for f in all_files if q in f["path"].lower()]
+            else:
+                filtered = list(all_files)
+            if idx >= len(filtered):
+                idx = max(0, len(filtered) - 1) if filtered else 0
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
+def _expand_file_markers(line):
+    parts = []
+    last_end = 0
+    for m in _FILE_RE.finditer(line):
+        parts.append(line[last_end : m.start()])
+        filter_text = m.group(1)
+        path = file_selector(initial_query=filter_text)
+        if path:
+            parts.append(path)
+        else:
+            parts.append(m.group(0))
+        last_end = m.end()
+    parts.append(line[last_end:])
+    return "".join(parts)
+
+
 def open_editor(initial_text=""):
     editor_cmd = shlex.split(
         os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi"
@@ -3294,6 +3534,7 @@ Replace this with instructions for the model.
             continue
 
         # ── message ──
+        line = _expand_file_markers(line)
         messages.append({"role": "user", "content": line})
         send_conversation(messages, cfg, pop_on_first_error=True)
 
