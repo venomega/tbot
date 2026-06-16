@@ -73,6 +73,7 @@ PROVIDERS = {
 _provider_url = PROVIDERS["openrouter"]["url"]
 
 _log_fh = None
+_current_log_path = None
 
 
 class C:
@@ -569,21 +570,23 @@ def _log_path():
 
 
 def _log_init():
-    global _log_fh
+    global _log_fh, _current_log_path
     LOG_DIR.mkdir(parents=True, exist_ok=True)
-    _log_fh = open(_log_path(), "a", encoding="utf-8")
+    _current_log_path = _log_path()
+    _log_fh = open(_current_log_path, "a", encoding="utf-8")
     _log_write("── session started ──")
 
 
 def _log_reopen():
-    global _log_fh
+    global _log_fh, _current_log_path
     if _log_fh is not None:
         _log_write("── session ended ──")
         try:
             _log_fh.close()
         except Exception:
             pass
-    _log_fh = open(_log_path(), "a", encoding="utf-8")
+    _current_log_path = _log_path()
+    _log_fh = open(_current_log_path, "a", encoding="utf-8")
     _log_write("── session started ──")
 
 
@@ -595,7 +598,10 @@ def _log_close():
             _log_fh.close()
         except Exception:
             pass
-        _log_fh = None
+
+
+_log_fh = None
+_current_log_path = None
 
 
 def _log_write(text):
@@ -605,6 +611,43 @@ def _log_write(text):
             _log_fh.flush()
         except Exception:
             pass
+
+
+def _llm_convert(text, target_format, cfg):
+    base_url = _provider_url(cfg)
+    headers = {
+        "Authorization": f"Bearer {cfg['api_key']}",
+        "Content-Type": "application/json",
+    }
+    fmt_name = target_format.lstrip(".")
+    system = (
+        f"Convierte el siguiente log de conversación a formato {fmt_name.upper()}. "
+        f"Preserva TODO el contenido, incluyendo preguntas y respuestas del usuario y asistente. "
+        f"Usa el formato {fmt_name.upper()} apropiado con estructura clara. "
+        f"Devuelve SOLO el resultado en el formato solicitado, sin explicaciones adicionales."
+    )
+    payload = {
+        "model": cfg["model"],
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.3,
+        "max_tokens": 16384,
+        "stream": False,
+    }
+    try:
+        resp = requests.post(
+            base_url + "/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return None
 
 
 def _clean_html_text(html_text, min_line_length=0):
@@ -2876,6 +2919,9 @@ def print_help():
     print(f"  /edit  [text]      Multi-line editor (or Ctrl+E / /edit)")
     print(f"  /tools             Toggle tool calling on/off")
     print(f"  /trust             Toggle auto-approve tools")
+    print(
+        f"  /export <file>      Export session log (use .md/.html for LLM conversion)"
+    )
     print(f"  /skills            List installed skills")
     print(f"  /skill add|rm|show  Manage skills")
     print(f"  /exit              Quit")
@@ -3465,6 +3511,29 @@ Replace this with instructions for the model.
                     print(f"  /skill show <name>     show skill files")
                     print(f"  /skill install <url>   install from URL or git repo")
                     print(f"  /skills                list all skills")
+            elif cmd == "export":
+                if not arg:
+                    print(f"{C.YELLOW}usage: /export <file>{C.RESET}")
+                    continue
+                export_path = Path(arg).expanduser().resolve()
+                if not _current_log_path or not _current_log_path.exists():
+                    print(f"{C.RED}no log file found{C.RESET}")
+                    continue
+                log_text = _current_log_path.read_text(encoding="utf-8")
+                ext = export_path.suffix.lower()
+                if ext in (".html", ".md"):
+                    print(f"{C.YELLOW}converting to {ext}...{C.RESET}")
+                    result = _llm_convert(log_text, ext, cfg)
+                    if result is None:
+                        print(f"{C.RED}conversion failed{C.RESET}")
+                        continue
+                    export_path.parent.mkdir(parents=True, exist_ok=True)
+                    export_path.write_text(result, encoding="utf-8")
+                    print(f"{C.GREEN}exported ({ext}) to {export_path}{C.RESET}")
+                else:
+                    export_path.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(_current_log_path, export_path)
+                    print(f"{C.GREEN}exported to {export_path}{C.RESET}")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
