@@ -19,7 +19,55 @@ HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
 LOG_DIR = CONFIG_DIR / "log"
-PROVIDER_URL = "https://openrouter.ai/api/v1"
+PROVIDERS = {
+    "openrouter": {
+        "name": "OpenRouter",
+        "url": "https://openrouter.ai/api/v1",
+        "env_key": "OPENROUTER_API_KEY",
+    },
+    "openai": {
+        "name": "OpenAI",
+        "url": "https://api.openai.com/v1",
+        "env_key": "OPENAI_API_KEY",
+    },
+    "deepseek": {
+        "name": "DeepSeek",
+        "url": "https://api.deepseek.com/v1",
+        "env_key": "DEEPSEEK_API_KEY",
+    },
+    "groq": {
+        "name": "Groq",
+        "url": "https://api.groq.com/openai/v1",
+        "env_key": "GROQ_API_KEY",
+    },
+    "together": {
+        "name": "Together AI",
+        "url": "https://api.together.xyz/v1",
+        "env_key": "TOGETHER_API_KEY",
+    },
+    "perplexity": {
+        "name": "Perplexity",
+        "url": "https://api.perplexity.ai",
+        "env_key": "PERPLEXITY_API_KEY",
+    },
+    "xai": {
+        "name": "xAI (Grok)",
+        "url": "https://api.x.ai/v1",
+        "env_key": "XAI_API_KEY",
+    },
+    "mistral": {
+        "name": "Mistral AI",
+        "url": "https://api.mistral.ai/v1",
+        "env_key": "MISTRAL_API_KEY",
+    },
+    "fireworks": {
+        "name": "Fireworks AI",
+        "url": "https://api.fireworks.ai/inference/v1",
+        "env_key": "FIREWORKS_API_KEY",
+    },
+}
+
+_provider_url = PROVIDERS["openrouter"]["url"]
 
 _log_fh = None
 
@@ -1860,18 +1908,23 @@ _models_cache = []
 _models_cache_time = 0
 
 
-def fetch_models(api_key, max_age=3600):
+def _provider_url(cfg):
+    provider = cfg.get("provider", "openrouter")
+    info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+    return info["url"]
+
+
+def fetch_models(api_key, max_age=3600, provider="openrouter"):
     global _models_cache, _models_cache_time
     now = time.time()
     if _models_cache and now - _models_cache_time < max_age:
         return _models_cache
     try:
+        info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        resp = requests.get(
-             PROVIDER_URL + "/models", timeout=10, headers=headers
-        )
+        resp = requests.get(info["url"] + "/models", timeout=10, headers=headers)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             _models_cache = data
@@ -1882,8 +1935,8 @@ def fetch_models(api_key, max_age=3600):
     return _models_cache or []
 
 
-def get_model_context(model_id, api_key):
-    for m in fetch_models(api_key):
+def get_model_context(model_id, api_key, provider="openrouter"):
+    for m in fetch_models(api_key, provider=provider):
         if m.get("id") == model_id:
             ctx = m.get("context_length")
             if ctx:
@@ -1894,6 +1947,7 @@ def get_model_context(model_id, api_key):
 def default_cfg():
     return {
         "api_key": "",
+        "provider": "openrouter",
         "model": "deepseek/deepseek-v4-flash",
         "temperature": 0.7,
         "system_prompt": "",  # empty = load from system_prompt.txt
@@ -1928,15 +1982,18 @@ def save_cfg(cfg):
 
 
 def resolve_key(cfg):
-    key = cfg.get("api_key") or os.environ.get("OPENROUTER_API_KEY")
+    provider = cfg.get("provider", "openrouter")
+    info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+    env_key = info["env_key"]
+    key = cfg.get("api_key") or os.environ.get(env_key)
     if key:
         if not cfg.get("api_key"):
             cfg["api_key"] = key
             save_cfg(cfg)
         return key
-    print(f"{C.YELLOW}No API key configured.{C.RESET}")
-    print(f"Get one at: {C.CYAN}https://openrouter.ai/keys{C.RESET}")
-    key = input(f"{C.GREEN}Enter API key (sk-or-v1-...): {C.RESET}").strip()
+    print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
+    print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
+    key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
     if not key:
         print(f"{C.RED}No key provided.{C.RESET}")
         sys.exit(1)
@@ -1995,6 +2052,7 @@ def _compute_max_history_chars(cfg):
 
 
 def chat_completion(messages, cfg, stream=True, tools=None):
+    base_url = _provider_url(cfg)
     headers = {
         "Authorization": f"Bearer {cfg['api_key']}",
         "Content-Type": "application/json",
@@ -2012,7 +2070,11 @@ def chat_completion(messages, cfg, stream=True, tools=None):
         payload["tools"] = tools
     try:
         resp = requests.post(
-            PROVIDER_URL + "/chat/completions", headers=headers, json=payload, stream=stream, timeout=120
+            base_url + "/chat/completions",
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=120,
         )
     except requests.exceptions.Timeout:
         return {
@@ -2300,8 +2362,14 @@ def show_banner(cfg):
         if ctx
         else ""
     )
-    print(f"\n{C.BOLD}{C.CYAN}  tbot{C.RESET}  {C.GRAY}— OpenRouter CLI{C.RESET}")
+    provider_name = PROVIDERS.get(cfg.get("provider", "openrouter"), {}).get(
+        "name", "OpenRouter"
+    )
+    print(f"\n{C.BOLD}{C.CYAN}  tbot{C.RESET}  {C.GRAY}— {provider_name} CLI{C.RESET}")
     print(f"  {C.GRAY}model:{C.RESET} {C.YELLOW}{cfg['model']}{C.RESET}{ctx_str}")
+    print(
+        f"  {C.GRAY}prov:{C.RESET}  {C.YELLOW}{cfg.get('provider', 'openrouter')}{C.RESET}"
+    )
     print(
         f"  {C.GRAY}temp:{C.RESET}  {C.YELLOW}{cfg['temperature']}{C.RESET}  "
         f"{tools_flag}  {trust_flag}"
@@ -2387,13 +2455,13 @@ def _read_esc(fd):
     return seq
 
 
-def model_selector(current_id, api_key):
+def model_selector(current_id, api_key, provider="openrouter"):
     import termios, tty
 
     _TBOT_PARAMS = {"temperature", "max_tokens", "tools"}
     models = [
         m
-        for m in fetch_models(api_key)
+        for m in fetch_models(api_key, provider=provider)
         if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))
     ]
     if not models:
@@ -2447,11 +2515,83 @@ def model_selector(current_id, api_key):
         sys.stdout.flush()
 
 
+def _render_provider_selector(providers, filtered, idx, current_id):
+    w = _term_width()
+    buf = [
+        f"{C.BOLD}{C.CYAN}provider{C.RESET}  {C.YELLOW}{current_id}{C.RESET}  {C.GRAY}({len(filtered)}/{len(providers)}){C.RESET}\r\n"
+    ]
+    buf.append(f"{C.GRAY}{'─' * (w - 2)}{C.RESET}\r\n")
+    if not filtered:
+        buf.append(f"{C.GRAY}no providers{C.RESET}\r\n")
+    else:
+        start = max(0, idx - 5)
+        end = min(len(filtered), start + 12)
+        for i in range(start, end):
+            k = filtered[i]
+            info = providers[k]
+            pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+            name = info["name"]
+            env = info["env_key"]
+            has_env = (
+                C.GREEN + "✓" + C.RESET
+                if os.environ.get(env)
+                else C.GRAY + "✗" + C.RESET
+            )
+            buf.append(f"{pre}{k:<16} {name:<20} {has_env} {C.GRAY}{env}{C.RESET}\r\n")
+    buf.append(f"\r\n{C.GRAY}↑/↓ nav  ↵ select  Ctrl+C exit{C.RESET}")
+    return "".join(buf)
+
+
+def provider_selector(current_id):
+    import termios, tty
+
+    providers = {k: v for k, v in PROVIDERS.items()}
+    sorted_keys = sorted(providers.keys())
+    filtered = list(sorted_keys)
+    idx = 0
+    try:
+        idx = filtered.index(current_id)
+    except ValueError:
+        pass
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(
+                _render_provider_selector(providers, filtered, idx, current_id)
+            )
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                _read_esc(fd)
+            elif ch in ("\r", "\n"):
+                return filtered[idx] if filtered else None
+            elif ch == "\x03":
+                return None
+            elif ch == "\x0e":  # Ctrl+N — down
+                idx = min(len(filtered) - 1, idx + 1)
+            elif ch == "\x10":  # Ctrl+P — up
+                idx = max(0, idx - 1)
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
 def print_help():
     print(f"{C.CYAN}Commands:{C.RESET}")
     print(f"  /help              This help")
     print(f"  /new               Reset conversation")
     print(f"  /model [name]      Show or switch model")
+    print(f"  /provider [name]   Show or switch provider")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
     print(f"  /edit  [text]      Multi-line editor (or Ctrl+E / /edit)")
@@ -2634,7 +2774,9 @@ def main():
     atexit.register(save_history)
     if readline is not None:
         readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
-    ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+    ctx = get_model_context(
+        cfg["model"], cfg.get("api_key", ""), cfg.get("provider", "openrouter")
+    )
     if ctx:
         cfg["_context_length"] = ctx
     messages = _init_messages(cfg)
@@ -2685,7 +2827,11 @@ def main():
                     cfg["model"] = arg
                     cfg.pop("_context_length", None)
                     save_cfg(cfg)
-                    ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+                    ctx = get_model_context(
+                        cfg["model"],
+                        cfg.get("api_key", ""),
+                        cfg.get("provider", "openrouter"),
+                    )
                     if ctx:
                         cfg["_context_length"] = ctx
                         print(
@@ -2696,12 +2842,20 @@ def main():
                             f"{C.GREEN}model → {cfg['model']} (context unknown){C.RESET}"
                         )
                 else:
-                    selected = model_selector(cfg["model"], cfg.get("api_key", ""))
+                    selected = model_selector(
+                        cfg["model"],
+                        cfg.get("api_key", ""),
+                        cfg.get("provider", "openrouter"),
+                    )
                     if selected and selected != cfg["model"]:
                         cfg["model"] = selected
                         cfg.pop("_context_length", None)
                         save_cfg(cfg)
-                        ctx = get_model_context(cfg["model"], cfg.get("api_key", ""))
+                        ctx = get_model_context(
+                            cfg["model"],
+                            cfg.get("api_key", ""),
+                            cfg.get("provider", "openrouter"),
+                        )
                         if ctx:
                             cfg["_context_length"] = ctx
                             print(
@@ -2710,6 +2864,49 @@ def main():
                         else:
                             print(f"{C.GREEN}model → {cfg['model']}{C.RESET}")
                     elif selected == cfg["model"]:
+                        pass
+                    else:
+                        print(f"{C.YELLOW}cancelled{C.RESET}")
+            elif cmd == "provider":
+                if arg:
+                    prov = arg.lower().strip()
+                    if prov in PROVIDERS:
+                        old_prov = cfg.get("provider", "openrouter")
+                        cfg["provider"] = prov
+                        cfg.pop("_context_length", None)
+                        cfg["api_key"] = ""
+                        save_cfg(cfg)
+                        cfg["api_key"] = resolve_key(cfg)
+                        save_cfg(cfg)
+                        global _models_cache
+                        _models_cache = []
+                        info = PROVIDERS[prov]
+                        print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
+                        if prov != old_prov:
+                            print(f"{C.YELLOW}model reset to default{C.RESET}")
+                            cfg["model"] = default_cfg()["model"]
+                            save_cfg(cfg)
+                    else:
+                        names = ", ".join(PROVIDERS.keys())
+                        print(f"{C.RED}unknown provider. Available: {names}{C.RESET}")
+                else:
+                    selected = provider_selector(cfg.get("provider", "openrouter"))
+                    if selected and selected != cfg.get("provider"):
+                        old_prov = cfg.get("provider", "openrouter")
+                        cfg["provider"] = selected
+                        cfg.pop("_context_length", None)
+                        cfg["api_key"] = ""
+                        save_cfg(cfg)
+                        cfg["api_key"] = resolve_key(cfg)
+                        save_cfg(cfg)
+                        _models_cache = []
+                        info = PROVIDERS[selected]
+                        print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
+                        if selected != old_prov:
+                            print(f"{C.YELLOW}model reset to default{C.RESET}")
+                            cfg["model"] = default_cfg()["model"]
+                            save_cfg(cfg)
+                    elif selected == cfg.get("provider"):
                         pass
                     else:
                         print(f"{C.YELLOW}cancelled{C.RESET}")
