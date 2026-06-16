@@ -1566,6 +1566,124 @@ def clear_skill_cache():
     _skill_cache = None
 
 
+SKILL_GUIDE_SKILL = r"""---
+name: "skill-guide"
+description: "Reference guide for creating new tbot skills. Load this when you need to create a new skill or modify an existing one."
+schema:
+  type: object
+  properties:
+    input:
+      type: string
+      description: "Topic to focus on (frontmatter, schema, dependencies, or leave empty for full guide)"
+  required: []
+---
+
+# Skill: skill-guide
+
+## Overview
+
+A tbot skill is a directory under `~/.config/tbot/skills/<name>/` containing a `SKILL.md` file with YAML frontmatter.
+Skills are loaded on-demand via the `skill` tool — the model calls `skill_<name>()` to inject instructions into context.
+
+---
+
+## Frontmatter
+
+Every `SKILL.md` must start with YAML frontmatter between `---` delimiters:
+
+```yaml
+---
+name: "skill-name"
+description: "Clear description of when to use this skill"
+schema:
+  type: object
+  properties:
+    input:
+      type: string
+      description: "Input description"
+  required: [input]
+---
+```
+
+### Fields
+
+| Field        | Required | Description                                      |
+|-------------|----------|--------------------------------------------------|
+| `name`       | yes      | Lowercase, alphanumeric with hyphens. Must match the directory name. |
+| `description`| yes      | 1-2 sentence description of when the model should use this skill. |
+| `schema`     | no       | JSON Schema for the skill tool's parameters. Omit for simple lookup-only skills. |
+
+---
+
+## Body
+
+After frontmatter, write markdown instructions. This is what gets injected into the model's context when `skill_<name>()` is called.
+
+### Structure
+
+- Start with `# Skill: <name>`
+- Use `## Overview` to describe what the skill does
+- Use `## Dependencies` to list other skills or packages required
+- Use `## Steps` or `## Instructions` for actionable steps
+- Reference scripts and file paths using absolute paths
+
+### Example
+
+```markdown
+# Skill: my-skill
+
+## Overview
+Does X, Y, and Z using the existing tools at `/path/to/tools`.
+
+## Dependencies
+This skill depends on `other-skill` — load it with `skill_other-skill()` first.
+
+## Steps
+1. Load dependencies with `skill_other-skill()`
+2. Read the configuration from `/path/to/config`
+3. Run the generator script
+4. Output the result
+```
+
+---
+
+## Dependencies
+
+List other skills or external tools in a `## Dependencies` section:
+
+```markdown
+## Dependencies
+
+- `pip install requests` — installs a Python package
+- `npm install axios` — installs a Node.js package
+- `other-skill` — another skill that must be loaded first
+- `git` (must be available on PATH)
+```
+
+tbot auto-installs `pip install` and `npm install` dependencies when the skill is installed from a URL or git repo.
+
+---
+
+## Best Practices
+
+1. **Single responsibility** — each skill does one thing well
+2. **Black-box dependencies** — invoke other skills via their CLI or tool, never copy their internal logic
+3. **Idempotent** — running the same skill twice produces the same result
+4. **Self-contained** — avoid relying on mutable global state
+5. **Descriptive name** — the model chooses skills by name + description, so be specific
+6. **No code duplication** — use `execFileSync` / `subprocess` to call other skills' CLIs instead of reimplementing their logic"""
+
+
+def _init_default_skills():
+    """Create default skills on first run."""
+    ensure_skills_dir()
+    skill_dir = SKILLS_DIR / "skill-guide"
+    if not skill_dir.exists():
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(SKILL_GUIDE_SKILL, encoding="utf-8")
+        clear_skill_cache()
+
+
 def _install_from_skill_url(skill_url):
     """Install a skill from a direct URL to SKILL.md."""
     ensure_skills_dir()
@@ -2793,6 +2911,7 @@ def _init_messages(cfg):
 
 def main():
     cfg = load_cfg()
+    _init_default_skills()
     cfg["api_key"] = resolve_key(cfg)
 
     parser = argparse.ArgumentParser(
