@@ -1568,7 +1568,7 @@ def clear_skill_cache():
 
 SKILL_GUIDE_SKILL = r"""---
 name: "skill-guide"
-description: "Reference guide for creating new tbot skills. Load this when you need to create a new skill or modify an existing one."
+description: "Reference guide for creating, modifying, updating, or fixing tbot skills (SKILL.md files). Load this when you need to create, edit, update, or fix a SKILL.md."
 schema:
   type: object
   properties:
