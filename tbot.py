@@ -4146,6 +4146,22 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 _last_cost = _cost
             _acc_cost += _cost
             if tool_calls:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+                messages.append(assistant_msg)
                 if content:
                     tool_only_rounds = 0
                     print()
