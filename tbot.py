@@ -3126,7 +3126,6 @@ def setup_history():
         pass
     readline.set_history_length(1000)
     try:
-        readline.parse_and_bind("bind ^I rl_complete")
         readline.parse_and_bind("tab: complete")
         readline.set_completer(_completer)
         readline.parse_and_bind('"\\C-e": "/edit\\C-j"')
