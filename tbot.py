@@ -104,7 +104,7 @@ PROVIDERS = {
     },
 }
 
-_provider_url = PROVIDERS["openrouter"]["url"]
+_DEFAULT_PROVIDER_URL = PROVIDERS["openrouter"]["url"]
 
 _log_fh = None
 _current_log_path = None
@@ -2469,6 +2469,8 @@ _models_cache_time = 0
 
 def _load_models_cache():
     global _models_cache, _models_cache_time
+    _models_cache = []
+    _models_cache_time = 0
     try:
         if MODELS_CACHE_FILE.exists():
             data = json.loads(MODELS_CACHE_FILE.read_text())
@@ -2476,6 +2478,8 @@ def _load_models_cache():
             _models_cache_time = data.get("time", 0)
     except Exception:
         MODELS_CACHE_FILE.unlink(missing_ok=True)
+        _models_cache = []
+        _models_cache_time = 0
 
 
 def _save_models_cache(models):
@@ -2608,17 +2612,20 @@ def save_cfg(cfg):
 def resolve_key(cfg):
     provider = cfg.get("provider", "openrouter")
     if provider == "custom":
-        key = cfg.get("api_key", "")
-        if key:
-            return key
-        print(f"{C.YELLOW}No API key configured for Custom API.{C.RESET}")
-        key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
+        key = cfg.get("api_key")
         if not key:
-            print(f"{C.RED}No key provided.{C.RESET}")
-            sys.exit(1)
-        cfg["api_key"] = key
-        save_cfg(cfg)
-        return key
+            print(f"{C.YELLOW}No API key configured for Custom API.{C.RESET}")
+            try:
+                key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                sys.exit(1)
+            if not key:
+                print(f"{C.RED}No key provided.{C.RESET}")
+                sys.exit(1)
+            cfg["api_key"] = key
+            save_cfg(cfg)
+        return key or ""
     info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
     env_key = info["env_key"]
     key = cfg.get("api_key") or os.environ.get(env_key)
@@ -2629,7 +2636,11 @@ def resolve_key(cfg):
         return key
     print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
     print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
-    key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
+    try:
+        key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(1)
     if not key:
         print(f"{C.RED}No key provided.{C.RESET}")
         sys.exit(1)
@@ -2683,10 +2694,36 @@ def _compute_max_history_chars(cfg):
     return cfg.get("max_history_chars", 200000)
 
 
+def _provider_name(cfg):
+    provider = cfg.get("provider", "openrouter")
+    if provider == "custom":
+        return "Custom API"
+    info = PROVIDERS.get(provider)
+    return info["name"] if info else provider
+
+
 def chat_completion(messages, cfg, stream=True, tools=None):
+    api_key = cfg.get("api_key")
+    if not api_key:
+        provider_name = _provider_name(cfg)
+        return {
+            "error": "no_api_key",
+            "title": "API key not configured",
+            "detail": f"No API key found for {provider_name}. Run `/provider` to configure it.",
+            "hint": f"Set the API key in the config or use the provider setup command.",
+        }
+
     base_url = _provider_url(cfg)
+    if not base_url:
+        return {
+            "error": "no_url",
+            "title": "Provider URL not configured",
+            "detail": "No base URL configured for this provider.",
+            "hint": "Run `/provider custom` to set up the URL and API key.",
+        }
+
     headers = {
-        "Authorization": f"Bearer {cfg['api_key']}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "HTTP-Referer": "https://github.com/user/tbot",
         "X-Title": "tbot",
@@ -2700,6 +2737,8 @@ def chat_completion(messages, cfg, stream=True, tools=None):
     }
     if tools:
         payload["tools"] = tools
+
+    provider_name = _provider_name(cfg)
     try:
         resp = requests.post(
             base_url + "/chat/completions",
@@ -2712,7 +2751,7 @@ def chat_completion(messages, cfg, stream=True, tools=None):
         return {
             "error": "timeout",
             "title": "Connection timed out",
-            "detail": "The request to OpenRouter took too long to respond.",
+            "detail": f"The request to {provider_name} took too long to respond.",
             "hint": "Check your internet connection or try again. If the problem persists, the service may be slow.",
         }
     except requests.exceptions.SSLError as e:
@@ -2725,8 +2764,8 @@ def chat_completion(messages, cfg, stream=True, tools=None):
     except requests.exceptions.ConnectionError:
         return {
             "error": "connection",
-            "title": "Could not connect to OpenRouter",
-            "detail": "No route to host. Your device may be offline or OpenRouter is blocked.",
+            "title": f"Could not connect to {provider_name}",
+            "detail": "No route to host. Your device may be offline or the service is blocked.",
             "hint": "Check your internet connection with: ping openrouter.ai\nIf on Termux, try: pkg install openssl && pkg reinstall python",
         }
     except requests.exceptions.ProxyError:
@@ -2751,11 +2790,15 @@ def chat_completion(messages, cfg, stream=True, tools=None):
             msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
         except Exception:
             msg = resp.text[:300]
+        if cfg.get("provider") == "custom":
+            hint = "Check your API key, custom URL, and model name. Ensure the endpoint supports OpenAI-compatible /chat/completions."
+        else:
+            hint = f"Check your API key, model name, and {provider_name} status."
         return {
             "error": f"http_{resp.status_code}",
             "title": f"HTTP {resp.status_code}",
             "detail": msg,
-            "hint": "The API returned an error. Check your API key, model name, and OpenRouter status at https://status.openrouter.ai",
+            "hint": hint,
         }
 
     return {"stream": resp}
