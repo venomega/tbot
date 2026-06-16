@@ -2006,7 +2006,6 @@ schema:
     input:
       type: string
       description: "Topic to focus on (frontmatter, schema, dependencies, or leave empty for full guide)"
-  required: []
 ---
 
 # Skill: skill-guide
@@ -2415,13 +2414,16 @@ def skills_to_tools(skills):
     tools = []
     for n, d, s, *_ in skills:
         desc = f"[ONE-TIME] Load instructions for '{n}' skill. Call ONCE, then follow the instructions — do NOT call again. {d}"
+        params = dict(s)
+        if "required" in params and not params["required"]:
+            del params["required"]
         tools.append(
             {
                 "type": "function",
                 "function": {
                     "name": f"skill_{n}",
                     "description": desc[:500],
-                    "parameters": s,
+                    "parameters": params,
                 },
             }
         )
