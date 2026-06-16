@@ -952,6 +952,26 @@ def _edit_snippet(filepath, new_text, idx, old_len, new_len, context=4):
     return f"{filepath}:{line_no}\n{snippet}"
 
 
+def _render_diff(old_text, new_text, context=3):
+    """Show a git-style colored diff between old and new text blocks."""
+    old_lines = old_text.split("\n")
+    new_lines = new_text.split("\n")
+    if old_lines == new_lines:
+        return ""
+    parts = []
+    show_old = old_lines and old_lines != [""]
+    show_new = new_lines and new_lines != [""]
+    if show_old:
+        for line in old_lines:
+            parts.append(f"{C.RED}- {line}{C.RESET}")
+    if show_old and show_new:
+        parts.append(f"{C.GRAY}───{C.RESET}")
+    if show_new:
+        for line in new_lines:
+            parts.append(f"{C.GREEN}+ {line}{C.RESET}")
+    return "\n".join(parts)
+
+
 def handle_edit(args):
     fp = _pick(args, "filePath", "file_path")
     if not fp:
@@ -985,6 +1005,10 @@ def handle_edit(args):
         p.write_text(new_text, encoding="utf-8")
         idx = new_text.find(new)
         snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
+        diff = _render_diff(old, new)
+        if diff:
+            for line in diff.split("\n"):
+                print(f"  {line}")
         return f"Replaced {count} occurrence(s) in {filepath}\n{snip}"
     idx = text.find(old)
     if idx == -1:
@@ -1029,6 +1053,10 @@ def handle_edit(args):
     new_text = text[:idx] + new + text[idx + len(old) :]
     p.write_text(new_text, encoding="utf-8")
     snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
+    diff = _render_diff(old, new)
+    if diff:
+        for line in diff.split("\n"):
+            print(f"  {line}")
     return f"Replaced 1 occurrence in {filepath}\n{snip}"
 
 
