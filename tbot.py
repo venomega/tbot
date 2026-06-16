@@ -2888,16 +2888,6 @@ MAX_TOOLS_PER_ROUND = 10
 
 def execute_tool_calls(tool_calls, messages, cfg):
     global _todo_has_write_since_last
-    if len(tool_calls) > MAX_TOOLS_PER_ROUND:
-        discarded = tool_calls[MAX_TOOLS_PER_ROUND:]
-        tool_calls = tool_calls[:MAX_TOOLS_PER_ROUND]
-        messages.append(
-            {
-                "role": "system",
-                "content": f"Solo se ejecutaron {MAX_TOOLS_PER_ROUND} de tus tool calls. "
-                f"Los otros {len(discarded)} fueron ignorados. Reduce tool calls paralelos.",
-            }
-        )
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -4190,6 +4180,9 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 messages.pop(i)
                 if i < len(messages) and messages[i]["role"] == "assistant":
                     messages.pop(i)
+                    # Also remove tool messages that belong to this assistant
+                    while i < len(messages) and messages[i]["role"] == "tool":
+                        messages.pop(i)
                 break
     tools = None
     if cfg["tools_enabled"]:
@@ -4263,22 +4256,6 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 _last_cost = _cost
             _acc_cost += _cost
             if tool_calls:
-                assistant_msg = {
-                    "role": "assistant",
-                    "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
-                }
-                messages.append(assistant_msg)
                 if content:
                     tool_only_rounds = 0
                     print()
@@ -4296,13 +4273,46 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                             }
                         )
                         break
+                # Truncate tool_calls BEFORE building assistant_msg so all tool_calls
+                # in the message have corresponding tool responses
+                if len(tool_calls) > MAX_TOOLS_PER_ROUND:
+                    discarded = tool_calls[MAX_TOOLS_PER_ROUND:]
+                    tool_calls = tool_calls[:MAX_TOOLS_PER_ROUND]
+                    messages.append(
+                        {
+                            "role": "system",
+                            "content": f"Solo se ejecutaron {MAX_TOOLS_PER_ROUND} de tus tool calls. "
+                            f"Los otros {len(discarded)} fueron ignorados. Reduce tool calls paralelos.",
+                        }
+                    )
                 doom_warning = _check_doom_loop(tool_calls)
                 if doom_warning:
                     print(f"\n  {C.YELLOW}{doom_warning[:100]}{C.RESET}")
                     messages.append({"role": "system", "content": doom_warning})
                     continue
+                # Build assistant message now (after doom check to avoid orphaned tool_calls)
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["function"]["name"],
+                                "arguments": tc["function"]["arguments"],
+                            },
+                        }
+                        for tc in tool_calls
+                    ],
+                }
+                messages.append(assistant_msg)
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
+                    # Clean up: remove the assistant_msg and any tool messages added this round
+                    for _ in range(len(tool_calls) + 1):
+                        if messages:
+                            messages.pop()
                     break
 
                 # --- stuck round detection (todowrite loops) ---
