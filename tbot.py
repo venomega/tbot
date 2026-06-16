@@ -3449,6 +3449,7 @@ def print_help():
     print(f"  /skills            List installed skills")
     print(f"  /skill add|rm|show  Manage skills")
     print(f"  /exit              Quit")
+    print(f"  !<command>         Run bash command and save to conversation")
     print()
     print(f"{C.CYAN}Tools ({len(TOOLS)}):{C.RESET}")
     for t in TOOLS:
@@ -4126,6 +4127,46 @@ Replace this with instructions for the model.
                     print(f"  /rag status          Show index stats")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
+            continue
+
+        # ── bash shortcut (!prefix) ──
+        if line.startswith("!"):
+            cmd = line[1:].strip()
+            if cmd:
+                print(f"  {C.GRAY}$ {cmd}{C.RESET}")
+                try:
+                    r = subprocess.run(
+                        cmd,
+                        shell=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        cwd=str(CURRENT_DIR),
+                    )
+                    out = r.stdout
+                    if r.stderr:
+                        out += "\n--- stderr ---\n" + r.stderr
+                    out += f"\n--- exit code: {r.returncode} ---"
+                except subprocess.TimeoutExpired:
+                    out = "Command timed out after 120s"
+                except Exception as e:
+                    out = f"Error: {e}"
+
+                preview = out[:500].replace("\n", "\\n")
+                print(
+                    f"  {C.GRAY}→ {preview}{'...' if len(out) > 500 else ''}{C.RESET}"
+                )
+
+                _log_write(f"$ {cmd}")
+                _log_write(out)
+
+                messages.append({"role": "user", "content": f"! {cmd}"})
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"```\n$ {cmd}\n{out}\n```",
+                    }
+                )
             continue
 
         # ── message ──
