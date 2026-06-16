@@ -184,6 +184,29 @@ def _content_str_len(content):
     return 0
 
 
+def _fzf_file_selector(initial_query=""):
+    """Use fzf to select files from the project. Returns comma-separated paths or None."""
+    if not shutil.which("fzf"):
+        return None
+    all_files = _collect_files()
+    if not all_files:
+        return None
+    fzf_input = "\n".join(f["path"] for f in all_files)
+    cmd = ["fzf", "--multi", "--height=~80%", "--layout=reverse"]
+    if initial_query:
+        cmd.extend(["--query", initial_query])
+    try:
+        r = subprocess.run(
+            cmd, input=fzf_input, capture_output=True, text=True, timeout=30
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            selected = [s.strip() for s in r.stdout.strip().split("\n") if s.strip()]
+            return ",".join(selected)
+    except subprocess.TimeoutExpired:
+        pass
+    return None
+
+
 def _collect_files():
     candidates = []
     for f in CURRENT_DIR.rglob("*"):
@@ -3554,7 +3577,10 @@ def _expand_file_markers(line):
     for m in _FILE_RE.finditer(line):
         parts.append(line[last_end : m.start()])
         filter_text = m.group(1)
-        path = file_selector(initial_query=filter_text)
+        if shutil.which("fzf"):
+            path = _fzf_file_selector(initial_query=filter_text)
+        else:
+            path = file_selector(initial_query=filter_text)
         if path:
             parts.append(path)
         else:
