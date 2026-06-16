@@ -1675,12 +1675,13 @@ tbot auto-installs `pip install` and `npm install` dependencies when the skill i
 
 
 def _init_default_skills():
-    """Create default skills on first run."""
+    """Create default skills on first run or if missing."""
     ensure_skills_dir()
     skill_dir = SKILLS_DIR / "skill-guide"
-    if not skill_dir.exists():
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.exists():
         skill_dir.mkdir(parents=True, exist_ok=True)
-        (skill_dir / "SKILL.md").write_text(SKILL_GUIDE_SKILL, encoding="utf-8")
+        skill_md.write_text(SKILL_GUIDE_SKILL, encoding="utf-8")
         clear_skill_cache()
 
 
