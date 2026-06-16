@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -128,6 +128,40 @@ def _check_gitignore(paths):
 
 
 _FILE_SKIP_DIRS = frozenset({".git", ".gitignore"})
+
+_IMAGE_EXTS = frozenset({".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"})
+
+_IMAGE_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
+}
+
+
+def _is_image(path):
+    return Path(path).suffix.lower() in _IMAGE_EXTS
+
+
+def _image_mime(path):
+    return _IMAGE_MIME.get(Path(path).suffix.lower(), "image/png")
+
+
+def _content_str_len(content):
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict):
+                total += len(part.get("text", ""))
+                url = part.get("image_url", {})
+                if isinstance(url, dict):
+                    total += len(url.get("url", ""))
+        return total
+    return 0
 
 
 def _collect_files():
@@ -264,13 +298,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "read",
-            "description": "Read a file or directory. Supports offset and limit for partial reads. Re-reading a file you already read this round is allowed (content will be refreshed).",
+            "description": "Read a file or directory. Supports offset and limit for partial reads. Also reads images (PNG, JPG, GIF, WebP, BMP) and returns them as data URIs so vision models can see them. Re-reading a file you already read this round is allowed (content will be refreshed).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "filePath": {
                         "type": "string",
-                        "description": "Path to the file or directory",
+                        "description": "Path to the file or directory. For images, the content is returned as a data URI and made visible to vision models.",
                     },
                     "offset": {
                         "type": "integer",
@@ -971,6 +1005,14 @@ def handle_read(args):
             result += f"\n({total} entries)"
         result += "\n</entries>"
         return result
+    if _is_image(p):
+        sz = p.stat().st_size
+        max_img = 20_000_000
+        if sz > max_img:
+            return f"Error: image too large ({sz} bytes, max {max_img})"
+        data = base64.b64encode(p.read_bytes()).decode("ascii")
+        mime = _image_mime(p)
+        return f"data:{mime};base64,{data}"
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
@@ -2560,11 +2602,7 @@ def _compute_max_tokens(cfg, messages=None):
     if not ctx:
         return 16384
     if messages:
-        input_chars = sum(
-            len(m.get("content", ""))
-            for m in messages
-            if isinstance(m.get("content"), str)
-        )
+        input_chars = sum(_content_str_len(m.get("content", "")) for m in messages)
         estimated_input = input_chars // 4 + 2048
         available = max(1024, ctx - estimated_input)
         return min(16384, available)
@@ -2865,6 +2903,20 @@ def execute_tool_calls(tool_calls, messages, cfg):
             _emit_edit_diff()
         _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+        if name == "read" and result.startswith("data:image/"):
+            fpath = args.get("filePath", "?")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": f"[read({fpath!r}) returned this image:]",
+                        },
+                        {"type": "image_url", "image_url": {"url": result}},
+                    ],
+                }
+            )
         if name not in _READ_ONLY_TOOLS and ok:
             _todo_has_write_since_last = True
     return True
@@ -3649,8 +3701,6 @@ def main():
         if not line:
             continue
 
-        _log_write(f">>> {line}")
-
         # ── commands ──
         if line.startswith("/"):
             parts = line[1:].strip().split(maxsplit=1)
@@ -3987,6 +4037,7 @@ Replace this with instructions for the model.
 
         # ── message ──
         line = _expand_file_markers(line)
+        _log_write(f">>> {line}")
         messages.append({"role": "user", "content": line})
         send_conversation(messages, cfg, pop_on_first_error=True)
 
@@ -3997,12 +4048,7 @@ MAX_TOOL_ONLY_ROUNDS = 6
 def send_conversation(messages, cfg, pop_on_first_error=False):
     max_chars = _compute_max_history_chars(cfg)
     while (
-        sum(
-            len(m.get("content", ""))
-            for m in messages
-            if isinstance(m.get("content"), str)
-        )
-        > max_chars
+        sum(_content_str_len(m.get("content", "")) for m in messages) > max_chars
         and sum(1 for m in messages if m["role"] not in ("system",)) > 1
     ):
         for i, m in enumerate(messages):
