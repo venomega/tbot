@@ -1689,12 +1689,14 @@ def _run_rag(args, timeout=30):
 
 def handle_rag_index(args):
     path = args.get("path", ".")
+    t0 = time.time()
     result = _run_rag(["index", path], timeout=120)
+    elapsed = time.time() - t0
     if "error" in result:
         return f"Error indexing: {result['error']}"
     chunks = result.get("chunks", "?")
     files = result.get("files", "?")
-    return f"Index built: {files} files, {chunks} chunks for {path}"
+    return f"Index built: {files} files, {chunks} chunks for {path} ({elapsed:.1f}s)"
 
 
 def handle_rag_search(args):
