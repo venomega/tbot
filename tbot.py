@@ -89,114 +89,50 @@ class C:
 
 # ── File picker ───────────────────────────────────────────────
 
-_FILE_SELECTOR_SKIP_DIRS = frozenset(
-    {
-        ".git",
-        "__pycache__",
-        "node_modules",
-        ".venv",
-        "venv",
-        "dist",
-        "build",
-        ".tox",
-        ".eggs",
-        "egg-info",
-        ".ruff_cache",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".gitlab",
-        ".github",
-        ".vscode",
-        ".idea",
-    }
-)
-
-_BINARY_EXTS = frozenset(
-    {
-        ".png",
-        ".jpg",
-        ".jpeg",
-        ".gif",
-        ".bmp",
-        ".ico",
-        ".webp",
-        ".woff",
-        ".woff2",
-        ".ttf",
-        ".eot",
-        ".otf",
-        ".pdf",
-        ".doc",
-        ".docx",
-        ".xls",
-        ".xlsx",
-        ".ppt",
-        ".pptx",
-        ".zip",
-        ".tar",
-        ".gz",
-        ".bz2",
-        ".xz",
-        ".7z",
-        ".rar",
-        ".zst",
-        ".pyc",
-        ".pyo",
-        ".pyd",
-        ".so",
-        ".dll",
-        ".dylib",
-        ".o",
-        ".a",
-        ".lib",
-        ".obj",
-        ".exe",
-        ".bin",
-        ".msi",
-        ".deb",
-        ".rpm",
-        ".apk",
-        ".dat",
-        ".db",
-        ".sqlite",
-        ".sqlite3",
-        ".class",
-        ".jar",
-        ".war",
-        ".iso",
-        ".img",
-        ".dmg",
-        ".mp3",
-        ".mp4",
-        ".avi",
-        ".mov",
-        ".mkv",
-        ".DS_Store",
-    }
-)
-
 _FILE_RE = re.compile(r"@@(\S*)")
 
 
+def _check_gitignore(paths):
+    ignored = set()
+    try:
+        input_data = "\n".join(str(p) for p in paths)
+        r = subprocess.run(
+            ["git", "check-ignore", "--stdin"],
+            input=input_data,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(CURRENT_DIR),
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            for line in r.stdout.strip().split("\n"):
+                ignored.add(line.strip())
+    except Exception:
+        pass
+    return ignored
+
+
+_FILE_SKIP_DIRS = frozenset({".git", ".gitignore"})
+
+
 def _collect_files():
-    files = []
+    candidates = []
     for f in CURRENT_DIR.rglob("*"):
-        if f.is_dir() and f.name in _FILE_SELECTOR_SKIP_DIRS:
-            continue
         if not f.is_file():
             continue
-        if any(
-            p.name in _FILE_SELECTOR_SKIP_DIRS
-            for p in f.relative_to(CURRENT_DIR).parents
-        ):
+        if any(p.name in _FILE_SKIP_DIRS for p in f.parents):
             continue
-        if f.suffix.lower() in _BINARY_EXTS:
-            continue
-        if f.stat().st_size > 1_000_000:
+        if f.stat().st_size > 3_000_000:
             continue
         try:
             rel = f.relative_to(CURRENT_DIR)
         except ValueError:
+            continue
+        candidates.append((f, rel))
+    ignored = _check_gitignore([rel for _, rel in candidates])
+    files = []
+    for f, rel in candidates:
+        if str(rel) in ignored:
             continue
         files.append({"path": str(rel), "size": f.stat().st_size})
     return sorted(files, key=lambda x: x["path"])
