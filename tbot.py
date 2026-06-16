@@ -3068,6 +3068,157 @@ def model_selector(current_id, api_key, provider="openrouter"):
         sys.stdout.flush()
 
 
+def session_selector():
+    import termios, tty
+
+    all_files = sorted(
+        [f for f in LOG_DIR.glob("*.log") if f.is_file()],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    )
+    if not all_files:
+        return None
+
+    result = _run_rag(["index", str(LOG_DIR)], timeout=30)
+    if isinstance(result, dict) and result.get("error"):
+        return None
+
+    query = ""
+    results = [
+        {"path": f.name, "full_path": str(f), "size": f.stat().st_size, "score": 0}
+        for f in all_files
+    ]
+    idx = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            w = _term_width()
+            sep = f"{C.GRAY}{'─' * (w - 2)}{C.RESET}"
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(
+                f"{C.BOLD}{C.CYAN}sessions{C.RESET}  {C.GRAY}({len(results)}/{len(all_files)}){C.RESET}\r\n"
+            )
+            sys.stdout.write(f"{C.CYAN}filter:{C.RESET} {query if query else ''}\r\n")
+            sys.stdout.write(f"{sep}\r\n")
+            if not results:
+                sys.stdout.write(f"{C.GRAY}no matches{C.RESET}\r\n")
+            else:
+                start = max(0, idx - 10)
+                end = min(len(results), start + 20)
+                for i in range(start, end):
+                    r = results[i]
+                    pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+                    name = r["path"]
+                    sz = r["size"]
+                    sz_str = (
+                        f"{sz}B"
+                        if sz < 1024
+                        else f"{sz / 1024:.0f}K"
+                        if sz < 1024 * 1024
+                        else f"{sz / 1024 / 1024:.1f}M"
+                    )
+                    score_str = (
+                        f"  score={C.YELLOW}{r['score']:.1f}{C.RESET}"
+                        if r.get("score", 0) > 0
+                        else ""
+                    )
+                    sys.stdout.write(
+                        f"{pre}{name}  {C.GRAY}{sz_str}{C.RESET}{score_str}\r\n"
+                    )
+            sys.stdout.write(
+                f"\r\n{C.GRAY}Ctrl+N/P nav  type filter  ↵ view  Ctrl+C exit{C.RESET}"
+            )
+            sys.stdout.flush()
+
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                _read_esc(fd)
+            elif ch in ("\r", "\n"):
+                if results and idx < len(results):
+                    return {
+                        "path": results[idx]["path"],
+                        "full_path": results[idx]["full_path"],
+                    }
+                return None
+            elif ch == "\x03":
+                return None
+            elif ch == "\x0e":
+                if results:
+                    idx = min(len(results) - 1, idx + 1)
+            elif ch == "\x10":
+                if results:
+                    idx = max(0, idx - 1)
+            elif ch in ("\x7f", "\b"):
+                query = query[:-1]
+                idx = 0
+            elif ch.isprintable():
+                query += ch
+                idx = 0
+
+            q = query.strip()
+            if q:
+                rag_out = _run_rag(["search", q, "100"], timeout=10)
+                file_scores = {}
+                if isinstance(rag_out, list):
+                    for r in rag_out:
+                        p = r.get("path", "")
+                        s = r.get("score", 0)
+                        if p:
+                            file_scores[p] = max(file_scores.get(p, 0), s)
+                elif isinstance(rag_out, dict) and "raw" in rag_out:
+                    try:
+                        data = json.loads(rag_out["raw"])
+                        if isinstance(data, list):
+                            for r in data:
+                                p = r.get("path", "")
+                                s = r.get("score", 0)
+                                if p:
+                                    file_scores[p] = max(file_scores.get(p, 0), s)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                if file_scores:
+                    scored = []
+                    for f in all_files:
+                        s = file_scores.get(f.name, 0)
+                        if s > 0:
+                            scored.append(
+                                {
+                                    "path": f.name,
+                                    "full_path": str(f),
+                                    "size": f.stat().st_size,
+                                    "score": s,
+                                }
+                            )
+                    scored.sort(key=lambda x: -x["score"])
+                    results = scored
+                else:
+                    results = []
+            else:
+                results = [
+                    {
+                        "path": f.name,
+                        "full_path": str(f),
+                        "size": f.stat().st_size,
+                        "score": 0,
+                    }
+                    for f in all_files
+                ]
+            if results and idx >= len(results):
+                idx = max(0, len(results) - 1)
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
 def _render_provider_selector(providers, filtered, idx, current_id):
     w = _term_width()
     buf = [
@@ -3149,6 +3300,7 @@ def print_help():
     print(f"  /help              This help")
     print(f"  /new               Reset conversation")
     print(f"  /model [name]      Show or switch model")
+    print(f"  /session           Search and load session logs")
     print(f"  /provider [name]   Show or switch provider")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
@@ -3567,6 +3719,21 @@ def main():
                         pass
                     else:
                         print(f"{C.YELLOW}cancelled{C.RESET}")
+            elif cmd == "session":
+                selected = session_selector()
+                if selected:
+                    try:
+                        text = Path(selected["full_path"]).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    except Exception as e:
+                        print(f"{C.RED}cannot read log: {e}{C.RESET}")
+                        continue
+                    print(
+                        f"\n{C.CYAN}── {selected['path']} ({len(text)} chars) ──{C.RESET}"
+                    )
+                    print(text.rstrip())
+                    messages.append({"role": "user", "content": text.rstrip()})
             elif cmd == "provider":
                 if arg:
                     prov = arg.lower().strip()
