@@ -2747,14 +2747,14 @@ def chat_completion(messages, cfg, stream=True, tools=None):
             headers=headers,
             json=payload,
             stream=stream,
-            timeout=120,
+            timeout=10,
         )
     except requests.exceptions.Timeout:
         return {
             "error": "timeout",
             "title": "Connection timed out",
-            "detail": f"The request to {provider_name} took too long to respond.",
-            "hint": "Check your internet connection or try again. If the problem persists, the service may be slow.",
+            "detail": f"The request to {provider_name} timed out after 10s.",
+            "hint": "Check your internet connection. The client will retry automatically.",
         }
     except requests.exceptions.SSLError as e:
         return {
@@ -4125,7 +4125,7 @@ def main():
                         if messages[i]["role"] == "user":
                             last_user = i
                             break
-                    initial = messages[last_user]["content"] if last_user != -1 else ""
+                    initial = ""
                     print(f"{C.YELLOW}opening editor...{C.RESET}")
                     content = open_editor(initial)
                     if content:
