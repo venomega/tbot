@@ -1640,11 +1640,13 @@ def _rag_binary():
     global RAG_BIN
     if RAG_BIN is not None:
         return RAG_BIN
-    script_dir = Path(__file__).parent.resolve()
+    script_dir = Path(os.path.dirname(os.path.realpath(__file__)))
+    cwd = Path.cwd()
     candidates = [
         script_dir / "rag" / "rag_bin",
         script_dir / "rag_bin",
-        Path.cwd() / "rag" / "rag_bin",
+        cwd / "rag" / "rag_bin",
+        cwd / "rag_bin",
     ]
     for c in candidates:
         if c.exists() and os.access(str(c), os.X_OK):
@@ -1672,7 +1674,7 @@ def _run_rag(args, timeout=30):
         if r.returncode != 0:
             return {"error": r.stderr.strip() or f"exit {r.returncode}"}
         if not r.stdout:
-            return {"error": "no output from rag binary"}
+            return {"ok": True}
         try:
             return json.loads(r.stdout)
         except json.JSONDecodeError:
@@ -1690,7 +1692,9 @@ def handle_rag_index(args):
     result = _run_rag(["index", path], timeout=120)
     if "error" in result:
         return f"Error indexing: {result['error']}"
-    return f"Index built successfully for {path}"
+    chunks = result.get("chunks", "?")
+    files = result.get("files", "?")
+    return f"Index built: {files} files, {chunks} chunks for {path}"
 
 
 def handle_rag_search(args):
@@ -1734,48 +1738,24 @@ def handle_rag_status(_args):
     if "error" in result:
         return f"Index: missing ({result['error']})"
     if isinstance(result, dict):
-        if result.get("exists"):
+        if not result.get("exists"):
+            return "RAG index: not built yet. Use rag_index tool to build it."
+        root = result.get("root_path", "")
+        if root and str(_resolve_path(root)) != str(CURRENT_DIR):
             return (
-                f"RAG index: ready\n"
-                f"  Chunks: {result.get('chunks', 0)}\n"
-                f"  Files:  {result.get('files', 0)}\n"
-                f"  Terms:  {result.get('total_terms', 0)}"
+                f"RAG index exists but is for a different project:\n"
+                f"  Indexed: {root}\n"
+                f"  Current: {CURRENT_DIR}\n"
+                f"Use rag_index to build an index for this project."
             )
-        return "RAG index: not built yet. Use rag_index tool to build it."
+        return (
+            f"RAG index: ready\n"
+            f"  Path:   {root}\n"
+            f"  Chunks: {result.get('chunks', 0)}\n"
+            f"  Files:  {result.get('files', 0)}\n"
+            f"  Terms:  {result.get('total_terms', 0)}"
+        )
     return f"RAG status: {result}"
-
-
-def _inject_rag_context(messages, cfg, max_chunks=5):
-    """Search RAG index for the last user message and inject results into system prompt."""
-    if not _rag_binary():
-        return
-    if not messages:
-        return
-    last_user = None
-    for m in reversed(messages):
-        if m.get("role") == "user" and isinstance(m.get("content"), str):
-            last_user = m["content"]
-            break
-    if not last_user or len(last_user) < 10:
-        return
-    result = _run_rag(["search", last_user, str(max_chunks)])
-    if isinstance(result, list) and result:
-        context = "## Codebase context (RAG)\n\n"
-        for r in result:
-            path = r.get("path", "?")
-            ctype = r.get("type", "?")
-            name = r.get("name", "")
-            score = r.get("score", 0)
-            text = r.get("text", "")[:500]
-            context += f'<doc path="{path}" type="{ctype}" name="{name}" score="{score:.1f}">\n'
-            context += text + "\n</doc>\n\n"
-        # Inject into system message or create one
-        for m in messages:
-            if m.get("role") == "system":
-                if context not in m.get("content", ""):
-                    m["content"] = context + "\n" + m["content"]
-                return
-        messages.insert(0, {"role": "system", "content": context})
 
 
 TOOL_HANDLERS = {
@@ -3360,7 +3340,8 @@ IMPORTANT: You must NEVER generate or guess URLs for the user unless you are con
 - DO NOT ADD COMMENTS to code unless asked.
 
 # Tools
-Available: read, write, edit, glob, grep, bash, question, todowrite, websearch, webfetch, skill.
+Available: {tools}
+- rag_index/rag_search/rag_status: codebase RAG (BM25). Index first, then search.
 - Do NOT call todowrite repeatedly. If blocked, use edit/write for TASK.md directly.
 - Re-reading a file is allowed — previous content is stale, re-read is fresh.
 - Parallelize independent tool calls in one response. Prefer grep/glob for search.
@@ -3413,12 +3394,14 @@ def load_system_prompt(cfg):
 def _env_vars():
     skills = load_skills()
     skills_list = ", ".join(n for n, *_ in skills) if skills else "none"
+    tool_names = [t["function"]["name"] for t in TOOLS]
     return {
         "date": time.strftime("%Y-%m-%d"),
         "cwd": str(Path.cwd()),
         "platform": platform.system().lower(),
         "skills_dir": str(SKILLS_DIR),
         "skills_list": skills_list,
+        "tools": ", ".join(tool_names),
     }
 
 
@@ -3868,16 +3851,11 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     stream_retries = 0
     tool_only_rounds = 0
     stuck_rounds = 0
-    _rag_injected = False
-
     while round_n < max_rounds:
         _clear_trails()
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
-                if not _rag_injected and _rag_binary():
-                    _inject_rag_context(messages, cfg)
-                    _rag_injected = True
                 result = chat_completion(messages, cfg, stream=True, tools=tools)
                 if "error" not in result:
                     break
