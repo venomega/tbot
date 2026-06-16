@@ -1704,32 +1704,36 @@ def handle_rag_search(args):
     if not query:
         return "Error: query is required"
     top_k = min(args.get("top_k", 5), 20)
+    t0 = time.time()
     result = _run_rag(["search", query, str(top_k)])
+    elapsed = time.time() - t0
     if "error" in result:
         return f"Search error: {result['error']}"
     if isinstance(result, list):
         if not result:
-            return "No results found."
+            return f"No results found. ({elapsed:.3f}s)"
         lines = []
         for r in result:
             lines.append(
                 f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
             )
-        return "\n".join(lines[:top_k])
+        out = "\n".join(lines[:top_k])
+        return f"{out}\n({elapsed:.3f}s)"
     if "raw" in result:
         raw = result["raw"]
         if raw == "[]":
-            return "No results found."
+            return f"No results found. ({elapsed:.3f}s)"
         try:
             data = json.loads(raw)
             if not data:
-                return "No results found."
+                return f"No results found. ({elapsed:.3f}s)"
             lines = []
             for r in data:
                 lines.append(
                     f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
                 )
-            return "\n".join(lines[:top_k])
+            out = "\n".join(lines[:top_k])
+            return f"{out}\n({elapsed:.3f}s)"
         except json.JSONDecodeError:
             return raw[:2000]
     return str(result)[:2000]
@@ -3396,7 +3400,9 @@ def load_system_prompt(cfg):
 def _env_vars():
     skills = load_skills()
     skills_list = ", ".join(n for n, *_ in skills) if skills else "none"
-    tool_names = [t["function"]["name"] for t in TOOLS]
+    tool_names = [
+        t["function"]["name"] for t in TOOLS if t["function"]["name"] != "invalid"
+    ]
     return {
         "date": time.strftime("%Y-%m-%d"),
         "cwd": str(Path.cwd()),
