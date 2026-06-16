@@ -11,6 +11,26 @@ try:
 except ImportError:
     readline = None
 
+_COMMANDS = [
+    "help",
+    "new",
+    "model",
+    "session",
+    "provider",
+    "temp",
+    "sys",
+    "edit",
+    "tools",
+    "trust",
+    "export",
+    "skills",
+    "skill",
+    "rag",
+    "exit",
+]
+_SKILL_SUBCMDS = ["add", "rm", "show", "install"]
+_RAG_SUBCMDS = ["index", "search", "status"]
+
 _total_tokens = 0
 _last_cost = 0
 _acc_cost = 0
@@ -2931,6 +2951,33 @@ def execute_tool_calls(tool_calls, messages, cfg):
 # ── UI ──────────────────────────────────────────────────────────
 
 
+def _completer(text, state):
+    line = readline.get_line_buffer()
+    parts = line.lstrip().split()
+    if not parts or not parts[0].startswith("/"):
+        return None
+    cmd = parts[0][1:]
+    if cmd == "skill" and len(parts) == 2:
+        matches = [s for s in _SKILL_SUBCMDS if s.startswith(parts[1])]
+        return (matches[state] + " ") if state < len(matches) else None
+    if cmd == "rag" and len(parts) == 2:
+        matches = [s for s in _RAG_SUBCMDS if s.startswith(parts[1])]
+        return (matches[state] + " ") if state < len(matches) else None
+    if cmd == "model" and len(parts) == 2:
+        q = parts[1].lower()
+        models = _models_cache or []
+        matches = sorted(
+            m.get("id", "") for m in models if q in m.get("id", "").lower()
+        )
+        if matches:
+            matches = [m + " " for m in matches]
+        return matches[state] if state < len(matches) else None
+    if cmd in _COMMANDS and text != cmd:
+        return None
+    matches = [c + " " for c in _COMMANDS if c.startswith(cmd)]
+    return matches[state] if state < len(matches) else None
+
+
 def setup_history():
     if readline is None:
         return
@@ -2941,6 +2988,9 @@ def setup_history():
         pass
     readline.set_history_length(1000)
     try:
+        readline.parse_and_bind("bind ^I rl_complete")
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer(_completer)
         readline.parse_and_bind('"\\C-e": "/edit\\C-j"')
     except Exception:
         pass
