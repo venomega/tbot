@@ -1741,6 +1741,23 @@ def _rag_binary():
     if which:
         RAG_BIN = which
         return RAG_BIN
+    # Try auto-compile from the rag/ folder next to tbot.py
+    rag_src = script_dir / "rag"
+    if rag_src.is_dir() and (rag_src / "go.mod").exists():
+        try:
+            result = subprocess.run(
+                ["go", "build", "-o", "rag_bin", "."],
+                cwd=str(rag_src),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode == 0:
+                RAG_BIN = str(rag_src / "rag_bin")
+                os.chmod(RAG_BIN, 0o755)
+                return RAG_BIN
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
     return None
 
 
