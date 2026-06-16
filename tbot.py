@@ -2471,18 +2471,24 @@ def _provider_url(cfg):
     return info.get("url", "")
 
 
-def fetch_models(api_key, max_age=3600, provider="openrouter"):
+def fetch_models(api_key, max_age=3600, provider="openrouter", custom_url=""):
     global _models_cache, _models_cache_time
     _load_models_cache()
     now = time.time()
     if _models_cache and now - _models_cache_time < max_age:
         return _models_cache
     try:
-        info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+        if provider == "custom":
+            base_url = custom_url
+        else:
+            info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
+            base_url = info.get("url", "")
+        if not base_url:
+            return _models_cache or []
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        resp = requests.get(info["url"] + "/models", timeout=10, headers=headers)
+        resp = requests.get(base_url + "/models", timeout=10, headers=headers)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             _save_models_cache(data)
@@ -2492,8 +2498,8 @@ def fetch_models(api_key, max_age=3600, provider="openrouter"):
     return _models_cache or []
 
 
-def get_model_context(model_id, api_key, provider="openrouter"):
-    for m in fetch_models(api_key, provider=provider):
+def get_model_context(model_id, api_key, provider="openrouter", custom_url=""):
+    for m in fetch_models(api_key, provider=provider, custom_url=custom_url):
         if m.get("id") == model_id:
             ctx = m.get("context_length")
             if ctx:
@@ -3060,15 +3066,20 @@ def _read_esc(fd):
     return seq
 
 
-def model_selector(current_id, api_key, provider="openrouter"):
+def model_selector(current_id, api_key, provider="openrouter", custom_url=""):
     import termios, tty
 
+    all_models = fetch_models(api_key, provider=provider, custom_url=custom_url)
     _TBOT_PARAMS = {"temperature", "max_tokens", "tools"}
-    models = [
-        m
-        for m in fetch_models(api_key, provider=provider)
-        if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))
-    ]
+    has_params = any("supported_parameters" in m for m in all_models)
+    if has_params:
+        models = [
+            m
+            for m in all_models
+            if _TBOT_PARAMS.issubset(m.get("supported_parameters", []))
+        ]
+    else:
+        models = list(all_models)
     if not models:
         return None
     filtered = list(models)
@@ -3677,7 +3688,10 @@ def main():
     if readline is not None:
         readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
     ctx = get_model_context(
-        cfg["model"], cfg.get("api_key", ""), cfg.get("provider", "openrouter")
+        cfg["model"],
+        cfg.get("api_key", ""),
+        cfg.get("provider", "openrouter"),
+        cfg.get("custom_url", ""),
     )
     if ctx:
         cfg["_context_length"] = ctx
@@ -3733,6 +3747,7 @@ def main():
                         cfg["model"],
                         cfg.get("api_key", ""),
                         cfg.get("provider", "openrouter"),
+                        cfg.get("custom_url", ""),
                     )
                     if ctx:
                         cfg["_context_length"] = ctx
@@ -3748,6 +3763,7 @@ def main():
                         cfg["model"],
                         cfg.get("api_key", ""),
                         cfg.get("provider", "openrouter"),
+                        cfg.get("custom_url", ""),
                     )
                     if selected and selected != cfg["model"]:
                         cfg["model"] = selected
@@ -3757,6 +3773,7 @@ def main():
                             cfg["model"],
                             cfg.get("api_key", ""),
                             cfg.get("provider", "openrouter"),
+                            cfg.get("custom_url", ""),
                         )
                         if ctx:
                             cfg["_context_length"] = ctx
