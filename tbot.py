@@ -1675,7 +1675,7 @@ tbot auto-installs `pip install` and `npm install` dependencies when the skill i
 
 
 def _init_default_skills():
-    """Create default skills on first run or if missing."""
+    """Create or sync default skills with the latest embedded content."""
     ensure_skills_dir()
     skill_dir = SKILLS_DIR / "skill-guide"
     skill_md = skill_dir / "SKILL.md"
@@ -1683,6 +1683,11 @@ def _init_default_skills():
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_md.write_text(SKILL_GUIDE_SKILL, encoding="utf-8")
         clear_skill_cache()
+    else:
+        current = skill_md.read_text(encoding="utf-8")
+        if current != SKILL_GUIDE_SKILL:
+            skill_md.write_text(SKILL_GUIDE_SKILL, encoding="utf-8")
+            clear_skill_cache()
 
 
 def _install_from_skill_url(skill_url):
@@ -2859,7 +2864,9 @@ Working directory: {cwd}
 Platform: {platform}
 Skills directory: {skills_dir}
 
-Use the `skill` tool to load instructions for a specific task. Available skills: {skills_list}"""
+Use the `skill` tool to load instructions for a specific task. Available skills: {skills_list}
+
+Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices."""
 
 
 def load_system_prompt(cfg):
