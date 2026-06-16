@@ -972,6 +972,17 @@ def _render_diff(old_text, new_text, context=3):
     return "\n".join(parts)
 
 
+_last_edit_diff = None
+
+
+def _emit_edit_diff():
+    global _last_edit_diff
+    if _last_edit_diff:
+        for line in _last_edit_diff.split("\n"):
+            print(f"  {line}")
+        _last_edit_diff = None
+
+
 def handle_edit(args):
     fp = _pick(args, "filePath", "file_path")
     if not fp:
@@ -984,6 +995,7 @@ def handle_edit(args):
     if new is None:
         return "Error: newString (or new_string) is required"
     replace_all = args.get("replaceAll", args.get("replace_all", False))
+    global _last_edit_diff
     if old == new:
         return "No changes to apply: oldString and newString are identical."
     p = Path(filepath)
@@ -1006,9 +1018,7 @@ def handle_edit(args):
         idx = new_text.find(new)
         snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
         diff = _render_diff(old, new)
-        if diff:
-            for line in diff.split("\n"):
-                print(f"  {line}")
+        _last_edit_diff = diff
         return f"Replaced {count} occurrence(s) in {filepath}\n{snip}"
     idx = text.find(old)
     if idx == -1:
@@ -1054,9 +1064,7 @@ def handle_edit(args):
     p.write_text(new_text, encoding="utf-8")
     snip = _edit_snippet(filepath, new_text, idx, len(old), len(new))
     diff = _render_diff(old, new)
-    if diff:
-        for line in diff.split("\n"):
-            print(f"  {line}")
+    _last_edit_diff = diff
     return f"Replaced 1 occurrence in {filepath}\n{snip}"
 
 
@@ -2524,6 +2532,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
 
         preview = result[:500].replace("\n", "\\n")
         print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
+        if name == "edit":
+            _emit_edit_diff()
         _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         if name not in _READ_ONLY_TOOLS and ok:
