@@ -2257,7 +2257,12 @@ def parse_stream(resp):
                     content_parts.append(c)
                     token_count += 1
                     print(c, end="", flush=True)
-                    _log_write(c)
+                    if _log_fh is not None:
+                        try:
+                            _log_fh.write(c)
+                            _log_fh.flush()
+                        except Exception:
+                            pass
                 for tc in delta.get("tool_calls", []):
                     idx = tc.get("index", 0)
                     if idx not in tool_calls:
@@ -2279,6 +2284,13 @@ def parse_stream(resp):
                 pass
     except (socket.timeout, OSError):
         interrupted = True
+
+    if content_parts and _log_fh is not None and not interrupted:
+        try:
+            _log_fh.write("\n")
+            _log_fh.flush()
+        except Exception:
+            pass
 
     if not completion_tokens:
         completion_tokens = token_count
