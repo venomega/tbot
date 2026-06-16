@@ -2864,7 +2864,10 @@ Working directory: {cwd}
 Platform: {platform}
 Skills directory: {skills_dir}
 
-Use the `skill` tool to load instructions for a specific task. Available skills: {skills_list}
+Skills are loaded in two steps:
+  1. `skill(name)` — checks if a skill exists (returns the loader function name)
+  2. `skill_<name>()` — actually loads the skill's instructions into your context
+Call the `skill_<name>()` variant directly if you know the skill exists. Available skills: {skills_list}
 
 Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices."""
 
