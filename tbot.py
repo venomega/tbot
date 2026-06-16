@@ -2967,7 +2967,52 @@ def execute_tool_calls(tool_calls, messages, cfg):
 def _completer(text, state):
     line = readline.get_line_buffer()
     parts = line.lstrip().split()
-    if not parts or not parts[0].startswith("/"):
+    if not parts:
+        return None
+
+    # ── ! prefix: bash completion via compgen ──
+    if parts[0].startswith("!"):
+        try:
+            raw = line.lstrip()
+            cmd_token = parts[0]
+            past_cmd = bool(raw[len(cmd_token) :].strip()) or raw[
+                len(cmd_token) :
+            ].endswith(" ")
+            if not past_cmd:
+                prefix = parts[0][1:]
+                r = subprocess.run(
+                    ["bash", "-c", f"compgen -c '{prefix}'"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                matches = [c + " " for c in r.stdout.strip().split("\n") if c]
+            else:
+                prefix = parts[-1] if len(parts) > 1 else ""
+                slash_idx = prefix.rfind("/")
+                dir_part = prefix[: slash_idx + 1] if slash_idx >= 0 else ""
+                r = subprocess.run(
+                    ["bash", "-c", f"compgen -f -- '{prefix}'"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                matches = []
+                for c in r.stdout.strip().split("\n"):
+                    c = c.strip()
+                    if not c:
+                        continue
+                    basename = c[len(dir_part) :] if dir_part and c.startswith(dir_part) else c
+                    p = Path(c) if c.startswith("/") else Path(prefix).parent / c
+                    if p.exists() and p.is_dir():
+                        matches.append(basename + "/")
+                    else:
+                        matches.append(basename + " ")
+        except Exception:
+            matches = []
+        return matches[state] if state < len(matches) else None
+
+    if not parts[0].startswith("/"):
         return None
     cmd = parts[0][1:]
     if cmd == "skill" and len(parts) == 2:
