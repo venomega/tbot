@@ -12,6 +12,20 @@ except ImportError:
     readline = None
 
 _total_tokens = 0
+_last_cost = 0
+_acc_cost = 0
+
+
+def _format_cost(cost):
+    if not cost:
+        return ""
+    if cost < 0.001:
+        s = f"{cost:.6f}"
+    else:
+        s = f"{cost:.4f}"
+    s = s.rstrip("0").rstrip(".")
+    return f" ${s}"
+
 
 CONFIG_DIR = Path.home() / ".config" / "tbot"
 CONFIG_FILE = CONFIG_DIR / "config.json"
@@ -505,6 +519,54 @@ TOOLS = [
                     },
                 },
                 "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rag_index",
+            "description": "Build or rebuild the RAG index for a directory. Call this BEFORE rag_search if the index does not exist yet. The index is stored in ~/.config/tbot/rag_index/. Indexing is fast (<1s for most projects).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to index (default: current project directory, i.e. the directory you are working in)",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rag_search",
+            "description": "Search the codebase index using BM25 (keyword-based, no LLM). Returns relevant code/document chunks as JSON. Call rag_index first if the index doesn't exist.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (keywords, function names, concepts)",
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of results to return (default: 5, max: 20)",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "rag_status",
+            "description": "Show RAG index status (exists, chunk count, file count, term count). Use this to check if the index is ready before searching.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
             },
         },
     },
@@ -1568,6 +1630,154 @@ def handle_get_system_info(_args):
     )
 
 
+# ── RAG (Go binary) ───────────────────────────────────────────
+
+
+RAG_BIN = None
+
+
+def _rag_binary():
+    global RAG_BIN
+    if RAG_BIN is not None:
+        return RAG_BIN
+    script_dir = Path(__file__).parent.resolve()
+    candidates = [
+        script_dir / "rag" / "rag_bin",
+        script_dir / "rag_bin",
+        Path.cwd() / "rag" / "rag_bin",
+    ]
+    for c in candidates:
+        if c.exists() and os.access(str(c), os.X_OK):
+            RAG_BIN = str(c)
+            return RAG_BIN
+    which = shutil.which("rag_bin")
+    if which:
+        RAG_BIN = which
+        return RAG_BIN
+    return None
+
+
+def _run_rag(args, timeout=30):
+    binary = _rag_binary()
+    if not binary:
+        return {"error": "rag binary not found — run 'cd rag && go build -o rag_bin .'"}
+    try:
+        r = subprocess.run(
+            [binary] + args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=str(CURRENT_DIR),
+        )
+        if r.returncode != 0:
+            return {"error": r.stderr.strip() or f"exit {r.returncode}"}
+        if not r.stdout:
+            return {"error": "no output from rag binary"}
+        try:
+            return json.loads(r.stdout)
+        except json.JSONDecodeError:
+            return {"raw": r.stdout.strip(), "stderr": r.stderr.strip()}
+    except subprocess.TimeoutExpired:
+        return {"error": "rag command timed out"}
+    except FileNotFoundError:
+        return {"error": "rag binary not found"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def handle_rag_index(args):
+    path = args.get("path", ".")
+    result = _run_rag(["index", path], timeout=120)
+    if "error" in result:
+        return f"Error indexing: {result['error']}"
+    return f"Index built successfully for {path}"
+
+
+def handle_rag_search(args):
+    query = args.get("query", "")
+    if not query:
+        return "Error: query is required"
+    top_k = min(args.get("top_k", 5), 20)
+    result = _run_rag(["search", query, str(top_k)])
+    if "error" in result:
+        return f"Search error: {result['error']}"
+    if isinstance(result, list):
+        if not result:
+            return "No results found."
+        lines = []
+        for r in result:
+            lines.append(
+                f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
+            )
+        return "\n".join(lines[:top_k])
+    if "raw" in result:
+        raw = result["raw"]
+        if raw == "[]":
+            return "No results found."
+        try:
+            data = json.loads(raw)
+            if not data:
+                return "No results found."
+            lines = []
+            for r in data:
+                lines.append(
+                    f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
+                )
+            return "\n".join(lines[:top_k])
+        except json.JSONDecodeError:
+            return raw[:2000]
+    return str(result)[:2000]
+
+
+def handle_rag_status(_args):
+    result = _run_rag(["status"])
+    if "error" in result:
+        return f"Index: missing ({result['error']})"
+    if isinstance(result, dict):
+        if result.get("exists"):
+            return (
+                f"RAG index: ready\n"
+                f"  Chunks: {result.get('chunks', 0)}\n"
+                f"  Files:  {result.get('files', 0)}\n"
+                f"  Terms:  {result.get('total_terms', 0)}"
+            )
+        return "RAG index: not built yet. Use rag_index tool to build it."
+    return f"RAG status: {result}"
+
+
+def _inject_rag_context(messages, cfg, max_chunks=5):
+    """Search RAG index for the last user message and inject results into system prompt."""
+    if not _rag_binary():
+        return
+    if not messages:
+        return
+    last_user = None
+    for m in reversed(messages):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            last_user = m["content"]
+            break
+    if not last_user or len(last_user) < 10:
+        return
+    result = _run_rag(["search", last_user, str(max_chunks)])
+    if isinstance(result, list) and result:
+        context = "## Codebase context (RAG)\n\n"
+        for r in result:
+            path = r.get("path", "?")
+            ctype = r.get("type", "?")
+            name = r.get("name", "")
+            score = r.get("score", 0)
+            text = r.get("text", "")[:500]
+            context += f'<doc path="{path}" type="{ctype}" name="{name}" score="{score:.1f}">\n'
+            context += text + "\n</doc>\n\n"
+        # Inject into system message or create one
+        for m in messages:
+            if m.get("role") == "system":
+                if context not in m.get("content", ""):
+                    m["content"] = context + "\n" + m["content"]
+                return
+        messages.insert(0, {"role": "system", "content": context})
+
+
 TOOL_HANDLERS = {
     "invalid": handle_invalid,
     "question": handle_question,
@@ -1582,7 +1792,11 @@ TOOL_HANDLERS = {
     "todowrite": handle_todowrite,
     "websearch": handle_websearch,
     "skill": handle_skill,
+    "rag_index": handle_rag_index,
+    "rag_search": handle_rag_search,
+    "rag_status": handle_rag_status,
 }
+
 
 # ── Skills (SKILL.md v1 — directory format) ───────────────────
 
@@ -2160,8 +2374,33 @@ def skill_tool_handler(name, args, messages=None):
 
 # ── Model list cache ────────────────────────────────────────
 
+MODELS_CACHE_FILE = CONFIG_DIR / "models.json"
 _models_cache = []
 _models_cache_time = 0
+
+
+def _load_models_cache():
+    global _models_cache, _models_cache_time
+    try:
+        if MODELS_CACHE_FILE.exists():
+            data = json.loads(MODELS_CACHE_FILE.read_text())
+            _models_cache = data.get("models", [])
+            _models_cache_time = data.get("time", 0)
+    except Exception:
+        MODELS_CACHE_FILE.unlink(missing_ok=True)
+
+
+def _save_models_cache(models):
+    global _models_cache, _models_cache_time
+    _models_cache = models
+    _models_cache_time = time.time()
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        MODELS_CACHE_FILE.write_text(
+            json.dumps({"time": _models_cache_time, "models": models})
+        )
+    except Exception:
+        pass
 
 
 def _setup_custom_provider(cfg):
@@ -2188,8 +2427,7 @@ def _setup_custom_provider(cfg):
     cfg["api_key"] = key
     cfg.pop("_context_length", None)
     save_cfg(cfg)
-    global _models_cache
-    _models_cache = []
+    _save_models_cache([])
     print(f"{C.GREEN}provider → Custom API{C.RESET}")
     if old_prov != "custom":
         print(f"{C.YELLOW}model reset to default{C.RESET}")
@@ -2207,6 +2445,7 @@ def _provider_url(cfg):
 
 def fetch_models(api_key, max_age=3600, provider="openrouter"):
     global _models_cache, _models_cache_time
+    _load_models_cache()
     now = time.time()
     if _models_cache and now - _models_cache_time < max_age:
         return _models_cache
@@ -2218,8 +2457,7 @@ def fetch_models(api_key, max_age=3600, provider="openrouter"):
         resp = requests.get(info["url"] + "/models", timeout=10, headers=headers)
         if resp.status_code == 200:
             data = resp.json().get("data", [])
-            _models_cache = data
-            _models_cache_time = now
+            _save_models_cache(data)
             return data
     except Exception:
         pass
@@ -2449,6 +2687,7 @@ def parse_stream(resp):
     prompt_tokens = 0
     completion_tokens = 0
     total_tokens = 0
+    cost = 0
     interrupted = False
 
     sock = None
@@ -2461,7 +2700,7 @@ def parse_stream(resp):
     try:
         iterator = resp.iter_lines()
     except Exception:
-        return None, None, 0, 0, 0, True
+        return None, None, 0, 0, 0, 0, True
 
     received = False
     try:
@@ -2495,12 +2734,15 @@ def parse_stream(resp):
                     pt = usage.get("prompt_tokens", 0)
                     ct = usage.get("completion_tokens", 0)
                     tt = usage.get("total_tokens", 0)
+                    c = usage.get("cost", 0)
                     if pt:
                         prompt_tokens = pt
                     if ct:
                         completion_tokens = ct
                     if tt:
                         total_tokens = tt
+                    if c:
+                        cost = c
                 choices = data.get("choices", [])
                 if not choices:
                     continue
@@ -2554,7 +2796,15 @@ def parse_stream(resp):
             _log_write(
                 f"tool_call: {c['function']['name']}({c['function']['arguments'][:200]})"
             )
-    return content, calls, prompt_tokens, completion_tokens, total_tokens, interrupted
+    return (
+        content,
+        calls,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost,
+        interrupted,
+    )
 
 
 # ── Tool execution ──────────────────────────────────────────────
@@ -3271,8 +3521,10 @@ def main():
             elif cmd == "help":
                 print_help()
             elif cmd == "new":
-                global _total_tokens, _todo_blocked_count
+                global _total_tokens, _last_cost, _acc_cost, _todo_blocked_count
                 _total_tokens = 0
+                _last_cost = 0
+                _acc_cost = 0
                 _todo_blocked_count = 0
                 messages = _init_messages(cfg)
                 _doom_trail.clear()
@@ -3338,8 +3590,7 @@ def main():
                         save_cfg(cfg)
                         cfg["api_key"] = resolve_key(cfg)
                         save_cfg(cfg)
-                        global _models_cache
-                        _models_cache = []
+                        _save_models_cache([])
                         info = PROVIDERS[prov]
                         print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
                         if prov != old_prov:
@@ -3363,7 +3614,7 @@ def main():
                             save_cfg(cfg)
                             cfg["api_key"] = resolve_key(cfg)
                             save_cfg(cfg)
-                            _models_cache = []
+                            _save_models_cache([])
                             info = PROVIDERS[selected]
                             print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
                             if selected != old_prov:
@@ -3534,6 +3785,44 @@ Replace this with instructions for the model.
                     export_path.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(_current_log_path, export_path)
                     print(f"{C.GREEN}exported to {export_path}{C.RESET}")
+            elif cmd == "rag":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if sub_cmd == "index":
+                    print(f"{C.YELLOW}Indexing...{C.RESET}")
+                    result = _run_rag(["index", sub_arg or "."], timeout=120)
+                    if "error" in result:
+                        print(f"{C.RED}{result['error']}{C.RESET}")
+                    else:
+                        print(f"{C.GREEN}Index built{C.RESET}")
+                elif sub_cmd == "search":
+                    if not sub_arg:
+                        print(f"{C.RED}usage: /rag search <query>{C.RESET}")
+                    else:
+                        result = _run_rag(["search", sub_arg, "5"])
+                        if "error" in result:
+                            print(f"{C.RED}{result['error']}{C.RESET}")
+                        elif isinstance(result, list):
+                            for r in result:
+                                print(
+                                    f"  {C.CYAN}{r.get('path', '?')}:{r.get('start', '?')}{C.RESET} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
+                                )
+                        else:
+                            print(str(result)[:2000])
+                elif sub_cmd == "status":
+                    result = _run_rag(["status"])
+                    if isinstance(result, dict) and result.get("exists"):
+                        print(f"  Chunks: {result.get('chunks', 0)}")
+                        print(f"  Files:  {result.get('files', 0)}")
+                        print(f"  Terms:  {result.get('total_terms', 0)}")
+                    else:
+                        print(f"{C.YELLOW}No index{C.RESET}")
+                else:
+                    print(f"{C.YELLOW}usage:{C.RESET}")
+                    print(f"  /rag index [path]    Build RAG index")
+                    print(f"  /rag search <query>  Search codebase")
+                    print(f"  /rag status          Show index stats")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
@@ -3579,11 +3868,16 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
     stream_retries = 0
     tool_only_rounds = 0
     stuck_rounds = 0
+    _rag_injected = False
+
     while round_n < max_rounds:
         _clear_trails()
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
+                if not _rag_injected and _rag_binary():
+                    _inject_rag_context(messages, cfg)
+                    _rag_injected = True
                 result = chat_completion(messages, cfg, stream=True, tools=tools)
                 if "error" not in result:
                     break
@@ -3604,8 +3898,8 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 break
             if "error" in result:
                 break
-            global _total_tokens
-            content, tool_calls, pt, ct, _tot, interrupted = parse_stream(
+            global _total_tokens, _last_cost, _acc_cost
+            content, tool_calls, pt, ct, _tot, _cost, interrupted = parse_stream(
                 result["stream"]
             )
             result["stream"].close()
@@ -3632,6 +3926,9 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 stream_retries = 0
             if _tot:
                 _total_tokens = _tot
+            if _cost:
+                _last_cost = _cost
+            _acc_cost += _cost
             if tool_calls:
                 if content:
                     tool_only_rounds = 0
@@ -3688,7 +3985,8 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 tool_only_rounds = 0
                 print()
                 if _total_tokens:
-                    print(f"{C.GRAY}── {_total_tokens} tokens ──{C.RESET}")
+                    cost_str = _format_cost(_acc_cost) if _acc_cost else ""
+                    print(f"{C.GRAY}── {_total_tokens} tokens{cost_str} ──{C.RESET}")
                 messages.append({"role": "assistant", "content": content})
             break
         except KeyboardInterrupt:
