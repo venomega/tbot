@@ -65,6 +65,9 @@ PROVIDERS = {
         "url": "https://api.fireworks.ai/inference/v1",
         "env_key": "FIREWORKS_API_KEY",
     },
+    "custom": {
+        "name": "Custom API",
+    },
 }
 
 _provider_url = PROVIDERS["openrouter"]["url"]
@@ -1908,10 +1911,45 @@ _models_cache = []
 _models_cache_time = 0
 
 
+def _setup_custom_provider(cfg):
+    print(f"\n{C.CYAN}── Custom API Provider ──{C.RESET}")
+    print(
+        f"{C.GRAY}Enter the base URL for your API (e.g. https://api.example.com/v1){C.RESET}"
+    )
+    raw_url = input(f"{C.GREEN}base_url:{C.RESET} ").strip()
+    if not raw_url:
+        print(f"{C.RED}cancelled{C.RESET}")
+        return
+    raw_url = raw_url.rstrip("/")
+    if raw_url.endswith("/chat/completions"):
+        raw_url = raw_url[: -len("/chat/completions")]
+        print(f"{C.GRAY}  → stripped /chat/completions{C.RESET}")
+    print(f"{C.GRAY}  → {raw_url}{C.RESET}")
+    key = input(f"{C.GREEN}api_key:{C.RESET} ").strip()
+    if not key:
+        print(f"{C.RED}cancelled{C.RESET}")
+        return
+    old_prov = cfg.get("provider", "openrouter")
+    cfg["provider"] = "custom"
+    cfg["custom_url"] = raw_url
+    cfg["api_key"] = key
+    cfg.pop("_context_length", None)
+    save_cfg(cfg)
+    global _models_cache
+    _models_cache = []
+    print(f"{C.GREEN}provider → Custom API{C.RESET}")
+    if old_prov != "custom":
+        print(f"{C.YELLOW}model reset to default{C.RESET}")
+        cfg["model"] = default_cfg()["model"]
+        save_cfg(cfg)
+
+
 def _provider_url(cfg):
     provider = cfg.get("provider", "openrouter")
+    if provider == "custom":
+        return cfg.get("custom_url", "")
     info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
-    return info["url"]
+    return info.get("url", "")
 
 
 def fetch_models(api_key, max_age=3600, provider="openrouter"):
@@ -1983,6 +2021,18 @@ def save_cfg(cfg):
 
 def resolve_key(cfg):
     provider = cfg.get("provider", "openrouter")
+    if provider == "custom":
+        key = cfg.get("api_key", "")
+        if key:
+            return key
+        print(f"{C.YELLOW}No API key configured for Custom API.{C.RESET}")
+        key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
+        if not key:
+            print(f"{C.RED}No key provided.{C.RESET}")
+            sys.exit(1)
+        cfg["api_key"] = key
+        save_cfg(cfg)
+        return key
     info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
     env_key = info["env_key"]
     key = cfg.get("api_key") or os.environ.get(env_key)
@@ -2531,13 +2581,18 @@ def _render_provider_selector(providers, filtered, idx, current_id):
             info = providers[k]
             pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
             name = info["name"]
-            env = info["env_key"]
-            has_env = (
-                C.GREEN + "✓" + C.RESET
-                if os.environ.get(env)
-                else C.GRAY + "✗" + C.RESET
-            )
-            buf.append(f"{pre}{k:<16} {name:<20} {has_env} {C.GRAY}{env}{C.RESET}\r\n")
+            env = info.get("env_key", "")
+            if env:
+                has_env = (
+                    C.GREEN + "✓" + C.RESET
+                    if os.environ.get(env)
+                    else C.GRAY + "✗" + C.RESET
+                )
+                buf.append(
+                    f"{pre}{k:<16} {name:<20} {has_env} {C.GRAY}{env}{C.RESET}\r\n"
+                )
+            else:
+                buf.append(f"{pre}{k:<16} {name:<20}\r\n")
     buf.append(f"\r\n{C.GRAY}↑/↓ nav  ↵ select  Ctrl+C exit{C.RESET}")
     return "".join(buf)
 
@@ -2870,10 +2925,13 @@ def main():
             elif cmd == "provider":
                 if arg:
                     prov = arg.lower().strip()
-                    if prov in PROVIDERS:
+                    if prov == "custom":
+                        _setup_custom_provider(cfg)
+                    elif prov in PROVIDERS:
                         old_prov = cfg.get("provider", "openrouter")
                         cfg["provider"] = prov
                         cfg.pop("_context_length", None)
+                        cfg.pop("custom_url", None)
                         cfg["api_key"] = ""
                         save_cfg(cfg)
                         cfg["api_key"] = resolve_key(cfg)
@@ -2892,20 +2950,24 @@ def main():
                 else:
                     selected = provider_selector(cfg.get("provider", "openrouter"))
                     if selected and selected != cfg.get("provider"):
-                        old_prov = cfg.get("provider", "openrouter")
-                        cfg["provider"] = selected
-                        cfg.pop("_context_length", None)
-                        cfg["api_key"] = ""
-                        save_cfg(cfg)
-                        cfg["api_key"] = resolve_key(cfg)
-                        save_cfg(cfg)
-                        _models_cache = []
-                        info = PROVIDERS[selected]
-                        print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
-                        if selected != old_prov:
-                            print(f"{C.YELLOW}model reset to default{C.RESET}")
-                            cfg["model"] = default_cfg()["model"]
+                        if selected == "custom":
+                            _setup_custom_provider(cfg)
+                        else:
+                            old_prov = cfg.get("provider", "openrouter")
+                            cfg["provider"] = selected
+                            cfg.pop("_context_length", None)
+                            cfg.pop("custom_url", None)
+                            cfg["api_key"] = ""
                             save_cfg(cfg)
+                            cfg["api_key"] = resolve_key(cfg)
+                            save_cfg(cfg)
+                            _models_cache = []
+                            info = PROVIDERS[selected]
+                            print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
+                            if selected != old_prov:
+                                print(f"{C.YELLOW}model reset to default{C.RESET}")
+                                cfg["model"] = default_cfg()["model"]
+                                save_cfg(cfg)
                     elif selected == cfg.get("provider"):
                         pass
                     else:
