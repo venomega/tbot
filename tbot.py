@@ -15,6 +15,7 @@ _COMMANDS = [
     "help",
     "new",
     "model",
+    "preset",
     "session",
     "provider",
     "temp",
@@ -28,6 +29,7 @@ _COMMANDS = [
     "rag",
     "exit",
 ]
+_PRESET_SUBCMDS = ["save", "load", "rm", "ls", "show"]
 _SKILL_SUBCMDS = ["add", "rm", "show", "install"]
 _RAG_SUBCMDS = ["index", "search", "status"]
 
@@ -53,6 +55,7 @@ HISTORY_FILE = CONFIG_DIR / "history.txt"
 SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
 LOG_DIR = CONFIG_DIR / "log"
+PRESETS_DIR = CONFIG_DIR / "presets"
 PROVIDERS = {
     "openrouter": {
         "name": "OpenRouter",
@@ -3095,6 +3098,16 @@ def _completer(text, state):
     if not parts[0].startswith("/"):
         return None
     cmd = parts[0][1:]
+    if cmd == "preset" and len(parts) == 2:
+        matches = [s for s in _PRESET_SUBCMDS if s.startswith(parts[1])]
+        return (matches[state] + " ") if state < len(matches) else None
+    if cmd in ("preset", "skill") and len(parts) == 3 and parts[1] in ("load", "rm", "show"):
+        presets = list_presets()
+        prefix = parts[2]
+        matches = sorted(p["name"] for p in presets if p["name"].startswith(prefix))
+        if matches:
+            return (matches[state] + " ") if state < len(matches) else None
+        return None
     if cmd == "skill" and len(parts) == 2:
         matches = [s for s in _SKILL_SUBCMDS if s.startswith(parts[1])]
         return (matches[state] + " ") if state < len(matches) else None
@@ -3545,11 +3558,152 @@ def provider_selector(current_id):
         sys.stdout.flush()
 
 
+# ── Presets ──────────────────────────────────────────────
+
+
+def _presets_dir():
+    PRESETS_DIR.mkdir(parents=True, exist_ok=True)
+    return PRESETS_DIR
+
+
+def list_presets():
+    _presets_dir()
+    presets = []
+    for f in sorted(PRESETS_DIR.iterdir()):
+        if f.suffix == ".json" and f.is_file():
+            try:
+                data = json.loads(f.read_text())
+                presets.append({"name": f.stem, "path": f, "data": data})
+            except (json.JSONDecodeError, OSError):
+                pass
+    return presets
+
+
+def save_preset(name, cfg):
+    """Save full config dict as a preset (minus ephemeral fields)."""
+    _presets_dir()
+    data = {
+        k: v
+        for k, v in cfg.items()
+        if k not in ("_context_length",)
+    }
+    path = PRESETS_DIR / f"{name}.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    return path
+
+
+def load_preset_into_cfg(name, cfg):
+    """Load a preset into cfg dict in-place. Returns (True, msg) or (False, error)."""
+    presets = list_presets()
+    match = [p for p in presets if p["name"] == name]
+    if not match:
+        return False, f"preset '{name}' not found"
+    data = match[0]["data"]
+
+    old_provider = cfg.get("provider", "openrouter")
+    new_provider = data.get("provider", old_provider)
+
+    # Overwrite all stored keys (preserves ephemeral keys in cfg not in preset)
+    cfg.update(data)
+
+    # If provider changed, mirror housekeeping that /provider does
+    if new_provider != old_provider:
+        cfg.pop("_context_length", None)
+        if new_provider != "custom":
+            cfg.pop("custom_url", None)
+    save_cfg(cfg)
+
+    # Refresh context_length
+    ctx = get_model_context(
+        cfg["model"],
+        cfg.get("api_key", ""),
+        cfg.get("provider", "openrouter"),
+        cfg.get("custom_url", ""),
+    )
+    if ctx:
+        cfg["_context_length"] = ctx
+
+    return True, f"preset → {name}"
+
+
+def delete_preset(name):
+    path = PRESETS_DIR / f"{name}.json"
+    if not path.exists():
+        return False, f"preset '{name}' not found"
+    path.unlink()
+    return True, f"preset '{name}' removed"
+
+
+def _render_preset_selector(presets, idx):
+    w = _term_width()
+    buf = [
+        f"{C.BOLD}{C.CYAN}preset{C.RESET}  {C.GRAY}({len(presets)} presets){C.RESET}\r\n"
+    ]
+    buf.append(f"{C.GRAY}{'─' * (w - 2)}{C.RESET}\r\n")
+    if not presets:
+        buf.append(f"{C.GRAY}no presets — use /preset save <name>{C.RESET}\r\n")
+    else:
+        start = max(0, idx - 5)
+        end = min(len(presets), start + 12)
+        for i in range(start, end):
+            p = presets[i]
+            pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+            prov = p["data"].get("provider", "?")
+            model = p["data"].get("model", "?")
+            temp = p["data"].get("temperature", "?")
+            buf.append(
+                f"{pre}{p['name']:<20} {C.YELLOW}{prov:<12}{C.RESET} {C.GREEN}{model}{C.RESET}  {C.GRAY}temp={temp}{C.RESET}\r\n"
+            )
+    buf.append(f"\r\n{C.GRAY}↑/↓ nav  ↵ load  Ctrl+C exit{C.RESET}")
+    return "".join(buf)
+
+
+def preset_selector():
+    import termios, tty
+
+    presets = list_presets()
+    if not presets:
+        return None
+    idx = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(_render_preset_selector(presets, idx))
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                _read_esc(fd)
+            elif ch in ("\r", "\n"):
+                if presets and idx < len(presets):
+                    return presets[idx]["name"]
+                return None
+            elif ch == "\x03":
+                return None
+            elif ch == "\x0e":
+                idx = min(len(presets) - 1, idx + 1) if presets else 0
+            elif ch == "\x10":
+                idx = max(0, idx - 1)
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
 def print_help():
     print(f"{C.CYAN}Commands:{C.RESET}")
     print(f"  /help              This help")
     print(f"  /new               Reset conversation")
     print(f"  /model [name]      Show or switch model")
+    print(f"  /preset [sub]      Save/load/rm/ls/show presets (provider+model pairs)")
     print(f"  /session           Search and load session logs")
     print(f"  /provider [name]   Show or switch provider")
     print(f"  /temp [n]          Show or set temperature")
@@ -4028,6 +4182,97 @@ def main():
                     )
                     print(text.rstrip())
                     messages.append({"role": "user", "content": text.rstrip()})
+            elif cmd == "preset":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if not sub_cmd:
+                    presets = list_presets()
+                    if not presets:
+                        print(f"{C.YELLOW}no presets — use /preset save <name>{C.RESET}")
+                    else:
+                        name = preset_selector()
+                        if name:
+                            ok, msg = load_preset_into_cfg(name, cfg)
+                            if ok:
+                                _save_models_cache([])
+                                prov = PROVIDERS.get(cfg.get("provider", ""), {}).get(
+                                    "name", cfg.get("provider", "?")
+                                )
+                                print(
+                                    f"{C.GREEN}{msg} ({prov} / {cfg['model']}){C.RESET}"
+                                )
+                            else:
+                                print(f"{C.RED}{msg}{C.RESET}")
+                        else:
+                            print(f"{C.YELLOW}cancelled{C.RESET}")
+                elif sub_cmd == "save":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /preset save <name>{C.RESET}")
+                    else:
+                        path = save_preset(sub_arg, cfg)
+                        print(f"{C.GREEN}preset '{sub_arg}' saved{C.RESET}")
+                elif sub_cmd == "load":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /preset load <name>{C.RESET}")
+                    else:
+                        ok, msg = load_preset_into_cfg(sub_arg, cfg)
+                        if ok:
+                            _save_models_cache([])
+                            prov = PROVIDERS.get(cfg.get("provider", ""), {}).get(
+                                "name", cfg.get("provider", "?")
+                            )
+                            print(
+                                f"{C.GREEN}{msg} ({prov} / {cfg['model']}){C.RESET}"
+                            )
+                        else:
+                            print(f"{C.RED}{msg}{C.RESET}")
+                elif sub_cmd == "rm":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /preset rm <name>{C.RESET}")
+                    else:
+                        ok, msg = delete_preset(sub_arg)
+                        print(f"{C.GREEN if ok else C.RED}{msg}{C.RESET}")
+                elif sub_cmd == "ls":
+                    presets = list_presets()
+                    if not presets:
+                        print(f"{C.YELLOW}no presets{C.RESET}")
+                        print(f"{C.GRAY}create one: /preset save <name>{C.RESET}")
+                    else:
+                        print(f"{C.CYAN}presets ({len(presets)}):{C.RESET}")
+                        for p in presets:
+                            prov = p["data"].get("provider", "?")
+                            model = p["data"].get("model", "?")
+                            temp = p["data"].get("temperature", "?")
+                            print(
+                                f"  {C.GREEN}{p['name']:<20}{C.RESET}"
+                                f" {C.YELLOW}{prov:<12}{C.RESET}"
+                                f" {C.CYAN}{model}{C.RESET}"
+                                f"  {C.GRAY}temp={temp}{C.RESET}"
+                            )
+                elif sub_cmd == "show":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /preset show <name>{C.RESET}")
+                    else:
+                        presets = list_presets()
+                        match = [p for p in presets if p["name"] == sub_arg]
+                        if not match:
+                            print(f"{C.RED}preset '{sub_arg}' not found{C.RESET}")
+                        else:
+                            print(
+                                f"{C.CYAN}── {sub_arg} ──{C.RESET}"
+                            )
+                            print(
+                                json.dumps(match[0]["data"], indent=2, ensure_ascii=False)
+                            )
+                else:
+                    print(f"{C.YELLOW}usage:{C.RESET}")
+                    print(f"  /preset               Interactive selector")
+                    print(f"  /preset save <name>   Save current config as preset")
+                    print(f"  /preset load <name>   Load a preset")
+                    print(f"  /preset rm <name>     Delete a preset")
+                    print(f"  /preset ls            List presets")
+                    print(f"  /preset show <name>   Show preset details")
             elif cmd == "provider":
                 if arg:
                     prov = arg.lower().strip()
