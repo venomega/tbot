@@ -1497,6 +1497,40 @@ def handle_todowrite(args):
     return response
 
 
+def _display_task_md():
+    """Read TASK.md and print it with ANSI-colored markdown rendering."""
+    task_file = CURRENT_DIR / "TASK.md"
+    if not task_file.exists():
+        return
+    content = task_file.read_text(encoding="utf-8")
+    print(f"\n  {C.BOLD}{C.GREEN}═══ TASK.md ═══{C.RESET}")
+    for line in content.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            print()
+            continue
+        # Heading
+        if stripped.startswith("# ") or stripped.startswith("#"):
+            print(f"  {C.BOLD}{C.CYAN}{line}{C.RESET}")
+        # Checkbox items
+        elif stripped.startswith("- [") and "]" in stripped:
+            rest = stripped[6:] if len(stripped) > 6 else ""
+            if stripped.startswith("- [x]"):
+                print(f"  {C.GREEN}✔{C.RESET} {rest}")
+            elif stripped.startswith("- [~]") or stripped.startswith("- [-]"):
+                print(f"  {C.YELLOW}◷{C.RESET} {rest}")
+            elif stripped.startswith("- [ ]"):
+                print(f"  {C.GRAY}○{C.RESET} {rest}")
+            else:
+                print(f"  {line}")
+        # HTML comment
+        elif stripped.startswith("<!--"):
+            print(f"  {C.GRAY}{line}{C.RESET}")
+        else:
+            print(f"  {line}")
+    print()
+
+
 def _resolve_ddg_url(url):
     """Resolve DuckDuckGo redirect URLs to the actual target."""
     url = url.strip()
@@ -3311,6 +3345,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
         print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
         if name == "edit":
             _emit_edit_diff()
+        if name == "todowrite" and result != "TOOL_CALL_DECLINED":
+            _display_task_md()
         _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}")
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         if name == "read" and result.startswith("data:image/"):
