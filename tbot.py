@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -2819,6 +2819,131 @@ def _term_size():
         return None
 
 
+@functools.lru_cache(maxsize=1)
+def _supports_osc8():
+    """Detect if the terminal supports OSC 8 hyperlinks via env vars."""
+    term_prog = os.environ.get("TERM_PROGRAM", "")
+    term = os.environ.get("TERM", "")
+    # Known OSC-8-capable terminals
+    if term_prog in ("iTerm.app", "WezTerm", "vscode", "Ghostty", "tmux"):
+        return True
+    if term in ("xterm-kitty", "alacritty", "wezterm", "ghostty"):
+        return True
+    if os.environ.get("KITTY_WINDOW_ID"):  # Kitty
+        return True
+    if os.environ.get("WT_SESSION"):  # Windows Terminal
+        return True
+    if os.environ.get("VTE_VERSION"):  # GNOME Terminal, Konsole, etc.
+        return True
+    if os.environ.get("TERMINAL_EMULATOR") == "JetBrains-JediTerm":
+        return True
+    if os.environ.get("ALACRITTY_LOG"):
+        return True
+    # macOS Terminal.app and unknown terminals → assume no OSC 8
+    return False
+
+
+def _render_inline_fmt(text, base_ansi, reset):
+    """Apply ANSI formatting for inline markdown elements (bold, italic, code, links)."""
+    osc8 = _supports_osc8()
+    # Inline code: `code`
+    text = re.sub(r'`([^`]+)`', rf'\033[33m\1{reset}{base_ansi}', text)
+    # Bold: **text** or __text__
+    text = re.sub(r'\*\*(.+?)\*\*', rf'\033[1m\1{reset}{base_ansi}', text)
+    text = re.sub(r'__(.+?)__', rf'\033[1m\1{reset}{base_ansi}', text)
+    # Italic: *text* (single asterisk)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', rf'\033[3m\1{reset}{base_ansi}', text)
+    # Italic: _text_ (word boundaries)
+    text = re.sub(r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', rf'\033[3m\1{reset}{base_ansi}', text)
+    # Links: [text](url) — OSC 8 label + bare URL fallback only if terminal lacks OSC 8
+    if osc8:
+        text = re.sub(
+            r'\[([^\]]+)\]\(([^)]+)\)',
+            rf'\033]8;;\2\033\\\033[4;34m\1{reset}{base_ansi}\033]8;;\033\\',
+            text,
+        )
+    else:
+        text = re.sub(
+            r'\[([^\]]+)\]\(([^)]+)\)',
+            rf'\033]8;;\2\033\\\033[4;34m\1{reset}{base_ansi}\033]8;;\033\\ \033[90m\2{reset}{base_ansi}',
+            text,
+        )
+    # Strikethrough: ~~text~~
+    text = re.sub(r'~~(.+?)~~', rf'\033[9m\1{reset}{base_ansi}', text)
+    return text
+
+
+def _render_md_line(line, resp_color, in_code_block):
+    """Render a single markdown line with ANSI formatting.
+
+    Returns (rendered_string, updated_in_code_block).
+    """
+    base_ansi = f"\033[{resp_color}m"
+    reset = C.RESET
+
+    # Code block fence detection (```)
+    stripped = line.strip()
+    if stripped.startswith("```"):
+        return f"{base_ansi}{line}{reset}", not in_code_block
+
+    # Inside code block — use cyan
+    if in_code_block:
+        return f"\033[36m{line}{reset}", True
+
+    # Empty line
+    if not line.strip():
+        return "", False
+
+    # ── Block-level elements ────────────────────────────────────
+
+    # Headers (# ## ### etc)
+    m = re.match(r'^(#{1,6})\s+(.+)$', line)
+    if m:
+        level = len(m.group(1))
+        hdr_colors = {1: '1;36', 2: '1;34', 3: '1;33', 4: '1;35', 5: '1;32', 6: '1;90'}
+        text = _render_inline_fmt(m.group(2), base_ansi, reset)
+        return f"\033[{hdr_colors.get(level, '1;36')}m{m.group(1)} {text}{reset}", False
+
+    # Horizontal rules
+    if re.match(r'^[-*_]{3,}\s*$', line):
+        try:
+            width = os.get_terminal_size().columns
+        except Exception:
+            width = 72
+        return f"\033[90m{'─' * min(len(line), width)}{reset}", False
+
+    # Blockquotes
+    if line.startswith('>'):
+        content = _render_inline_fmt(line[1:].strip(), base_ansi, reset)
+        return f"\033[90m│{reset} {content}", False
+
+    # Task list items: - [ ] or - [x]
+    task_match = re.match(r'^(\s*)[-*+]\s+\[([ xX])\]\s+(.*)$', line)
+    if task_match:
+        indent = task_match.group(1)
+        checked = task_match.group(2).lower() == 'x'
+        text = _render_inline_fmt(task_match.group(3), base_ansi, reset)
+        check_char = '✓' if checked else '○'
+        check_color = '\033[32m' if checked else '\033[90m'
+        return f"{base_ansi}{indent}- {check_color}[{check_char}]{reset} {text}", False
+
+    # Unordered list items: -, *, +
+    list_match = re.match(r'^(\s*)([-*+])\s+(.*)$', line)
+    if list_match:
+        text = _render_inline_fmt(list_match.group(3), base_ansi, reset)
+        return f"{base_ansi}{list_match.group(1)}{list_match.group(2)} {text}{reset}", False
+
+    # Ordered list items: 1., 2. etc
+    list_match = re.match(r'^(\s*)(\d+\.)\s+(.*)$', line)
+    if list_match:
+        text = _render_inline_fmt(list_match.group(3), base_ansi, reset)
+        return f"{base_ansi}{list_match.group(1)}{list_match.group(2)} {text}{reset}", False
+
+    # Regular line with inline formatting
+    rendered = _render_inline_fmt(line, base_ansi, reset)
+    return f"{base_ansi}{rendered}{reset}", False
+
+
 def parse_stream(resp, resp_color="95"):
     content_parts = []
     tool_calls = {}
@@ -2828,8 +2953,9 @@ def parse_stream(resp, resp_color="95"):
     total_tokens = 0
     cost = 0
     interrupted = False
-    _color_on = f"\033[{resp_color}m"
     _color_printed = False
+    line_buf = ""
+    in_code_block = False
 
     sock = None
     try:
@@ -2893,9 +3019,20 @@ def parse_stream(resp, resp_color="95"):
                     content_parts.append(c)
                     token_count += 1
                     if not _color_printed:
-                        print(_color_on, end="", flush=True)
                         _color_printed = True
-                    print(c, end="", flush=True)
+                    line_buf += c
+                    # Process complete lines from buffer
+                    while '\n' in line_buf:
+                        idx = line_buf.index('\n')
+                        line = line_buf[:idx]
+                        line_buf = line_buf[idx + 1:]
+                        rendered, in_code_block = _render_md_line(
+                            line, resp_color, in_code_block
+                        )
+                        if rendered:
+                            print(rendered, flush=True)
+                        else:
+                            print(flush=True)
                     if _log_fh is not None:
                         try:
                             _log_fh.write(c)
@@ -2925,6 +3062,15 @@ def parse_stream(resp, resp_color="95"):
         interrupted = True
 
     if _color_printed and not interrupted:
+        # Flush remaining partial line in buffer
+        if line_buf:
+            rendered, in_code_block = _render_md_line(
+                line_buf, resp_color, in_code_block
+            )
+            if rendered:
+                print(rendered, flush=True)
+            else:
+                print(flush=True)
         print(C.RESET, end="", flush=True)
 
     if content_parts and _log_fh is not None and not interrupted:
