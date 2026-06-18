@@ -4869,17 +4869,20 @@ def main():
                             last_user = i
                             break
                     if last_user == -1:
-                        print(f"{C.RED}no user message to edit{C.RESET}")
+                        messages.append({"role": "user", "content": arg})
+                        print(f"{C.GREEN}message added ({len(arg)} chars){C.RESET}")
+                        send_conversation(messages, cfg, pop_on_first_error=True)
                     else:
                         messages[last_user]["content"] = arg
-                        print(f"{C.GREEN}last message updated{C.RESET}")
+                        print(f"{C.GREEN}last message updated ({len(arg)} chars){C.RESET}")
+                        send_conversation(messages, cfg, pop_on_first_error=False)
                 else:
                     last_user = -1
                     for i in range(len(messages) - 1, -1, -1):
                         if messages[i]["role"] == "user":
                             last_user = i
                             break
-                    initial = ""
+                    initial = messages[last_user]["content"] if last_user != -1 else ""
                     print(f"{C.YELLOW}opening editor...{C.RESET}")
                     content = open_editor(initial)
                     if content:
