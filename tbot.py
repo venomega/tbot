@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, signal
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -3448,6 +3448,20 @@ def save_history():
         pass
 
 
+def _setup_sigwinch():
+    """Handle terminal resize (SIGWINCH) so readline redraws correctly."""
+    if readline is None:
+        return
+
+    def _on_resize(sig, action):
+        try:
+            readline.redisplay()
+        except Exception:
+            pass
+
+    signal.signal(signal.SIGWINCH, _on_resize)
+
+
 def show_banner(cfg):
     tools_flag = (
         f"{C.CYAN}tools{C.RESET}"
@@ -4358,8 +4372,14 @@ def main():
     atexit.register(_log_close)
     setup_history()
     atexit.register(save_history)
+    _setup_sigwinch()
+    # Build prompt: wrap ANSI escapes in \001...\002 so readline knows they are zero-width
     if readline is not None:
-        readline.set_startup_hook(lambda: sys.stdout.write(f"{C.BOLD}{C.BLUE}"))
+        _rl_bold_blue = "\001\033[1;34m\002"
+        _rl_reset = "\001\033[0m\002"
+        _prompt = f"{_rl_bold_blue}>>>{_rl_reset} "
+    else:
+        _prompt = f"{C.BOLD}{C.BLUE}>>>{C.RESET} "
     ctx = get_model_context(
         cfg["model"],
         cfg.get("api_key", ""),
@@ -4373,11 +4393,8 @@ def main():
 
     while True:
         try:
-            if readline is not None:
-                line = input(">>> ")
-                save_history()
-            else:
-                line = input(f"{C.BOLD}{C.BLUE}>>>{C.RESET} ")
+            line = input(_prompt)
+            save_history()
             sys.stdout.write(C.RESET)
         except (EOFError, KeyboardInterrupt):
             save_history()
