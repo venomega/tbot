@@ -971,7 +971,7 @@ def _clear_trails():
 
 
 def _detect_pattern(trail):
-    if len(trail) < 6:
+    if len(trail) < 20:
         return False
     names_only = [t[0] for t in trail[-6:]]
     # A,B,A,B,A,B
