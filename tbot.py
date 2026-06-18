@@ -2855,6 +2855,12 @@ def _render_inline_fmt(text, base_ansi, reset):
     text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', rf'\033[3m\1{reset}{base_ansi}', text)
     # Italic: _text_ (word boundaries)
     text = re.sub(r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', rf'\033[3m\1{reset}{base_ansi}', text)
+    # Superscript: ^text^ and HTML <sup>text</sup>
+    text = re.sub(r'\^(.+?)\^', rf'\033[33m\1{reset}{base_ansi}', text)
+    text = re.sub(r'<sup>(.+?)</sup>', rf'\033[33m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
+    # Subscript: ~text~ and HTML <sub>text</sub> (avoid ~~strikethrough~~)
+    text = re.sub(r'(?<!~)~(?!~)(.+?)(?<!~)~(?!~)', rf'\033[34m\1{reset}{base_ansi}', text)
+    text = re.sub(r'<sub>(.+?)</sub>', rf'\033[34m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
     # Links: [text](url) — OSC 8 label + bare URL fallback only if terminal lacks OSC 8
     if osc8:
         text = re.sub(
@@ -2873,6 +2879,120 @@ def _render_inline_fmt(text, base_ansi, reset):
     return text
 
 
+def _parse_table_row(line):
+    """Parse a markdown table row into cells (list of stripped strings)."""
+    s = line.strip()
+    # Strip leading/trailing pipes
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|'):
+        s = s[:-1]
+    return [cell.strip() for cell in s.split('|')]
+
+
+def _is_table_separator(cells):
+    """Return True if all cells look like column separators (---, :---, :--:, ---:)."""
+    return all(re.match(r'^:?-{3,}:?$', c) for c in cells if c.strip())
+
+
+def _render_table(rows, resp_color):
+    """Render accumulated markdown table rows with ANSI box-drawing grid.
+
+    Returns a list of strings to print.
+    """
+    base_ansi = f"\033[{resp_color}m"
+    reset = C.RESET
+    gray = '\033[90m'
+
+    if not rows:
+        return []
+
+    # Parse all rows, find separator position in parsed list
+    parsed = []
+    sep_pos = None  # position in `parsed` list
+    for row in rows:
+        cells = _parse_table_row(row)
+        if not cells:
+            continue
+        if _is_table_separator(cells):
+            if sep_pos is None:
+                sep_pos = len(parsed)
+            parsed.append(('sep', cells))
+        else:
+            # Apply inline formatting to each cell's content
+            fmt_cells = [_render_inline_fmt(c, base_ansi, reset) for c in cells]
+            parsed.append(('data', fmt_cells))
+
+    if not parsed:
+        return [f"{base_ansi}{rows[0]}{reset}"]
+
+    # Determine column count (max across all rows)
+    ncols = max(len(cells) for _, cells in parsed)
+
+    # Calculate column widths
+    widths = [0] * ncols
+    for kind, cells in parsed:
+        for i, cell in enumerate(cells):
+            # Strip ANSI codes for width calc
+            clean = re.sub(r'\033\[[0-9;]*m', '', cell)
+            widths[i] = max(widths[i], len(clean))
+
+    # Pad all cells to uniform column count
+    padded = []
+    for kind, cells in parsed:
+        while len(cells) < ncols:
+            cells.append('')
+        padded.append((kind, cells))
+
+    # ── Build grid lines ────────────────────────────────────
+    H = '─'      # horizontal
+    V = gray + '│' + base_ansi
+    LT = gray + '┌' + base_ansi
+    RT = gray + '┐' + base_ansi
+    LB = gray + '└' + base_ansi
+    RB = gray + '┘' + base_ansi
+    LJ = gray + '├' + base_ansi
+    RJ = gray + '┤' + base_ansi
+    CR = gray + '┼' + base_ansi
+
+    def _sep_line(left, join, right, fill=H):
+        return (left
+                + join.join(fill * (w + 2) for w in widths)
+                + right)
+
+    def _fmt_cell(text, width, is_header=False):
+        style = '\033[1m' if is_header else ''
+        text_clean = re.sub(r'\033\[[0-9;]*m', '', text)
+        visible_len = len(text_clean)
+        pad = width - visible_len
+        return f" {style}{text}{reset}{' ' * pad} "
+
+    result = []
+
+    # Top border
+    result.append(f"{base_ansi}{_sep_line(LT, '┬' if ncols > 1 else '', RT)}{reset}")
+
+    for idx, (kind, cells) in enumerate(padded):
+        if kind == 'sep':
+            result.append(f"{base_ansi}{_sep_line(LJ, '┼' if ncols > 1 else '', RJ, '─')}{reset}")
+        else:
+            # Header: first row if no separator, or any data row before the separator
+            if sep_pos is None:
+                is_header = (idx == 0)
+            else:
+                is_header = idx < sep_pos
+            line = V.join(
+                _fmt_cell(cells[i] if i < len(cells) else '', widths[i], is_header=is_header)
+                for i in range(ncols)
+            )
+            result.append(f"{base_ansi}{V}{line}{V}")
+
+    # Bottom border
+    result.append(f"{base_ansi}{_sep_line(LB, '┴' if ncols > 1 else '', RB)}{reset}")
+
+    return result
+
+
 def _render_md_line(line, resp_color, in_code_block):
     """Render a single markdown line with ANSI formatting.
 
@@ -2884,11 +3004,11 @@ def _render_md_line(line, resp_color, in_code_block):
     # Code block fence detection (```)
     stripped = line.strip()
     if stripped.startswith("```"):
-        return f"{base_ansi}{line}{reset}", not in_code_block
+        return f"\033[48;5;236m\033[90m{line}{reset}", not in_code_block
 
-    # Inside code block — use cyan
+    # Inside code block — cyan on dark background
     if in_code_block:
-        return f"\033[36m{line}{reset}", True
+        return f"\033[48;5;236m\033[36m{line}{reset}", True
 
     # Empty line
     if not line.strip():
@@ -2939,6 +3059,10 @@ def _render_md_line(line, resp_color, in_code_block):
         text = _render_inline_fmt(list_match.group(3), base_ansi, reset)
         return f"{base_ansi}{list_match.group(1)}{list_match.group(2)} {text}{reset}", False
 
+    # Markdown table row: at least 2 pipe characters
+    if line.strip().count('|') >= 2:
+        return None, False
+
     # Regular line with inline formatting
     rendered = _render_inline_fmt(line, base_ansi, reset)
     return f"{base_ansi}{rendered}{reset}", False
@@ -2956,6 +3080,7 @@ def parse_stream(resp, resp_color="95"):
     _color_printed = False
     line_buf = ""
     in_code_block = False
+    table_buf = []
 
     sock = None
     try:
@@ -3029,10 +3154,19 @@ def parse_stream(resp, resp_color="95"):
                         rendered, in_code_block = _render_md_line(
                             line, resp_color, in_code_block
                         )
-                        if rendered:
-                            print(rendered, flush=True)
+                        if rendered is None:
+                            # Table row — accumulate
+                            table_buf.append(line)
                         else:
-                            print(flush=True)
+                            # Not a table row — flush any pending table first
+                            if table_buf:
+                                for t_line in _render_table(table_buf, resp_color):
+                                    print(t_line, flush=True)
+                                table_buf = []
+                            if rendered:
+                                print(rendered, flush=True)
+                            else:
+                                print(flush=True)
                     if _log_fh is not None:
                         try:
                             _log_fh.write(c)
@@ -3067,10 +3201,22 @@ def parse_stream(resp, resp_color="95"):
             rendered, in_code_block = _render_md_line(
                 line_buf, resp_color, in_code_block
             )
-            if rendered:
-                print(rendered, flush=True)
+            if rendered is None:
+                table_buf.append(line_buf)
             else:
-                print(flush=True)
+                if table_buf:
+                    for t_line in _render_table(table_buf, resp_color):
+                        print(t_line, flush=True)
+                    table_buf = []
+                if rendered:
+                    print(rendered, flush=True)
+                else:
+                    print(flush=True)
+        # Flush any table that ends exactly at the last line
+        if table_buf:
+            for t_line in _render_table(table_buf, resp_color):
+                print(t_line, flush=True)
+            table_buf = []
         print(C.RESET, end="", flush=True)
 
     if content_parts and _log_fh is not None and not interrupted:
