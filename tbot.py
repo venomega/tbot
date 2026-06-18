@@ -3373,6 +3373,76 @@ def execute_tool_calls(tool_calls, messages, cfg):
 # ── UI ──────────────────────────────────────────────────────────
 
 
+def _run_interactive(cmd, cwd, timeout=120):
+    """Run a shell command, streaming stdout/stderr in real time, and
+    return (captured_output, exit_code).  The output is printed as it
+    arrives, then the captured text is sent to the AI."""
+    import threading
+
+    out_lines = []
+    err_lines = []
+    lock = threading.Lock()
+
+    def _reader(stream, lines, color):
+        try:
+            for line in iter(stream.readline, ""):
+                with lock:
+                    lines.append(line)
+                if color:
+                    sys.stdout.write(color + line + C.RESET)
+                else:
+                    sys.stdout.write(line)
+                sys.stdout.flush()
+            stream.close()
+        except ValueError:
+            pass
+
+    try:
+        p = subprocess.Popen(
+            cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=cwd,
+        )
+    except Exception as e:
+        return f"Error: {e}", -1
+
+    tout = threading.Thread(target=_reader, args=(p.stdout, out_lines, None))
+    terr = threading.Thread(target=_reader, args=(p.stderr, err_lines, C.RED))
+    tout.daemon = True
+    terr.daemon = True
+    tout.start()
+    terr.start()
+
+    timed_out = False
+    try:
+        p.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        p.kill()
+        p.wait()
+
+    tout.join()
+    terr.join()
+
+    out_b = "".join(out_lines)
+    err_b = "".join(err_lines)
+    captured = out_b
+    if err_b:
+        captured += "\n--- stderr ---\n" + err_b
+
+    if timed_out:
+        captured += "\n--- exit code: -1 (timed out) ---"
+        return captured, -1
+
+    captured += f"\n--- exit code: {p.returncode} ---"
+    status_color = C.GREEN if p.returncode == 0 else C.RED
+    print(f"  {status_color}exit {p.returncode}{C.RESET}")
+    return captured, p.returncode
+
+
 def _completer(text, state):
     """Tab completion for slash commands and !bash shortcuts."""
     line = readline.get_line_buffer()
@@ -4968,32 +5038,9 @@ Replace this with instructions for the model.
             cmd = line[1:].strip()
             if cmd:
                 print(f"  {C.GRAY}$ {cmd}{C.RESET}")
-                try:
-                    r = subprocess.run(
-                        cmd,
-                        shell=True,
-                        capture_output=True,
-                        text=True,
-                        timeout=120,
-                        cwd=str(CURRENT_DIR),
-                    )
-                    out = r.stdout
-                    if r.stderr:
-                        out += "\n--- stderr ---\n" + r.stderr
-                    out += f"\n--- exit code: {r.returncode} ---"
-                except subprocess.TimeoutExpired:
-                    out = "Command timed out after 120s"
-                except Exception as e:
-                    out = f"Error: {e}"
-
-                preview = out[:500].replace("\n", "\\n")
-                print(
-                    f"  {C.GRAY}→ {preview}{'...' if len(out) > 500 else ''}{C.RESET}"
-                )
-
+                out, rc = _run_interactive(cmd, str(CURRENT_DIR))
                 _log_write(f"$ {cmd}")
                 _log_write(out)
-
                 messages.append({"role": "user", "content": f"! {cmd}"})
                 messages.append(
                     {
