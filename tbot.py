@@ -3374,32 +3374,30 @@ def execute_tool_calls(tool_calls, messages, cfg):
 
 
 def _completer(text, state):
+    """Tab completion for slash commands and !bash shortcuts."""
     line = readline.get_line_buffer()
-    parts = line.lstrip().split()
-    if not parts:
-        return None
+    raw = line.lstrip()
+    parts = raw.split()
+    trailing_space = raw.endswith(" ")
 
     # ── ! prefix: bash completion via compgen ──
-    if parts[0].startswith("!"):
+    if raw.startswith("!"):
         try:
-            raw = line.lstrip()
-            cmd_token = parts[0]
+            cmd_token = parts[0] if parts else raw
             past_cmd = bool(raw[len(cmd_token) :].strip()) or raw[
                 len(cmd_token) :
             ].endswith(" ")
             if not past_cmd:
-                prefix = parts[0][1:]
+                prefix = text[1:] if text.startswith("!") else text
                 r = subprocess.run(
                     ["bash", "-c", f"compgen -c '{prefix}'"],
                     capture_output=True,
                     text=True,
                     timeout=1,
                 )
-                matches = [c + " " for c in r.stdout.strip().split("\n") if c]
+                matches = ["!" + c + " " for c in r.stdout.strip().split("\n") if c]
             else:
                 prefix = parts[-1] if len(parts) > 1 else ""
-                slash_idx = prefix.rfind("/")
-                dir_part = prefix[: slash_idx + 1] if slash_idx >= 0 else ""
                 r = subprocess.run(
                     ["bash", "-c", f"compgen -f -- '{prefix}'"],
                     capture_output=True,
@@ -3411,50 +3409,127 @@ def _completer(text, state):
                     c = c.strip()
                     if not c:
                         continue
-                    basename = (
-                        c[len(dir_part) :] if dir_part and c.startswith(dir_part) else c
-                    )
-                    p = Path(c) if c.startswith("/") else Path(prefix).parent / c
-                    if p.exists() and p.is_dir():
-                        matches.append(basename + "/")
+                    if Path(c).is_dir():
+                        matches.append(c + "/")
                     else:
-                        matches.append(basename + " ")
+                        matches.append(c + " ")
         except Exception:
             matches = []
         return matches[state] if state < len(matches) else None
 
-    if not parts[0].startswith("/"):
+    # ── Not a slash command → nothing to complete ──
+    if not raw.startswith("/"):
+        return None
+
+    # ── /command first word ──
+    if text.startswith("/"):
+        cmd = text[1:]
+        if cmd in _COMMANDS:
+            matches = [text + " "]
+        else:
+            matches = ["/" + c + " " for c in _COMMANDS if c.startswith(cmd)]
+        return matches[state] if state < len(matches) else None
+
+    # ── Completing arguments of a slash command ──
+    if not parts:
         return None
     cmd = parts[0][1:]
-    if cmd == "preset" and len(parts) == 2:
-        matches = [s for s in _PRESET_SUBCMDS if s.startswith(parts[1])]
-        return (matches[state] + " ") if state < len(matches) else None
-    if cmd in ("preset", "skill") and len(parts) == 3 and parts[1] in ("load", "rm", "show"):
-        presets = list_presets()
-        prefix = parts[2]
-        matches = sorted(p["name"] for p in presets if p["name"].startswith(prefix))
-        if matches:
-            return (matches[state] + " ") if state < len(matches) else None
-        return None
-    if cmd == "skill" and len(parts) == 2:
-        matches = [s for s in _SKILL_SUBCMDS if s.startswith(parts[1])]
-        return (matches[state] + " ") if state < len(matches) else None
-    if cmd == "rag" and len(parts) == 2:
-        matches = [s for s in _RAG_SUBCMDS if s.startswith(parts[1])]
-        return (matches[state] + " ") if state < len(matches) else None
-    if cmd == "model" and len(parts) == 2:
-        q = parts[1].lower()
+    # If a space follows the last token, treat the next argument as empty
+    args = parts[1:] if not trailing_space else parts[1:] + [""]
+    prefix = text  # "" or partial word
+
+    # ── /preset <subcmd> [name] ──
+    if cmd == "preset":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _PRESET_SUBCMDS if s.startswith(prefix)]
+        elif args[0] in ("load", "rm", "show", "save"):
+            if len(args) > 2 and not trailing_space:
+                return None
+            presets = list_presets()
+            matches = sorted(p["name"] + " " for p in presets if p["name"].startswith(prefix))
+        else:
+            return None
+        return matches[state] if state < len(matches) else None
+
+    # ── /skill <subcmd> [name] ──
+    if cmd == "skill":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _SKILL_SUBCMDS if s.startswith(prefix)]
+        elif args[0] in ("rm", "show"):
+            if len(args) > 2 and not trailing_space:
+                return None
+            skills = load_skills()
+            matches = sorted(n + " " for n, *_ in skills if n.startswith(prefix))
+        else:
+            return None
+        return matches[state] if state < len(matches) else None
+
+    # ── /rag <subcmd> ──
+    if cmd == "rag":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _RAG_SUBCMDS if s.startswith(prefix)]
+        else:
+            return None
+        return matches[state] if state < len(matches) else None
+
+    # ── /model [name] ──
+    if cmd == "model" and args:
+        q = prefix.lower()
         models = _models_cache or []
         matches = sorted(
             m.get("id", "") for m in models if q in m.get("id", "").lower()
         )
         if matches:
             matches = [m + " " for m in matches]
-        return matches[state] if state < len(matches) else None
-    if cmd in _COMMANDS and text != cmd:
+            return matches[state] if state < len(matches) else None
         return None
-    matches = [c + " " for c in _COMMANDS if c.startswith(cmd)]
-    return matches[state] if state < len(matches) else None
+
+    # ── /provider [name] ──
+    if cmd == "provider" and args:
+        matches = [p + " " for p in PROVIDERS if p.startswith(prefix)]
+        return matches[state] if state < len(matches) else None
+
+    # ── /temp [value] ──
+    if cmd == "temp" and args:
+        suggestions = ["0", "0.1", "0.3", "0.5", "0.7", "0.8", "1.0", "1.5", "2.0"]
+        matches = [s for s in suggestions if s.startswith(prefix)]
+        return matches[state] if state < len(matches) else None
+
+    # ── /session [filter] ──
+    if cmd == "session" and args:
+        sessions = sorted([f.name for f in LOG_DIR.glob("*.log") if f.is_file()])
+        matches = [s + " " for s in sessions if s.startswith(prefix)]
+        return matches[state] if state < len(matches) else None
+
+    # ── /export <filepath> ──
+    if cmd == "export" and args:
+        try:
+            r = subprocess.run(
+                ["bash", "-c", f"compgen -f -- '{prefix}'"],
+                capture_output=True,
+                text=True,
+                timeout=1,
+            )
+            matches = []
+            for c in r.stdout.strip().split("\n"):
+                c = c.strip()
+                if not c:
+                    continue
+                if Path(c).is_dir():
+                    matches.append(c + "/")
+                else:
+                    matches.append(c + " ")
+            return matches[state] if state < len(matches) else None
+        except Exception:
+            return None
+
+    return None
 
 
 def setup_history():
@@ -3467,8 +3542,27 @@ def setup_history():
         pass
     readline.set_history_length(1000)
     try:
-        readline.parse_and_bind("tab: complete")
+        # Remove / from delimiters so readline completes it as part of the word
+        delims = readline.get_completer_delims()
+        delims = delims.replace("/", "")
+        readline.set_completer_delims(delims)
+        # Register completer before binding tab
         readline.set_completer(_completer)
+        # Bind Tab — macOS libedit needs different syntax than GNU readline
+        is_libedit = "libedit" in (readline.__doc__ or "")
+        if is_libedit:
+            # libedit on macOS — try syntaxes known to work
+            for bind_cmd in (
+                'bind ^I rl_complete',
+                'tab: complete',
+            ):
+                try:
+                    readline.parse_and_bind(bind_cmd)
+                except Exception:
+                    continue
+        else:
+            # GNU readline
+            readline.parse_and_bind("tab: complete")
         readline.parse_and_bind('"\\C-e": "/edit\\C-j"')
     except Exception:
         pass
