@@ -4571,7 +4571,7 @@ Replace this with instructions for the model.
         send_conversation(messages, cfg, pop_on_first_error=True)
 
 
-MAX_TOOL_ONLY_ROUNDS = 6
+MAX_TOOL_ONLY_ROUNDS = 30
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
