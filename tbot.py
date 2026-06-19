@@ -27,6 +27,7 @@ _COMMANDS = [
     "skills",
     "skill",
     "rag",
+    "commit",
     "exit",
 ]
 _PRESET_SUBCMDS = ["save", "load", "rm", "ls", "show"]
@@ -4229,6 +4230,7 @@ def print_help():
     )
     print(f"  /skills            List installed skills")
     print(f"  /skill add|rm|show  Manage skills")
+    print(f"  /commit <msg>      git add . && git commit -m '<msg>'")
     print(f"  /exit              Quit")
     print(f"  !<command>         Run bash command and save to conversation")
     print()
@@ -5039,6 +5041,27 @@ Replace this with instructions for the model.
                     print(f"  /rag index [path]    Build RAG index")
                     print(f"  /rag search <query>  Search codebase")
                     print(f"  /rag status          Show index stats")
+            elif cmd == "commit":
+                if not arg:
+                    print(f"{C.YELLOW}usage: /commit <message>{C.RESET}")
+                else:
+                    r = subprocess.run(
+                        ["git", "add", "."],
+                        capture_output=True, text=True, timeout=30,
+                        cwd=str(CURRENT_DIR),
+                    )
+                    if r.returncode != 0:
+                        print(f"{C.RED}git add . failed: {r.stderr.strip()}{C.RESET}")
+                    else:
+                        r2 = subprocess.run(
+                            ["git", "commit", "-m", arg],
+                            capture_output=True, text=True, timeout=30,
+                            cwd=str(CURRENT_DIR),
+                        )
+                        if r2.returncode == 0:
+                            print(f"{C.GREEN}{r2.stdout.strip()}{C.RESET}")
+                        else:
+                            print(f"{C.RED}{r2.stderr.strip()}{C.RESET}")
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
