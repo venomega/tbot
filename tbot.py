@@ -742,10 +742,6 @@ def _log_close():
             pass
 
 
-_log_fh = None
-_current_log_path = None
-
-
 def _log_write(text):
     if _log_fh is not None:
         try:
@@ -5078,35 +5074,39 @@ MAX_TOOL_ONLY_ROUNDS = 60
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
-    max_chars = _compute_max_history_chars(cfg)
-    while (
-        sum(_content_str_len(m.get("content", "")) for m in messages) > max_chars
-        and sum(1 for m in messages if m["role"] not in ("system",)) > 1
-    ):
-        for i, m in enumerate(messages):
-            if m["role"] == "user":
-                messages.pop(i)
-                if i < len(messages) and messages[i]["role"] == "assistant":
+    try:
+        max_chars = _compute_max_history_chars(cfg)
+        while (
+            sum(_content_str_len(m.get("content", "")) for m in messages) > max_chars
+            and sum(1 for m in messages if m["role"] not in ("system",)) > 1
+        ):
+            for i, m in enumerate(messages):
+                if m["role"] == "user":
                     messages.pop(i)
-                    # Also remove tool messages that belong to this assistant
-                    while i < len(messages) and messages[i]["role"] == "tool":
+                    if i < len(messages) and messages[i]["role"] == "assistant":
                         messages.pop(i)
-                break
-    tools = None
-    if cfg["tools_enabled"]:
-        tools = list(TOOLS)
-        skills = load_skills()
-        if skills:
-            tools += skills_to_tools(skills)
-    max_rounds = cfg.get("max_rounds", 200)
-    round_n = 0
-    retryable_errors = {"connection", "timeout", "ssl", "proxy"}
-    max_retries = 3
-    base_delay = 1.0
-    max_stream_retries = 5
-    stream_retries = 0
-    tool_only_rounds = 0
-    stuck_rounds = 0
+                        # Also remove tool messages that belong to this assistant
+                        while i < len(messages) and messages[i]["role"] == "tool":
+                            messages.pop(i)
+                    break
+        tools = None
+        if cfg["tools_enabled"]:
+            tools = list(TOOLS)
+            skills = load_skills()
+            if skills:
+                tools += skills_to_tools(skills)
+        max_rounds = cfg.get("max_rounds", 200)
+        round_n = 0
+        retryable_errors = {"connection", "timeout", "ssl", "proxy"}
+        max_retries = 3
+        base_delay = 1.0
+        max_stream_retries = 5
+        stream_retries = 0
+        tool_only_rounds = 0
+        stuck_rounds = 0
+    except KeyboardInterrupt:
+        print(f"\n{C.YELLOW}cancelled{C.RESET}")
+        return
     while round_n < max_rounds:
         _clear_trails()
         round_n += 1
