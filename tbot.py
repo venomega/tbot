@@ -4222,7 +4222,7 @@ def print_help():
     print(f"  /provider [name]   Show or switch provider")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
-    print(f"  /edit  [text]      Multi-line input (or Ctrl+E) — empty line to finish")
+    print(f"  /edit  [text]      Multi-line editor (or Ctrl+E / /edit)")
     print(f"  /tools             Toggle tool calling on/off")
     print(f"  /trust             Toggle auto-approve tools")
     print(
@@ -4395,44 +4395,6 @@ def _collapse_for_history(text, max_len=200):
     if len(one_line) > max_len:
         one_line = one_line[:max_len] + "..."
     return one_line
-
-
-def _read_multi_line(initial=""):
-    """Read multi-line input from terminal. Empty line or Ctrl+D finishes."""
-    lines = []
-    if initial:
-        lines.append(initial)
-    auto_restore = False
-    if readline is not None:
-        try:
-            readline.set_auto_history(False)
-            auto_restore = True
-        except Exception:
-            pass
-    print(f"{C.YELLOW}── multi-line (empty line to finish, Ctrl+C to cancel) ──{C.RESET}")
-    try:
-        while True:
-            prompt = f"{C.CYAN}... {C.RESET}" if lines else ""
-            try:
-                line = input(prompt)
-                if not line.strip() and lines:
-                    break
-                lines.append(line)
-            except EOFError:
-                print()
-                break
-    except KeyboardInterrupt:
-        print(f"\n{C.YELLOW}cancelled{C.RESET}")
-        return None
-    finally:
-        if auto_restore:
-            try:
-                readline.set_auto_history(True)
-            except Exception:
-                pass
-    if not lines:
-        return None
-    return "\n".join(lines)
 
 
 def open_editor(initial_text=""):
@@ -4952,7 +4914,9 @@ def main():
                         if messages[i]["role"] == "user":
                             last_user = i
                             break
-                    content = _read_multi_line()
+                    initial = ""
+                    print(f"{C.YELLOW}opening editor...{C.RESET}")
+                    content = open_editor(initial)
                     if content:
                         appended = last_user == -1
                         if last_user != -1:
