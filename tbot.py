@@ -3104,6 +3104,7 @@ def _render_md_line(line, resp_color, in_code_block):
 
 def parse_stream(resp, resp_color="95"):
     content_parts = []
+    reasoning_parts = []
     tool_calls = {}
     token_count = 0
     prompt_tokens = 0
@@ -3126,7 +3127,7 @@ def parse_stream(resp, resp_color="95"):
     try:
         iterator = resp.iter_lines()
     except Exception:
-        return None, None, 0, 0, 0, 0, True
+        return None, None, None, 0, 0, 0, 0, True
 
     received = False
     try:
@@ -3173,6 +3174,10 @@ def parse_stream(resp, resp_color="95"):
                 if not choices:
                     continue
                 delta = choices[0].get("delta", {})
+                # Capture reasoning_content for DeepSeek thinking mode
+                rc = delta.get("reasoning_content")
+                if rc:
+                    reasoning_parts.append(rc)
                 c = delta.get("content")
                 if c:
                     content_parts.append(c)
@@ -3263,6 +3268,7 @@ def parse_stream(resp, resp_color="95"):
     if not completion_tokens:
         completion_tokens = token_count
     content = "".join(content_parts)
+    reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
     calls = list(tool_calls.values()) if tool_calls else None
     if calls:
         for c in calls:
@@ -3271,6 +3277,7 @@ def parse_stream(resp, resp_color="95"):
             )
     return (
         content,
+        reasoning_content,
         calls,
         prompt_tokens,
         completion_tokens,
@@ -5124,7 +5131,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if "error" in result:
                 break
             global _total_tokens, _last_cost, _acc_cost
-            content, tool_calls, pt, ct, _tot, _cost, interrupted = parse_stream(
+            content, reasoning_content, tool_calls, pt, ct, _tot, _cost, interrupted = parse_stream(
                 result["stream"], resp_color=cfg.get("resp_color", "95")
             )
             result["stream"].close()
@@ -5193,18 +5200,20 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 assistant_msg = {
                     "role": "assistant",
                     "content": content or None,
-                    "tool_calls": [
-                        {
-                            "id": tc["id"],
-                            "type": "function",
-                            "function": {
-                                "name": tc["function"]["name"],
-                                "arguments": tc["function"]["arguments"],
-                            },
-                        }
-                        for tc in tool_calls
-                    ],
                 }
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
+                assistant_msg["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["function"]["name"],
+                            "arguments": tc["function"]["arguments"],
+                        },
+                    }
+                    for tc in tool_calls
+                ]
                 before_tc = len(messages)
                 messages.append(assistant_msg)
                 ok = execute_tool_calls(tool_calls, messages, cfg)
@@ -5246,7 +5255,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 if _total_tokens:
                     cost_str = _format_cost(_acc_cost) if _acc_cost else ""
                     print(f"{C.GRAY}── {_total_tokens} tokens{cost_str} ──{C.RESET}")
-                messages.append({"role": "assistant", "content": content})
+                assistant_msg = {"role": "assistant", "content": content}
+                if reasoning_content:
+                    assistant_msg["reasoning_content"] = reasoning_content
+                messages.append(assistant_msg)
             break
         except KeyboardInterrupt:
             print(f"\n{C.YELLOW}cancelled{C.RESET}")
