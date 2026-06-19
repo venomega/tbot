@@ -3289,6 +3289,7 @@ MAX_TOOLS_PER_ROUND = 10
 def execute_tool_calls(tool_calls, messages, cfg):
     global _todo_has_write_since_last
     pending_system = []
+    pending_user = []  # user messages (images) to append after ALL tool responses
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -3351,7 +3352,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         if name == "read" and result.startswith("data:image/"):
             fpath = args.get("filePath", "?")
-            messages.append(
+            pending_user.append(
                 {
                     "role": "user",
                     "content": [
@@ -3365,6 +3366,10 @@ def execute_tool_calls(tool_calls, messages, cfg):
             )
         if name not in _READ_ONLY_TOOLS and ok:
             _todo_has_write_since_last = True
+    # Append user messages (images) AFTER all tool responses to keep tool_calls
+    # contiguous — required by providers like DeepSeek
+    for msg in pending_user:
+        messages.append(msg)
     for msg in pending_system:
         messages.append(msg)
     return True
@@ -5200,13 +5205,14 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                         for tc in tool_calls
                     ],
                 }
+                before_tc = len(messages)
                 messages.append(assistant_msg)
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
-                    # Clean up: remove the assistant_msg and any tool messages added this round
-                    for _ in range(len(tool_calls) + 1):
-                        if messages:
-                            messages.pop()
+                    # Clean up: remove only the messages added THIS round
+                    # (assistant_msg + any tool/user messages appended by execute_tool_calls)
+                    while len(messages) > before_tc:
+                        messages.pop()
                     break
 
                 # --- stuck round detection (todowrite loops) ---
