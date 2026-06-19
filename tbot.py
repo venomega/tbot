@@ -1136,8 +1136,6 @@ def handle_grep(args):
     root = _resolve_path(search_path)
     matches = []
     try:
-        import subprocess
-
         cmd = ["rg", "-n", pattern, str(root)]
         if include:
             cmd.extend(["-g", include])
@@ -3305,7 +3303,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
             args = {}
 
         args_str = json.dumps(args)[:200]
-        print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{args_str}{C.RESET}")
+        desc = args.get("description", "")
+        print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{desc or args_str}{C.RESET}")
         _log_write(f"── {name} {args_str}")
 
         handler = TOOL_HANDLERS.get(name)
@@ -3345,8 +3344,6 @@ def execute_tool_calls(tool_calls, messages, cfg):
             else:
                 result = "TOOL_CALL_DECLINED"
 
-        preview = result[:500].replace("\n", "\\n")
-        print(f"  {C.GRAY}→ {preview}{'...' if len(result) > 500 else ''}{C.RESET}")
         if name == "edit":
             _emit_edit_diff()
         if name == "todowrite" and result != "TOOL_CALL_DECLINED":
