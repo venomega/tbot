@@ -3485,13 +3485,14 @@ def _completer(text, state):
                     capture_output=True,
                     text=True,
                     timeout=1,
+                    cwd=str(CURRENT_DIR),
                 )
                 matches = []
                 for c in r.stdout.strip().split("\n"):
                     c = c.strip()
                     if not c:
                         continue
-                    if Path(c).is_dir():
+                    if (CURRENT_DIR / c).is_dir():
                         matches.append(c + "/")
                     else:
                         matches.append(c + " ")
@@ -3597,13 +3598,14 @@ def _completer(text, state):
                 capture_output=True,
                 text=True,
                 timeout=1,
+                cwd=str(CURRENT_DIR),
             )
             matches = []
             for c in r.stdout.strip().split("\n"):
                 c = c.strip()
                 if not c:
                     continue
-                if Path(c).is_dir():
+                if (CURRENT_DIR / c).is_dir():
                     matches.append(c + "/")
                 else:
                     matches.append(c + " ")
