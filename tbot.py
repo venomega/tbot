@@ -651,6 +651,55 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_skill",
+            "description": "Crea una nueva skill en ~/.config/tbot/skills/<name>/ para que el modelo pueda reutilizar este procedimiento en el futuro. Úsalo DESPUÉS de completar un procedimiento complejo que involucró trial-and-error. Antes de llamarlo, carga skill-guide con skill_skill-guide() para conocer el formato exacto. NO llames esto si el usuario no ha pedido la tarea o si el procedimiento es trivial.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre de la skill. Debe coincidir con el del frontmatter. Minúsculas, guiones, alfanumérico (ej: 'deploy-railway', 'docker-cleanup')."
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Descripción de 1-2 oraciones de cuándo el modelo debe usar esta skill."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "El cuerpo completo de la skill en Markdown, incluyendo el frontmatter YAML. Debe seguir el formato documentado en skill-guide."
+                    },
+                    "schema": {
+                        "type": "object",
+                        "description": "JSON Schema opcional para los parámetros de la skill tool. Omitir para skills de solo lectura/lookup.",
+                        "default": {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "Input"
+                                }
+                            },
+                            "required": ["input"]
+                        }
+                    },
+                    "replace": {
+                        "type": "boolean",
+                        "description": "Si es true y la skill ya existe, la sobrescribe en lugar de dar error.",
+                        "default": False
+                    },
+                    "files": {
+                        "type": "object",
+                        "description": "Opcional. Diccionario de nombre_archivo → contenido para archivos adicionales en la carpeta de la skill (ej: {'script.py': '...', 'config.template': '...'}).",
+                        "default": {}
+                    }
+                },
+                "required": ["name", "description", "content"]
+            }
+        }
+    },
 ]
 
 # ── Project directory context ────────────────────────────────
@@ -1730,6 +1779,60 @@ schema: {esc_schema}
     return f"{C.GREEN}skill '{name}' created{C.RESET}"
 
 
+def handle_create_skill_tool(args):
+    """Handler for the `create_skill` tool — model-driven skill creation."""
+    name = args.get("name", "")
+    if not name:
+        return "Error: name is required"
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_-]*$", name):
+        return f"Error: invalid skill name — use letters, numbers, underscores, hyphens"
+
+    description = args.get("description", name)
+    content = args.get("content", "")
+    schema = args.get(
+        "schema",
+        {
+            "type": "object",
+            "properties": {"input": {"type": "string", "description": "Input"}},
+            "required": ["input"],
+        },
+    )
+    replace = args.get("replace", False)
+    files = args.get("files", {})
+
+    # Validate that content has YAML frontmatter
+    meta = _parse_skill_text(content)
+    if not meta:
+        return (
+            "Error: content no tiene frontmatter YAML válido (debe comenzar con ---\\n...\\n---\\n). "
+            "Carga skill_skill-guide() para ver el formato exacto."
+        )
+
+    # Validate that frontmatter name matches argument
+    fm_name = meta.get("name", "")
+    if fm_name and fm_name != name:
+        return f"Error: el nombre en el frontmatter ('{fm_name}') no coincide con el argumento name ('{name}')"
+
+    ensure_skills_dir()
+    skill_dir = SKILLS_DIR / name
+    if skill_dir.exists():
+        if not replace:
+            return f"Error: skill '{name}' ya existe. Usa replace=true para sobrescribir o elige otro nombre."
+        shutil.rmtree(skill_dir)
+
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
+
+    # Write sibling files if provided
+    for fname, fcontent in files.items():
+        # Sanitize filename to prevent path traversal
+        safe_name = Path(fname).name
+        (skill_dir / safe_name).write_text(str(fcontent), encoding="utf-8")
+
+    clear_skill_cache()
+    return f"✓ Skill '{name}' creada exitosamente en {skill_dir}/SKILL.md. Disponible para usar con skill_{name}()."
+
+
 def handle_get_system_info(_args):
     return json.dumps(
         {
@@ -1915,6 +2018,7 @@ TOOL_HANDLERS = {
     "rag_index": handle_rag_index,
     "rag_search": handle_rag_search,
     "rag_status": handle_rag_status,
+    "create_skill": handle_create_skill_tool,
 }
 
 
@@ -4488,7 +4592,32 @@ Skills are loaded in two steps:
   2. `skill_<name>()` — actually loads the skill's instructions into your context
 Call `skill_<name>()` directly if you know the skill exists. Available skills: {skills_list}
 
-Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices."""
+Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices.
+
+# Autonomous Skill Creation
+
+After completing a complex procedure that involved multiple steps, different
+tools, and especially if there was trial-and-error (errors, retries, edge cases),
+consider creating a skill to preserve what you learned.
+
+## When to create a skill
+- The task required 5+ tool calls total
+- You used 3+ different tools
+- There were errors you had to work around (trial-and-error)
+- The result is a reusable procedure (not a one-off)
+- No similar skill already exists
+
+## How to create one
+1. Load `skill_skill-guide()` for the exact frontmatter format and best practices.
+2. Write the skill content including YAML frontmatter.
+3. Call `create_skill(name, description, content, replace=false)`.
+4. The skill will be available in future sessions via `skill_<name>()`.
+
+## Important
+- Do NOT create skills for trivial tasks (1-2 tool calls, no errors).
+- Do NOT create skills without checking with `skill("<name>")` first.
+- ALWAYS load skill-guide before writing the skill content.
+- The skill must be useful for YOU (the model) in the future, not for the user."""
 
 
 def load_system_prompt(cfg):
