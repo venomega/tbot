@@ -4894,7 +4894,7 @@ def main():
                         if messages[i]["role"] == "user":
                             last_user = i
                             break
-                    initial = messages[last_user]["content"] if last_user != -1 else ""
+                    initial = ""
                     print(f"{C.YELLOW}opening editor...{C.RESET}")
                     content = open_editor(initial)
                     if content:
