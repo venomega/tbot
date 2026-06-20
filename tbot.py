@@ -27,12 +27,16 @@ _COMMANDS = [
     "skills",
     "skill",
     "rag",
+    "memory",
+    "episodic",
     "commit",
     "exit",
 ]
 _PRESET_SUBCMDS = ["save", "load", "rm", "ls", "show"]
 _SKILL_SUBCMDS = ["add", "rm", "show", "install"]
 _RAG_SUBCMDS = ["index", "search", "status"]
+_MEMORY_SUBCMDS = ["show", "edit", "gate", "search"]
+_EPISODIC_SUBCMDS = ["search", "stats", "prune"]
 
 _total_tokens = 0
 _last_cost = 0
@@ -112,6 +116,151 @@ _DEFAULT_PROVIDER_URL = PROVIDERS["openrouter"]["url"]
 
 _log_fh = None
 _current_log_path = None
+
+# ── Memory system constants ──────────────────────────────────
+
+MEMORY_DIR = CONFIG_DIR / "memories"
+FACTS_DIR = MEMORY_DIR / "facts"
+MEMORY_FILE = FACTS_DIR / "MEMORY.md"
+USER_FILE = FACTS_DIR / "USER.md"
+EPISODIC_DB = MEMORY_DIR / "episodic.db"
+
+_session_state = {"id": None}
+
+_MEMORY_FACT_COUNTER = {}
+
+
+def ensure_memory_dirs():
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    FACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _read_fact_file(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+def _write_fact_file(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content.strip() + "\n", encoding="utf-8")
+
+
+def _init_episodic_db():
+    """Create/open episodic.db, create tables + FTS5 if not exist."""
+    MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(EPISODIC_DB))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS sessions (
+            id TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            model TEXT,
+            provider TEXT
+        )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            tool_name TEXT,
+            FOREIGN KEY (session_id) REFERENCES sessions(id)
+        )"""
+        )
+        # Create FTS5 virtual table (IF NOT EXISTS handled by checking existence)
+        try:
+            conn.execute(
+                """CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content, role, tool_name,
+                content=messages, content_rowid=id
+            )"""
+            )
+        except Exception:
+            # Table may already exist from previous run
+            pass
+        # Create triggers unconditionally (IF NOT EXISTS)
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, content, role, tool_name)
+            VALUES (new.id, new.content, new.role, new.tool_name);
+        END"""
+        )
+        conn.execute(
+            """CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid) VALUES ('delete', old.id);
+        END"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_created_at ON messages(created_at)"
+        )
+        conn.close()
+    except ImportError:
+        pass
+
+
+def _episodic_store(role, content, session_id=None, tool_name=None):
+    """Insert a message into episodic.db."""
+    if session_id is None:
+        session_id = _session_state.get("id")
+    if not session_id or not content:
+        return
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(EPISODIC_DB))
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_name) VALUES (?, ?, ?, ?)",
+            (session_id, role, content[:100000], tool_name),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
+def _episodic_search(query, top_k=10):
+    """Search FTS5 and return formatted results."""
+    if not query:
+        return ""
+    try:
+        import sqlite3
+
+        conn = sqlite3.connect(str(EPISODIC_DB))
+        conn.row_factory = sqlite3.Row
+        cursor = conn.execute(
+            """SELECT m.id, m.session_id, m.role, m.content, m.created_at, m.tool_name,
+                      rank
+               FROM messages_fts
+               JOIN messages m ON messages_fts.rowid = m.id
+               WHERE messages_fts MATCH ?
+               ORDER BY rank
+               LIMIT ?""",
+            (query, top_k),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            return ""
+        result = f"Episodic memory results (FTS5) for: {query}\n\n"
+        for r in rows:
+            role = r["role"]
+            content = r["content"][:500]
+            ts = r["created_at"]
+            sid = r["session_id"][:8]
+            tool = f" [{r['tool_name']}]" if r["tool_name"] else ""
+            result += f"[{ts}] session:{sid} {role}{tool}\n{content}\n---\n"
+        return result
+    except Exception as e:
+        return f"Error searching episodic memory: {e}"
 
 
 class C:
@@ -700,6 +849,90 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "fact_read",
+            "description": "Lee MEMORY.md (hechos del entorno: proyectos, configuraciones, convenciones aprendidas) o USER.md (preferencias del usuario, estilo de comunicación). Se inyectan automáticamente al inicio de la sesión.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "store": {
+                        "type": "string",
+                        "enum": ["memory", "user"],
+                        "description": "Qué archivo leer: 'memory' para MEMORY.md, 'user' para USER.md"
+                    }
+                },
+                "required": ["store"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fact_write",
+            "description": "Agrega o reemplaza una entrada en MEMORY.md o USER.md. Si el texto ya existe (substring match), se reemplaza. Si no, se agrega. Respeta el límite de caracteres.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "store": {
+                        "type": "string",
+                        "enum": ["memory", "user"],
+                        "description": "'memory' para MEMORY.md, 'user' para USER.md"
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "El texto de la entrada a guardar. Debe ser una línea informativa y compacta."
+                    }
+                },
+                "required": ["store", "content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fact_remove",
+            "description": "Elimina una entrada de MEMORY.md o USER.md por substring matching. El substring debe identificar exactamente una sola entrada.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "store": {
+                        "type": "string",
+                        "enum": ["memory", "user"],
+                        "description": "'memory' para MEMORY.md, 'user' para USER.md"
+                    },
+                    "substring": {
+                        "type": "string",
+                        "description": "Substring único que identifica la entrada a eliminar"
+                    }
+                },
+                "required": ["store", "substring"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "episodic_search",
+            "description": "Busca en el historial completo de conversaciones usando FTS5. Útil para recordar discusiones pasadas, decisiones técnicas, o configuraciones mencionadas en sesiones anteriores.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Términos de búsqueda (ej: 'despliegue coolify postgres', 'migración base de datos')"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Número de resultados (default: 5, max: 20)",
+                        "default": 5
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
 ]
 
 # ── Project directory context ────────────────────────────────
@@ -739,6 +972,8 @@ _READ_ONLY_TOOLS = frozenset(
         "skill",
         "skills",
         "invalid",
+        "fact_read",
+        "episodic_search",
     }
 )
 
@@ -792,13 +1027,16 @@ def _log_close():
             pass
 
 
-def _log_write(text):
+def _log_write(text, role=None, tool_name=None):
     if _log_fh is not None:
         try:
             _log_fh.write(text.rstrip("\n") + "\n")
             _log_fh.flush()
         except Exception:
             pass
+    # Also store in episodic database
+    if role and text:
+        _episodic_store(role, text, tool_name=tool_name)
 
 
 def _llm_convert(text, target_format, cfg):
@@ -2001,6 +2239,122 @@ def handle_rag_status(_args):
     return f"RAG status: {result}"
 
 
+# ── Fact Memory handlers ─────────────────────────────────────
+
+
+def _fact_file_path(store):
+    return MEMORY_FILE if store == "memory" else USER_FILE
+
+
+def _fact_limit(cfg, store):
+    return cfg.get("memory_facts_limit", 2200) if store == "memory" else cfg.get("memory_user_limit", 2200)
+
+
+# Import cfg lazily from the module-level config in main
+_cfg_for_memory = None
+
+
+def _get_memory_gate(cfg):
+    return cfg.get("memory_gate", False)
+
+
+def handle_fact_read(args):
+    store = args.get("store", "memory")
+    path = _fact_file_path(store)
+    content = _read_fact_file(path)
+    if not content:
+        return f"# {store.upper()} — Perfil del Usuario\n\n(empty — no facts recorded yet)" if store == "user" else f"# MEMORY — Hechos del Entorno\n\n(empty — no facts recorded yet)"
+    header = f"=== {path.name} ===\n"
+    return header + content
+
+
+def handle_fact_write(args):
+    store = args.get("store", "memory")
+    content = args.get("content", "").strip()
+    if not content:
+        return "Error: content is empty"
+    path = _fact_file_path(store)
+    # Memory gate: ask for user approval before writing
+    if _cfg_for_memory and _cfg_for_memory.get("memory_gate", False):
+        print(f"\n\033[33mMemory gate: approve write to {path.name}?\033[0m")
+        print(f"  Content: {content[:200]}")
+        answer = input("  y/N: ").strip().lower()
+        if answer != "y":
+            return "Write cancelled by memory gate"
+    current = _read_fact_file(path)
+    lines = current.split("\n") if current else []
+    # Check if content already exists (substring match on non-header lines)
+    # Lines that are headers or comments are ignored for matching
+    found_idx = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and not stripped.startswith("<!--"):
+            if content in stripped:
+                found_idx = i
+                break
+    if found_idx is not None:
+        lines[found_idx] = f"- {content}"
+    else:
+        lines.append(f"- {content}")
+        lines.append(f"<!-- added {time.strftime('%Y-%m-%d %H:%M:%S')} -->")
+    new_text = "\n".join(lines).strip()
+    # Check limit
+    limit = _fact_limit(_cfg_for_memory or {}, store)
+    if len(new_text) > limit:
+        return (
+            f"Error: exceeds limit of {limit} chars ({len(new_text)} total). "
+            f"Consolidate existing entries first. Current content:\n{new_text}"
+        )
+    _write_fact_file(path, new_text)
+    return f"Written to {path.name} ({len(new_text)}/{limit} chars used)"
+
+
+def handle_fact_remove(args):
+    store = args.get("store", "memory")
+    substring = args.get("substring", "").strip()
+    if not substring:
+        return "Error: substring is required"
+    path = _fact_file_path(store)
+    # Memory gate: ask for user approval before removing
+    if _cfg_for_memory and _cfg_for_memory.get("memory_gate", False):
+        print(f"\n\033[33mMemory gate: approve removal from {path.name}?\033[0m")
+        print(f"  Substring: {substring[:200]}")
+        answer = input("  y/N: ").strip().lower()
+        if answer != "y":
+            return "Removal cancelled by memory gate"
+    current = _read_fact_file(path)
+    if not current:
+        return f"Error: {path.name} is empty"
+    lines = current.split("\n")
+    # Find lines matching substring (exclude headers/comments)
+    matching = [l for l in lines if substring in l and not l.startswith("#") and not l.startswith("<!--")]
+    if len(matching) == 0:
+        return f"Error: no entry matches '{substring}'"
+    if len(matching) > 1:
+        matches_str = "\n".join(matching)
+        return f"Error: multiple entries match '{substring}':\n{matches_str}\nUse a more specific substring."
+    # Remove the matching line and any following <!-- added --> comment
+    remove_idx = lines.index(matching[0])
+    removed = [remove_idx]
+    if remove_idx + 1 < len(lines) and lines[remove_idx + 1].startswith("<!--"):
+        removed.append(remove_idx + 1)
+    new_lines = [l for i, l in enumerate(lines) if i not in removed]
+    new_text = "\n".join(new_lines).strip()
+    _write_fact_file(path, new_text)
+    return f"Removed entry from {path.name}"
+
+
+def handle_episodic_search(args):
+    query = args.get("query", "")
+    top_k = min(args.get("top_k", 5), 20)
+    if not query:
+        return "Error: query is required"
+    result = _episodic_search(query, top_k=top_k)
+    if not result:
+        return f"No episodic memories found for: {query}"
+    return result
+
+
 TOOL_HANDLERS = {
     "invalid": handle_invalid,
     "question": handle_question,
@@ -2019,6 +2373,10 @@ TOOL_HANDLERS = {
     "rag_search": handle_rag_search,
     "rag_status": handle_rag_status,
     "create_skill": handle_create_skill_tool,
+    "fact_read": handle_fact_read,
+    "fact_write": handle_fact_write,
+    "fact_remove": handle_fact_remove,
+    "episodic_search": handle_episodic_search,
 }
 
 
@@ -2720,6 +3078,10 @@ def default_cfg():
         "tools_enabled": True,
         "trust_mode": False,
         "resp_color": "95",
+        "memory_gate": False,
+        "memory_facts_limit": 2200,
+        "memory_user_limit": 2200,
+        "episodic_retention_days": 90,
     }
 
 
@@ -3410,7 +3772,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
         args_str = json.dumps(args)[:200]
         desc = args.get("description", "")
         print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{desc or args_str}{C.RESET}")
-        _log_write(f"── {name} {args_str}")
+        _log_write(f"── {name} {args_str}", role="tool", tool_name=name)
 
         handler = TOOL_HANDLERS.get(name)
         if not handler and name.startswith("skill_"):
@@ -3453,7 +3815,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
             _emit_edit_diff()
         if name == "todowrite" and result != "TOOL_CALL_DECLINED":
             _display_task_md()
-        _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}")
+        _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}", role="tool", tool_name=name)
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
         if name == "read" and result.startswith("data:image/"):
             fpath = args.get("filePath", "?")
@@ -3655,6 +4017,36 @@ def _completer(text, state):
             return None
         if len(args) == 1:
             matches = [s + " " for s in _RAG_SUBCMDS if s.startswith(prefix)]
+        else:
+            return None
+        return matches[state] if state < len(matches) else None
+
+    # ── /memory <subcmd> ──
+    if cmd == "memory":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _MEMORY_SUBCMDS if s.startswith(prefix)]
+        elif args[0] in ("show", "edit") and len(args) == 2:
+            matches = [s + " " for s in ("memory", "user") if s.startswith(prefix)]
+        elif args[0] == "gate" and len(args) == 2:
+            matches = [s + " " for s in ("on", "off") if s.startswith(prefix)]
+        elif args[0] == "search" and len(args) == 2:
+            # Suggest store names as first arg after "search"
+            matches = [s + " " for s in ("memory", "user") if s.startswith(prefix)]
+        else:
+            return None
+        return matches[state] if state < len(matches) else None
+
+    # ── /episodic <subcmd> ──
+    if cmd == "episodic":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _EPISODIC_SUBCMDS if s.startswith(prefix)]
+        elif args[0] == "prune" and len(args) == 2:
+            matches = ["30 ", "60 ", "90 ", "180 "]
+            matches = [s for s in matches if s.startswith(prefix)]
         else:
             return None
         return matches[state] if state < len(matches) else None
@@ -4594,6 +4986,53 @@ Call `skill_<name>()` directly if you know the skill exists. Available skills: {
 
 Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices.
 
+═══ MEMORY [{memory_pct}% — {memory_facts_limit} chars max] ═══
+{memory_content}
+
+═══ USER PROFILE [{user_pct}% — {memory_user_limit} chars max] ═══
+{user_content}
+
+# Fact Memory (hechos persistentes)
+
+Tienes acceso a dos archivos de hechos persistentes:
+- **MEMORY.md** — hechos del entorno: proyectos, configuraciones, convenciones aprendidas
+- **USER.md** — perfil del usuario: preferencias, estilo de comunicación
+
+Se cargan al inicio de cada sesión y los ves arriba. Para modificarlos:
+- `fact_read(store="memory"|"user")` — leer contenido actual
+- `fact_write(store, content)` — agregar o reemplazar una entrada
+- `fact_remove(store, substring)` — eliminar una entrada por substring
+
+Límite: ~{memory_facts_limit} chars por archivo.
+
+Cuándo guardar automáticamente:
+- El usuario dice "recuerda que..." o "toma nota..."
+- Descubres un hecho importante del entorno (sistema operativo, herramientas, estructura de proyecto)
+- El usuario expresa una preferencia clara ("prefiero X sobre Y")
+
+NO guardes:
+- Información trivial o temporal
+- Grandes bloques de código o logs
+- Cosas que puedes buscar en web
+
+Consolidación: si un archivo está cerca del límite (≥80%), fusiona entradas relacionadas
+antes de agregar nuevas.
+
+# Episodic Memory (historial de conversaciones)
+
+Todas las conversaciones pasadas se almacenan en una base de datos SQLite con
+búsqueda FTS5. Puedes buscar en ellas con:
+- `episodic_search(query, top_k=5)` — busca palabras clave en todo el historial
+
+Úsalo cuando:
+- Necesitas recordar una decisión técnica de una sesión anterior
+- El usuario menciona algo que discutieron antes
+- Quieres saber si ya probaste cierto enfoque
+
+NO lo uses para:
+- Información que está en MEMORY.md (usa fact_read)
+- Preguntas que puedes responder con las herramientas actuales
+
 # Autonomous Skill Creation
 
 After completing a complex procedure that involved multiple steps, different
@@ -4659,6 +5098,17 @@ def _env_vars(cfg=None):
     model = cfg.get("model", "unknown") if cfg else "unknown"
     provider = cfg.get("provider", "unknown") if cfg else "unknown"
     trust_mode = str(cfg.get("trust_mode", False)) if cfg else "unknown"
+    # Load memory content for system prompt injection
+    memory_content = _read_fact_file(MEMORY_FILE)
+    user_content = _read_fact_file(USER_FILE)
+    if not memory_content:
+        memory_content = "(empty)"
+    if not user_content:
+        user_content = "(empty)"
+    facts_limit = cfg.get("memory_facts_limit", 2200) if cfg else 2200
+    user_limit = cfg.get("memory_user_limit", 2200) if cfg else 2200
+    memory_pct = min(100, int(len(memory_content) / max(facts_limit, 1) * 100))
+    user_pct = min(100, int(len(user_content) / max(user_limit, 1) * 100))
     return {
         "date": time.strftime("%Y-%m-%d"),
         "cwd": str(Path.cwd()),
@@ -4673,6 +5123,12 @@ def _env_vars(cfg=None):
         "max_tool_output": str(MAX_TOOL_OUTPUT),
         "subagent_depth": depth,
         "has_rag": has_rag,
+        "memory_content": memory_content,
+        "user_content": user_content,
+        "memory_facts_limit": str(facts_limit),
+        "memory_user_limit": str(user_limit),
+        "memory_pct": str(memory_pct),
+        "user_pct": str(user_pct),
     }
 
 
@@ -4685,8 +5141,12 @@ def _init_messages(cfg):
 
 
 def main():
+    global _cfg_for_memory
     cfg = load_cfg()
+    _cfg_for_memory = cfg
     _init_default_skills()
+    ensure_memory_dirs()
+    _init_episodic_db()
     cfg["api_key"] = resolve_key(cfg)
 
     parser = argparse.ArgumentParser(
@@ -4724,7 +5184,7 @@ def main():
         messages = _init_messages(cfg)
         _log_init()
         atexit.register(_log_close)
-        _log_write(f">>> {args.task}")
+        _log_write(f">>> {args.task}", role="user")
         messages.append({"role": "user", "content": args.task})
         send_conversation(messages, cfg)
         return
@@ -4751,6 +5211,36 @@ def main():
         cfg["_context_length"] = ctx
     messages = _init_messages(cfg)
     show_banner(cfg)
+    # Initialize episodic memory
+    ensure_memory_dirs()
+    _init_episodic_db()
+    _session_state["id"] = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex()
+    try:
+        import sqlite3
+        conn = sqlite3.connect(str(EPISODIC_DB))
+        conn.execute(
+            "INSERT INTO sessions (id, started_at, model, provider) VALUES (?, datetime('now'), ?, ?)",
+            (_session_state["id"], cfg.get("model", "?"), cfg.get("provider", "?")),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+    # Auto-prune old messages
+    try:
+        import sqlite3
+        retention = cfg.get("episodic_retention_days", 90)
+        conn = sqlite3.connect(str(EPISODIC_DB))
+        pruned = conn.execute(
+            "DELETE FROM messages WHERE created_at < datetime('now', ?)",
+            (f"-{retention} days",),
+        ).rowcount
+        conn.commit()
+        conn.close()
+        if pruned:
+            print(f"{C.GRAY}memory: pruned {pruned} old messages{C.RESET}")
+    except Exception:
+        pass
 
     while True:
         try:
@@ -4788,6 +5278,20 @@ def main():
                 _doom_trail.clear()
                 _read_trail.clear()
                 _log_reopen()
+                # Initialize episodic session
+                _init_episodic_db()
+                _session_state["id"] = time.strftime("%Y%m%d-%H%M%S-") + os.urandom(4).hex()
+                try:
+                    import sqlite3
+                    conn = sqlite3.connect(str(EPISODIC_DB))
+                    conn.execute(
+                        "INSERT INTO sessions (id, started_at, model, provider) VALUES (?, datetime('now'), ?, ?)",
+                        (_session_state["id"], cfg.get("model", "?"), cfg.get("provider", "?")),
+                    )
+                    conn.commit()
+                    conn.close()
+                except Exception:
+                    pass
                 print(f"{C.GREEN}reset{C.RESET}")
             elif cmd == "model":
                 if arg:
@@ -5195,6 +5699,132 @@ Replace this with instructions for the model.
                     print(f"  /rag index [path]    Build RAG index")
                     print(f"  /rag search <query>  Search codebase")
                     print(f"  /rag status          Show index stats")
+            elif cmd == "memory":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if sub_cmd == "show":
+                    if sub_arg and sub_arg in ("memory", "user"):
+                        content = handle_fact_read({"store": sub_arg})
+                        print(content)
+                    elif sub_arg:
+                        print(f"{C.RED}invalid store. Use 'memory' or 'user'{C.RESET}")
+                    else:
+                        print(f"{C.CYAN}── MEMORY.md ──{C.RESET}")
+                        print(handle_fact_read({"store": "memory"}))
+                        print()
+                        print(f"{C.CYAN}── USER.md ──{C.RESET}")
+                        print(handle_fact_read({"store": "user"}))
+                elif sub_cmd == "edit":
+                    store = sub_arg if sub_arg in ("memory", "user") else "memory"
+                    path = _fact_file_path(store)
+                    ensure_memory_dirs()
+                    current = _read_fact_file(path)
+                    print(f"{C.YELLOW}opening editor for {path.name}...{C.RESET}")
+                    content = open_editor(current)
+                    if content is not None:
+                        _write_fact_file(path, content)
+                        print(f"{C.GREEN}{path.name} updated ({len(content)} chars){C.RESET}")
+                    else:
+                        print(f"{C.YELLOW}cancelled{C.RESET}")
+                elif sub_cmd == "gate":
+                    if sub_arg in ("on", "off"):
+                        cfg["memory_gate"] = sub_arg == "on"
+                        save_cfg(cfg)
+                        print(f"{C.GREEN}memory gate {'on' if sub_arg == 'on' else 'off'}{C.RESET}")
+                    else:
+                        print(f"{C.YELLOW}usage: /memory gate on|off{C.RESET}")
+                elif sub_cmd == "search":
+                    parts = arg.split(maxsplit=2)
+                    store = "both"
+                    query = ""
+                    if len(parts) == 3:
+                        store = parts[1].lower()
+                        query = parts[2]
+                    elif len(parts) == 2:
+                        # Could be "search <store>" or "search <query>"
+                        if parts[1] in ("memory", "user"):
+                            store = parts[1]
+                        else:
+                            query = parts[1]
+                    if not query:
+                        print(f"{C.RED}usage: /memory search [memory|user] <query>{C.RESET}")
+                    else:
+                        stores = [("memory", MEMORY_FILE), ("user", USER_FILE)]
+                        if store != "both":
+                            stores = [(s, p) for s, p in stores if s == store]
+                        for sname, spath in stores:
+                            content = _read_fact_file(spath)
+                            if not content:
+                                print(f"{C.YELLOW}({sname}: empty){C.RESET}")
+                                continue
+                            matching = [l for l in content.split("\n")
+                                        if query.lower() in l.lower()
+                                        and not l.startswith("<!--")]
+                            if matching:
+                                print(f"{C.CYAN}── {spath.name} ({len(matching)} matches) ──{C.RESET}")
+                                for m in matching:
+                                    print(f"  {m}")
+                            else:
+                                print(f"{C.YELLOW}({sname}: no matches){C.RESET}")
+                else:
+                    print(f"{C.YELLOW}usage:{C.RESET}")
+                    print(f"  /memory show [store]     Show MEMORY.md or USER.md (or both)")
+                    print(f"  /memory edit [store]     Open editor to edit manually")
+                    print(f"  /memory gate on|off      Enable/disable approval gate")
+                    print(f"  /memory search [store]   Search facts (case-insensitive)")
+            elif cmd == "episodic":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if sub_cmd == "search":
+                    if not sub_arg:
+                        print(f"{C.RED}usage: /episodic search <query>{C.RESET}")
+                    else:
+                        result = _episodic_search(sub_arg, top_k=10)
+                        if result:
+                            print(result)
+                        else:
+                            print(f"{C.YELLOW}no results for: {sub_arg}{C.RESET}")
+                elif sub_cmd == "stats":
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(str(EPISODIC_DB))
+                        sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+                        messages_count = conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+                        size = EPISODIC_DB.stat().st_size if EPISODIC_DB.exists() else 0
+                        conn.close()
+                        print(f"{C.CYAN}Episodic DB stats:{C.RESET}")
+                        print(f"  Sessions: {sessions}")
+                        print(f"  Messages: {messages_count}")
+                        print(f"  Size:     {size / 1024:.1f} KB")
+                    except Exception as e:
+                        print(f"{C.RED}error: {e}{C.RESET}")
+                elif sub_cmd == "prune":
+                    days = 90
+                    if sub_arg:
+                        try:
+                            days = max(1, int(sub_arg))
+                        except ValueError:
+                            print(f"{C.RED}invalid days{C.RESET}")
+                            continue
+                    try:
+                        import sqlite3
+                        conn = sqlite3.connect(str(EPISODIC_DB))
+                        deleted = conn.execute(
+                            "DELETE FROM messages WHERE created_at < datetime('now', ?)",
+                            (f"-{days} days",),
+                        ).rowcount
+                        conn.commit()
+                        conn.close()
+                        print(f"{C.GREEN}pruned {deleted} messages older than {days} days{C.RESET}")
+                    except Exception as e:
+                        print(f"{C.RED}error: {e}{C.RESET}")
+                else:
+                    print(f"{C.YELLOW}usage:{C.RESET}")
+                    print(f"  /episodic search <q>   Search full conversation history (FTS5)")
+                    print(f"  /episodic stats        Show database statistics")
+                    print(f"  /episodic prune [days] Delete messages older than N days")
             elif cmd == "commit":
                 if not arg:
                     print(f"{C.YELLOW}usage: /commit <message>{C.RESET}")
@@ -5239,7 +5869,7 @@ Replace this with instructions for the model.
 
         # ── message ──
         line = _expand_file_markers(line)
-        _log_write(f">>> {line}")
+        _log_write(f">>> {line}", role="user")
         messages.append({"role": "user", "content": line})
         send_conversation(messages, cfg, pop_on_first_error=True)
 
@@ -5392,6 +6022,12 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 ]
                 before_tc = len(messages)
                 messages.append(assistant_msg)
+                # Log assistant response to episodic memory
+                if content:
+                    _log_write(f"assistant: {content[:1000]}", role="assistant")
+                if tool_calls:
+                    tc_names = ", ".join(tc["function"]["name"] for tc in tool_calls)
+                    _log_write(f"assistant → tool_calls: {tc_names}", role="assistant")
                 ok = execute_tool_calls(tool_calls, messages, cfg)
                 if not ok:
                     # Clean up: remove only the messages added THIS round
@@ -5435,6 +6071,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 if reasoning_content:
                     assistant_msg["reasoning_content"] = reasoning_content
                 messages.append(assistant_msg)
+                _log_write(f"assistant: {content[:1000]}", role="assistant")
             break
         except KeyboardInterrupt:
             print(f"\n{C.YELLOW}cancelled{C.RESET}")
