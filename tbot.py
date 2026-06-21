@@ -1895,7 +1895,7 @@ def handle_skill(args):
     if not name:
         return "Error: name is required"
     skills = load_skills()
-    for n, desc, schema, doc in skills:
+    for n, desc, schema, doc, _entry in skills:
         if n == name:
             return f"Skill '{name}' found. Use `skill_{name}` to load instructions into context."
     return f"Skill '{name}' not found. Use /skills to list available skills."
@@ -2476,7 +2476,7 @@ def load_skills():
         schema = meta.get("schema", default_schema)
         doc = meta.get("_doc")
         if doc:
-            skills.append((name, desc, schema, doc))
+            skills.append((name, desc, schema, doc, entry.name))
     _skill_cache = skills
     return skills
 
@@ -2925,7 +2925,7 @@ def skills_to_tools(skills):
 
 
 def skill_tool_handler(name, args, messages=None):
-    for n, desc, schema, doc in load_skills():
+    for n, desc, schema, doc, entry_name in load_skills():
         if n == name:
             if messages is not None:
                 already = any(
@@ -2935,7 +2935,7 @@ def skill_tool_handler(name, args, messages=None):
                 )
                 if already:
                     return f"Skill '{name}' is already loaded. Follow the instructions already in context."
-                skill_dir = SKILLS_DIR / n
+                skill_dir = SKILLS_DIR / entry_name
                 siblings = sorted(
                     f.name
                     for f in skill_dir.iterdir()
