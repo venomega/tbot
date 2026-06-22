@@ -3338,6 +3338,27 @@ def _supports_osc8():
     return False
 
 
+def _strip_ansi(text):
+    """Strip all invisible ANSI escape sequences from text.
+
+    Handles:
+    - SGR codes: ``ESC[...m``  (color, bold, italic, etc.)
+    - OSC 8 hyperlinks: ``ESC]8;;...ESC\\``
+    - Any other OSC sequence: ``ESC]...ESC\\``
+    - Other CSI sequences: ``ESC[...``
+    """
+    ESC = '\033'  # actual ESC byte (0x1b)
+    # Strip SGR codes: ESC[<params>m
+    s = re.sub(ESC + r'\[[0-9;]*m', '', text)
+    # Strip OSC sequences: ESC]<string>ESC\ (e.g. OSC 8 hyperlinks)
+    s = re.sub(ESC + r'\].*?' + ESC + r'\\', '', s)
+    # Strip any remaining CSI sequences (cursor movement, etc.)
+    s = re.sub(ESC + r'\[[0-9;]*[A-Za-z]', '', s)
+    # Strip lone ESC characters (just in case)
+    s = re.sub(ESC, '', s)
+    return s
+
+
 def _render_inline_fmt(text, base_ansi, reset):
     """Apply ANSI formatting for inline markdown elements (bold, italic, code, links)."""
     osc8 = _supports_osc8()
@@ -3424,12 +3445,11 @@ def _render_table(rows, resp_color):
     # Determine column count (max across all rows)
     ncols = max(len(cells) for _, cells in parsed)
 
-    # Calculate column widths
+    # Calculate column widths (strip all invisible ANSI sequences)
     widths = [0] * ncols
     for kind, cells in parsed:
         for i, cell in enumerate(cells):
-            # Strip ANSI codes for width calc
-            clean = re.sub(r'\033\[[0-9;]*m', '', cell)
+            clean = _strip_ansi(cell)
             widths[i] = max(widths[i], len(clean))
 
     # Pad all cells to uniform column count
@@ -3457,7 +3477,7 @@ def _render_table(rows, resp_color):
 
     def _fmt_cell(text, width, is_header=False):
         style = '\033[1m' if is_header else ''
-        text_clean = re.sub(r'\033\[[0-9;]*m', '', text)
+        text_clean = _strip_ansi(text)
         visible_len = len(text_clean)
         pad = width - visible_len
         return f" {style}{text}{reset}{' ' * pad} "
@@ -4726,7 +4746,7 @@ def print_help():
     )
     print(f"  /skills            List installed skills")
     print(f"  /skill add|rm|show  Manage skills")
-    print(f"  /commit <msg>      git add . && git commit -m '<msg>'")
+    print(f"  /commit <msg>      git add -u && git commit -m '<msg>'")
     print(f"  /exit              Quit")
     print(f"  !<command>         Run bash command and save to conversation")
     print()
@@ -5830,12 +5850,12 @@ Replace this with instructions for the model.
                     print(f"{C.YELLOW}usage: /commit <message>{C.RESET}")
                 else:
                     r = subprocess.run(
-                        ["git", "add", "."],
+                        ["git", "add", "-u"],
                         capture_output=True, text=True, timeout=30,
                         cwd=str(CURRENT_DIR),
                     )
                     if r.returncode != 0:
-                        print(f"{C.RED}git add . failed: {r.stderr.strip()}{C.RESET}")
+                        print(f"{C.RED}git add -u failed: {r.stderr.strip()}{C.RESET}")
                     else:
                         r2 = subprocess.run(
                             ["git", "commit", "-m", arg],
