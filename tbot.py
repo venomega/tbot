@@ -5980,6 +5980,12 @@ def main():
                     print(f"{C.YELLOW}opening editor...{C.RESET}")
                     content = open_editor(initial)
                     if content:
+                        # ── Expandir @@ con fzf ──
+                        if "@@" in content and shutil.which("fzf"):
+                            sel = _fzf_file_selector()
+                            if sel:
+                                content = content.replace("@@", sel)
+                        # ──────────────────────────
                         appended = last_user == -1
                         if last_user != -1:
                             messages[last_user]["content"] = content
