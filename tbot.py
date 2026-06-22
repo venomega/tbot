@@ -2432,60 +2432,35 @@ def handle_episodic_search(args):
 # ── MCP tool handler ──────────────────────────────────────────────
 
 
-def _init_mcp(cfg, background=True):
-    """Inicializa el gestor MCP con la configuración actual.
+def _init_mcp(cfg):
+    """Inicializa el gestor MCP con la configuración actual (síncrono).
 
-    Si background=True, las conexiones se inician en un hilo separado
-    para no bloquear el arranque. Las herramientas MCP estarán disponibles
-    en cuanto termine la conexión.
-
-    Debe llamarse después de cargar cfg y antes de usar tools MCP.
+    Conecta todos los servidores MCP configurados y muestra un resumen
+    limpio antes de que aparezca el prompt.
     """
     global _mcp_manager
     if not _HAS_MCP:
         return
 
     mcp_configs = cfg.get("mcp_servers", [])
-    # Siempre crear el manager (aunque esté vacío) para que _get_mcp_tools() sea seguro
     _mcp_manager = MCPServerManager()
     _mcp_manager.load_configs(mcp_configs)
 
     if not mcp_configs:
         return
 
-    if not background or len(mcp_configs) == 1:
-        # Conexión síncrona (cuando hay 0 o 1 servidores no vale la pena el hilo)
-        results = _mcp_manager.connect_all(parallel=len(mcp_configs) > 1)
+    results = _mcp_manager.connect_all(parallel=True)
+    ok = sum(1 for _, s in results if s == "ok")
+    total = len(results)
+    errs = [n for n, s in results if s not in ("ok", "disabled")]
+
+    if ok:
+        mcp_count = len(_get_mcp_tools())
+        print(f"  {C.GREEN}MCP ✓{C.RESET} {ok}/{total} servidores, {mcp_count} tools")
+    if errs:
         for name, status in results:
-            if status == "ok":
-                print(f"  {C.GREEN}MCP ✓{C.RESET} {name}")
-            elif status == "disabled":
-                pass
-            else:
+            if status not in ("ok", "disabled"):
                 print(f"  {C.RED}MCP ✗{C.RESET} {name} — {status}")
-        return
-
-    # Conexión en background: el banner se muestra antes de que terminen
-    def _bg_connect():
-        try:
-            results = _mcp_manager.connect_all(parallel=True)
-            ok = sum(1 for _, s in results if s == "ok")
-            total = len(results)
-            errs = [n for n, s in results if s not in ("ok", "disabled")]
-            # Mostrar resumen solo si hay cambios relevantes
-            if ok or errs:
-                parts = []
-                if ok:
-                    mcp_count = len(_get_mcp_tools())
-                    parts.append(f"{C.GREEN}{ok}/{total} servidores, {mcp_count} tools{C.RESET}")
-                if errs:
-                    parts.append(f"{C.RED}{len(errs)} errores{C.RESET}")
-                print(f"\n  {C.GRAY}MCP{C.RESET} {' '.join(parts)}")
-        except Exception:
-            pass
-
-    bg = threading.Thread(target=_bg_connect, daemon=True, name="mcp-bg-init")
-    bg.start()
 
 
 def _get_mcp_tools():
@@ -5639,10 +5614,6 @@ def main():
         send_conversation(messages, cfg)
         return
 
-    # ── MCP initialization ──
-    _init_mcp(cfg)
-    atexit.register(lambda: _mcp_manager.close_all() if _mcp_manager else None)
-
     _log_init()
     atexit.register(_log_close)
     setup_history()
@@ -5695,6 +5666,10 @@ def main():
             print(f"{C.GRAY}memory: pruned {pruned} old messages{C.RESET}")
     except Exception:
         pass
+
+    # ── MCP initialization (synchronous — before prompt) ──
+    _init_mcp(cfg)
+    atexit.register(lambda: _mcp_manager.close_all() if _mcp_manager else None)
 
     while True:
         try:
