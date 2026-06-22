@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, signal
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, signal, threading
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -29,6 +29,7 @@ _COMMANDS = [
     "rag",
     "memory",
     "episodic",
+    "mcp",
     "commit",
     "exit",
 ]
@@ -37,6 +38,7 @@ _SKILL_SUBCMDS = ["add", "rm", "show", "install"]
 _RAG_SUBCMDS = ["index", "search", "status"]
 _MEMORY_SUBCMDS = ["show", "edit", "gate", "search"]
 _EPISODIC_SUBCMDS = ["search", "stats", "prune"]
+_MCP_SUBCMDS = ["status", "connect", "disconnect", "reconnect", "discover"]
 
 _total_tokens = 0
 _last_cost = 0
@@ -128,6 +130,16 @@ EPISODIC_DB = MEMORY_DIR / "episodic.db"
 _session_state = {"id": None}
 
 _MEMORY_FACT_COUNTER = {}
+
+# ── MCP (Model Context Protocol) ──────────────────────────────────
+try:
+    from mcp_client import MCPServerManager
+    _HAS_MCP = True
+except ImportError:
+    _HAS_MCP = False
+    MCPServerManager = None
+
+_mcp_manager = None
 
 
 def ensure_memory_dirs():
@@ -930,6 +942,68 @@ TOOLS = [
                     }
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "mcp_manage",
+            "description": "Gestiona la configuración de servidores MCP: listar, agregar, modificar o eliminar servidores. La config se guarda en ~/.config/tbot/config.json ('mcp_servers'). Para aplicar cambios, usa /mcp reconnect o reinicia tbot.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["list", "add", "remove", "modify"],
+                        "description": "Acción a realizar: list (lista servidores configurados), add (agregar nuevo), remove (eliminar), modify (modificar existente)"
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Nombre del servidor (requerido para add/remove/modify)"
+                    },
+                    "transport": {
+                        "type": "string",
+                        "enum": ["stdio", "http"],
+                        "description": "Tipo de transporte (para add/modify, default: stdio)"
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "Comando a ejecutar (para transporte stdio)"
+                    },
+                    "args": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Argumentos del comando (para transporte stdio)"
+                    },
+                    "url": {
+                        "type": "string",
+                        "description": "URL del servidor (para transporte http)"
+                    },
+                    "env": {
+                        "type": "object",
+                        "description": "Variables de entorno del servidor (para transporte stdio)",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "headers": {
+                        "type": "object",
+                        "description": "Headers HTTP personalizados (para transporte http, ej: API keys)",
+                        "additionalProperties": {"type": "string"}
+                    },
+                    "enabled": {
+                        "type": "boolean",
+                        "description": "Si el servidor está habilitado (default: true)"
+                    },
+                    "auto_reconnect": {
+                        "type": "boolean",
+                        "description": "Reconexión automática al desconectarse (default: true)"
+                    },
+                    "request_timeout": {
+                        "type": "integer",
+                        "description": "Timeout de requests en segundos (default: 60)"
+                    }
+                },
+                "required": ["action"]
             }
         }
     },
@@ -2355,6 +2429,322 @@ def handle_episodic_search(args):
     return result
 
 
+# ── MCP tool handler ──────────────────────────────────────────────
+
+
+def _init_mcp(cfg, background=True):
+    """Inicializa el gestor MCP con la configuración actual.
+
+    Si background=True, las conexiones se inician en un hilo separado
+    para no bloquear el arranque. Las herramientas MCP estarán disponibles
+    en cuanto termine la conexión.
+
+    Debe llamarse después de cargar cfg y antes de usar tools MCP.
+    """
+    global _mcp_manager
+    if not _HAS_MCP:
+        return
+
+    mcp_configs = cfg.get("mcp_servers", [])
+    # Siempre crear el manager (aunque esté vacío) para que _get_mcp_tools() sea seguro
+    _mcp_manager = MCPServerManager()
+    _mcp_manager.load_configs(mcp_configs)
+
+    if not mcp_configs:
+        return
+
+    if not background or len(mcp_configs) == 1:
+        # Conexión síncrona (cuando hay 0 o 1 servidores no vale la pena el hilo)
+        results = _mcp_manager.connect_all(parallel=len(mcp_configs) > 1)
+        for name, status in results:
+            if status == "ok":
+                print(f"  {C.GREEN}MCP ✓{C.RESET} {name}")
+            elif status == "disabled":
+                pass
+            else:
+                print(f"  {C.RED}MCP ✗{C.RESET} {name} — {status}")
+        return
+
+    # Conexión en background: el banner se muestra antes de que terminen
+    def _bg_connect():
+        try:
+            results = _mcp_manager.connect_all(parallel=True)
+            ok = sum(1 for _, s in results if s == "ok")
+            total = len(results)
+            errs = [n for n, s in results if s not in ("ok", "disabled")]
+            # Mostrar resumen solo si hay cambios relevantes
+            if ok or errs:
+                parts = []
+                if ok:
+                    mcp_count = len(_get_mcp_tools())
+                    parts.append(f"{C.GREEN}{ok}/{total} servidores, {mcp_count} tools{C.RESET}")
+                if errs:
+                    parts.append(f"{C.RED}{len(errs)} errores{C.RESET}")
+                print(f"\n  {C.GRAY}MCP{C.RESET} {' '.join(parts)}")
+        except Exception:
+            pass
+
+    bg = threading.Thread(target=_bg_connect, daemon=True, name="mcp-bg-init")
+    bg.start()
+
+
+def _get_mcp_tools():
+    """Retorna tools MCP en formato OpenAI function calling.
+
+    Returns:
+        list[dict] — herramientas para agregar a TOOLS
+    """
+    global _mcp_manager
+    if not _HAS_MCP or _mcp_manager is None:
+        return []
+    try:
+        return _mcp_manager.get_all_tools()
+    except Exception:
+        return []
+
+
+def _get_mcp_resource_notes():
+    """Retorna texto sobre recursos MCP para inyectar en system prompt."""
+    global _mcp_manager
+    if not _HAS_MCP or _mcp_manager is None:
+        return ""
+    try:
+        return _mcp_manager.get_resource_notes()
+    except Exception:
+        return ""
+
+
+def handle_mcp_tool_call(qualified_name, arguments):
+    """Handler para tool calls MCP (prefijo 'mcp__')."""
+    global _mcp_manager
+    if not _HAS_MCP:
+        return "Error: MCP no disponible — mcp_client.py no encontrado. Asegúrate de que mcp_client.py está en el mismo directorio que tbot.py."
+    if _mcp_manager is None:
+        return "Error: MCP no inicializado. Reinicia tbot o ejecuta /mcp reconnect."
+    return _mcp_manager.call_tool(qualified_name, arguments)
+
+
+def handle_mcp_command(args_dict):
+    """Handler para el comando interactivo /mcp.
+
+    args_dict: dict con 'action' y 'name' opcional
+    """
+    global _mcp_manager
+    if not _HAS_MCP:
+        return "MCP no disponible (mcp_client.py no encontrado)"
+    if _mcp_manager is None:
+        return "MCP no inicializado — reinicia tbot"
+
+    action = args_dict.get("action", "status")
+
+    if action == "status":
+        statuses = _mcp_manager.get_status()
+        if not statuses:
+            return "No hay servidores MCP configurados. Agrega servidores en ~/.config/tbot/config.json bajo 'mcp_servers'."
+        lines = [f"MCP Servers ({len(statuses)}):"]
+        for s in statuses:
+            status_color = {
+                "connected": C.GREEN,
+                "disconnected": C.RED,
+                "not_initialized": C.YELLOW,
+            }.get(s["status"], C.GRAY)
+            lines.append(
+                f"  {status_color}{s['name']:<20}{C.RESET} "
+                f"{s['transport']:<8} "
+                f"{status_color}{s['status']:<16}{C.RESET} "
+                f"{C.GRAY}{s['tools']} tools, {s['resources']} resources{C.RESET}"
+            )
+        return "\n".join(lines)
+
+    elif action == "connect":
+        name = args_dict.get("name", "")
+        if not name:
+            # Reconectar todos los que estén desconectados
+            count = 0
+            results = _mcp_manager.connect_all()
+            for n, status in results:
+                if status == "ok":
+                    count += 1
+            return f"Conectados {count} servidor(es) MCP"
+        client = _mcp_manager.get_client(name)
+        if client:
+            if client.connected:
+                return f"Servidor '{name}' ya está conectado"
+            # Reconnect específico
+            from mcp_client import MCPClient
+            for cfg in _mcp_manager._configs:
+                if cfg["name"] == name:
+                    try:
+                        new_client = MCPClient.from_config(cfg)
+                        new_client.connect()
+                        _mcp_manager._clients[name] = new_client
+                        return f"Servidor '{name}' reconectado"
+                    except Exception as e:
+                        return f"Error conectando '{name}': {e}"
+            return f"Servidor '{name}' no encontrado en configuración"
+        return f"Servidor '{name}' no encontrado"
+
+    elif action == "disconnect":
+        name = args_dict.get("name", "")
+        if not name:
+            return "Uso: /mcp disconnect <name>"
+        client = _mcp_manager.get_client(name)
+        if client:
+            client.close()
+            return f"Servidor '{name}' desconectado"
+        return f"Servidor '{name}' no encontrado"
+
+    elif action == "reconnect":
+        name = args_dict.get("name", "")
+        if name:
+            client = _mcp_manager.get_client(name)
+            if client:
+                client.close(terminate=True)
+                return handle_mcp_command({"action": "connect", "name": name})
+            return f"Servidor '{name}' no encontrado"
+        # Reconectar todos
+        _mcp_manager.close_all()
+        results = _mcp_manager.connect_all()
+        ok = sum(1 for _, s in results if s == "ok")
+        return f"Reconectados {ok}/{len(results)} servidores MCP"
+
+    elif action == "discover":
+        name = args_dict.get("name", "")
+        if name:
+            client = _mcp_manager.get_client(name)
+            if client and client.connected:
+                _mcp_manager.discover_all()
+                return f"Rediscovery completado para '{name}': {len(client.tools)} tools, {len(client.resources)} resources"
+            return f"Servidor '{name}' no encontrado o no conectado"
+        _mcp_manager.discover_all()
+        total_tools = sum(len(c.tools) for c in _mcp_manager._clients.values() if c.connected)
+        total_resources = sum(len(c.resources) for c in _mcp_manager._clients.values() if c.connected)
+        return f"Rediscovery completado: {total_tools} tools, {total_resources} resources"
+
+    return f"Acción desconocida: {action}"
+
+
+def handle_mcp_manage(args):
+    """Gestiona la configuración de servidores MCP en ~/.config/tbot/config.json.
+
+    Actions: list, add, remove, modify
+    """
+    action = args.get("action", "list")
+
+    cfg = load_cfg()
+    mcp_servers = cfg.get("mcp_servers", [])
+
+    if action == "list":
+        if not mcp_servers:
+            return "No hay servidores MCP configurados.\n\nUsa `mcp_manage` con action='add' para agregar uno.\nLa configuración se guarda en ~/.config/tbot/config.json bajo 'mcp_servers'."
+        lines = [f"Servidores MCP configurados ({len(mcp_servers)}):"]
+        for s in mcp_servers:
+            name = s.get("name", "?")
+            transport = s.get("transport", "stdio")
+            enabled = s.get("enabled", True)
+            cmd = s.get("command", s.get("url", ""))
+            status = "enabled" if enabled else "disabled"
+            lines.append(f"  [{status}] {name} ({transport}) — {cmd}")
+        return "\n".join(lines)
+
+    elif action == "add":
+        name = args.get("name", "").strip()
+        if not name:
+            return "Error: 'name' es requerido para agregar un servidor."
+        # Check duplicate
+        for s in mcp_servers:
+            if s["name"] == name:
+                return f"Error: ya existe un servidor llamado '{name}'. Usa action='modify' para modificarlo."
+
+        transport = args.get("transport", "stdio")
+        entry = {
+            "name": name,
+            "transport": transport,
+            "enabled": args.get("enabled", True),
+        }
+
+        if transport == "stdio":
+            if not args.get("command"):
+                return "Error: 'command' es requerido para transporte stdio."
+            entry["command"] = args["command"]
+            entry["args"] = args.get("args", [])
+        elif transport == "http":
+            if not args.get("url"):
+                return "Error: 'url' es requerido para transporte http."
+            entry["url"] = args["url"]
+        else:
+            return f"Error: transporte desconocido '{transport}'. Usa 'stdio' o 'http'."
+
+        if args.get("env"):
+            entry["env"] = args["env"]
+        if args.get("headers"):
+            entry["headers"] = args["headers"]
+        if args.get("auto_reconnect") is not None:
+            entry["auto_reconnect"] = args["auto_reconnect"]
+        if args.get("request_timeout"):
+            entry["request_timeout"] = args["request_timeout"]
+
+        mcp_servers.append(entry)
+        cfg["mcp_servers"] = mcp_servers
+        save_cfg(cfg)
+        return f"Servidor MCP '{name}' agregado exitosamente.\n\nImportante: ejecuta `/mcp reconnect` o reinicia tbot para activar el nuevo servidor."
+
+    elif action == "remove":
+        name = args.get("name", "").strip()
+        if not name:
+            return "Error: 'name' es requerido para eliminar un servidor."
+        idx = None
+        for i, s in enumerate(mcp_servers):
+            if s["name"] == name:
+                idx = i
+                break
+        if idx is None:
+            return f"Error: no se encontró un servidor llamado '{name}'."
+        removed = mcp_servers.pop(idx)
+        cfg["mcp_servers"] = mcp_servers
+        save_cfg(cfg)
+        return f"Servidor MCP '{name}' eliminado."
+
+    elif action == "modify":
+        name = args.get("name", "").strip()
+        if not name:
+            return "Error: 'name' es requerido para modificar un servidor."
+        idx = None
+        for i, s in enumerate(mcp_servers):
+            if s["name"] == name:
+                idx = i
+                break
+        if idx is None:
+            return f"Error: no se encontró un servidor llamado '{name}'."
+
+        entry = mcp_servers[idx]
+
+        if "transport" in args:
+            entry["transport"] = args["transport"]
+        if "enabled" in args:
+            entry["enabled"] = args["enabled"]
+        if "command" in args:
+            entry["command"] = args["command"]
+        if "args" in args:
+            entry["args"] = args["args"]
+        if "url" in args:
+            entry["url"] = args["url"]
+        if "env" in args:
+            entry["env"] = args["env"]
+        if "headers" in args:
+            entry["headers"] = args["headers"]
+        if "auto_reconnect" in args:
+            entry["auto_reconnect"] = args["auto_reconnect"]
+        if "request_timeout" in args:
+            entry["request_timeout"] = args["request_timeout"]
+
+        cfg["mcp_servers"] = mcp_servers
+        save_cfg(cfg)
+        return f"Servidor MCP '{name}' modificado.\n\nImportante: ejecuta `/mcp reconnect` o reinicia tbot para aplicar los cambios."
+
+    return f"Acción desconocida: '{action}'. Usa list, add, remove, o modify."
+
+
 TOOL_HANDLERS = {
     "invalid": handle_invalid,
     "question": handle_question,
@@ -2377,6 +2767,7 @@ TOOL_HANDLERS = {
     "fact_write": handle_fact_write,
     "fact_remove": handle_fact_remove,
     "episodic_search": handle_episodic_search,
+    "mcp_manage": handle_mcp_manage,
 }
 
 
@@ -3082,6 +3473,7 @@ def default_cfg():
         "memory_facts_limit": 2200,
         "memory_user_limit": 2200,
         "episodic_retention_days": 90,
+        "mcp_servers": [],
     }
 
 
@@ -3799,6 +4191,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
             handler = lambda a, _n=name[6:], _msgs=messages: skill_tool_handler(
                 _n, a, _msgs
             )
+        if not handler and name.startswith("mcp__"):
+            handler = lambda a, _qn=name: handle_mcp_tool_call(_qn, a)
         if not handler:
             result = f"Error: unknown tool '{name}'"
         else:
@@ -4057,6 +4451,20 @@ def _completer(text, state):
         else:
             return None
         return matches[state] if state < len(matches) else None
+
+    # ── /mcp <subcmd> [name] ──
+    if cmd == "mcp":
+        if not args:
+            return None
+        if len(args) == 1:
+            matches = [s + " " for s in _MCP_SUBCMDS if s.startswith(prefix)]
+            return matches[state] if state < len(matches) else None
+        if args[0] in ("connect", "disconnect", "reconnect", "discover") and len(args) > 1:
+            if not _mcp_manager:
+                return None
+            names = [s["name"] + " " for s in _mcp_manager.get_status() if s["name"].startswith(prefix)]
+            return names[state] if state < len(names) else None
+        return None
 
     # ── /episodic <subcmd> ──
     if cmd == "episodic":
@@ -4746,18 +5154,28 @@ def print_help():
     )
     print(f"  /skills            List installed skills")
     print(f"  /skill add|rm|show  Manage skills")
+    print(f"  /mcp               MCP server status")
+    print(f"  /mcp connect|disconnect|reconnect [name]  Manage MCP connections")
+    print(f"  /mcp discover      Rediscover tools/resources from MCP servers")
     print(f"  /commit <msg>      git add -u && git commit -m '<msg>'")
     print(f"  /exit              Quit")
     print(f"  !<command>         Run bash command and save to conversation")
     print()
-    print(f"{C.CYAN}Tools ({len(TOOLS)}):{C.RESET}")
+    mcp_count = len(_get_mcp_tools()) if _HAS_MCP else 0
+    total_tools = len(TOOLS) + mcp_count
+    print(f"{C.CYAN}Tools ({total_tools} total, {len(TOOLS)} built-in, {mcp_count} MCP):{C.RESET}")
     for t in TOOLS:
         fn = t["function"]
         print(
             f"  {C.YELLOW}{fn['name']}{C.RESET}  {C.GRAY}{fn['description'].split('.')[0]}.{C.RESET}"
         )
+    if mcp_count and _mcp_manager:
+        print(f"  {C.GREEN}({mcp_count} MCP tools from {_mcp_manager.connected_count}/{_mcp_manager.total_count} servers){C.RESET}")
     print(
         f"  {C.GRAY}--- skills are injected dynamically via the skill tool ---{C.RESET}"
+    )
+    print(
+        f"  {C.GRAY}--- MCP tools use prefix mcp__<server>__<tool> ---{C.RESET}"
     )
 
 
@@ -5004,6 +5422,12 @@ Skills are loaded in two steps:
   2. `skill_<name>()` — actually loads the skill's instructions into your context
 Call `skill_<name>()` directly if you know the skill exists. Available skills: {skills_list}
 
+# MCP (Model Context Protocol)
+External tools from MCP servers are available with the prefix `mcp__<server>__<tool>`.
+These connect to external services (databases, filesystems, APIs, etc.).
+Use them like any other tool — the MCP server handles the execution.
+MCP resources (if any) are listed below as hints for what data is available.
+
 Before creating, modifying, updating, or fixing any skill (SKILL.md), first load the `skill-guide` skill with `skill_skill-guide()` to get the format reference and best practices.
 
 ═══ MEMORY [{memory_pct}% — {memory_facts_limit} chars max] ═══
@@ -5104,6 +5528,12 @@ def load_system_prompt(cfg):
     for k, v in _env_vars(cfg).items():
         if "{" + k + "}" in data:
             data = data.replace("{" + k + "}", v)
+
+    # Append MCP resource notes if available
+    mcp_notes = _get_mcp_resource_notes()
+    if mcp_notes:
+        data += "\n\n" + mcp_notes
+
     return data
 
 
@@ -5208,6 +5638,10 @@ def main():
         messages.append({"role": "user", "content": args.task})
         send_conversation(messages, cfg)
         return
+
+    # ── MCP initialization ──
+    _init_mcp(cfg)
+    atexit.register(lambda: _mcp_manager.close_all() if _mcp_manager else None)
 
     _log_init()
     atexit.register(_log_close)
@@ -5866,6 +6300,15 @@ Replace this with instructions for the model.
                             print(f"{C.GREEN}{r2.stdout.strip()}{C.RESET}")
                         else:
                             print(f"{C.RED}{r2.stderr.strip()}{C.RESET}")
+            elif cmd == "mcp":
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else "status"
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                result = handle_mcp_command({"action": sub_cmd, "name": sub_arg})
+                if isinstance(result, str):
+                    print(result)
+                else:
+                    print(str(result))
             else:
                 print(f"{C.RED}unknown: /{cmd}{C.RESET}")
             continue
@@ -5919,6 +6362,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             skills = load_skills()
             if skills:
                 tools += skills_to_tools(skills)
+            # MCP tools
+            mcp_tools = _get_mcp_tools()
+            if mcp_tools:
+                tools += mcp_tools
         max_rounds = cfg.get("max_rounds", 200)
         round_n = 0
         retryable_errors = {"connection", "timeout", "ssl", "proxy"}
