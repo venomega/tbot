@@ -3726,6 +3726,31 @@ def _strip_ansi(text):
     return s
 
 
+def _visible_width(s):
+    """Return the visible width of string `s` in a monospace terminal.
+
+    Accounts for:
+    - East Asian Wide (W) and Fullwidth (F) characters → 2 columns
+    - Zero-width characters (combining marks, variation selectors, ZWJ, etc.) → 0 columns
+    - Everything else → 1 column
+    """
+    import unicodedata
+    width = 0
+    for ch in s:
+        cat = unicodedata.category(ch)
+        # Zero-width categories: Mn (Nonspacing Mark), Me (Enclosing Mark),
+        # Cf (Format chars like ZWJ, ZWNJ, variation selectors, soft hyphen),
+        # Cc (Control chars)
+        if cat in ('Mn', 'Me', 'Cf', 'Cc'):
+            continue
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ('W', 'F'):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
 def _render_inline_fmt(text, base_ansi, reset):
     """Apply ANSI formatting for inline markdown elements (bold, italic, code, links)."""
     osc8 = _supports_osc8()
@@ -3817,7 +3842,7 @@ def _render_table(rows, resp_color):
     for kind, cells in parsed:
         for i, cell in enumerate(cells):
             clean = _strip_ansi(cell)
-            widths[i] = max(widths[i], len(clean))
+            widths[i] = max(widths[i], _visible_width(clean))
 
     # Pad all cells to uniform column count
     padded = []
@@ -3845,7 +3870,7 @@ def _render_table(rows, resp_color):
     def _fmt_cell(text, width, is_header=False):
         style = '\033[1m' if is_header else ''
         text_clean = _strip_ansi(text)
-        visible_len = len(text_clean)
+        visible_len = _visible_width(text_clean)
         pad = width - visible_len
         return f" {style}{text}{reset}{' ' * pad} "
 
@@ -4665,12 +4690,18 @@ def _render_selector(models, filtered, query, idx, current_id):
 
 
 def _read_esc(fd):
-    import select
+    try:
+        import select
+    except ImportError:
+        return ""
 
     seq = ""
     for _ in range(8):
-        r, _, _ = select.select([sys.stdin], [], [], 0.2)
-        if not r:
+        try:
+            r, _, _ = select.select([sys.stdin], [], [], 0.2)
+            if not r:
+                break
+        except (ValueError, OSError):
             break
         b = sys.stdin.read(1)
         if not b:
@@ -4680,7 +4711,11 @@ def _read_esc(fd):
 
 
 def model_selector(current_id, api_key, provider="openrouter", custom_url=""):
-    import termios, tty
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: model selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
 
     all_models = fetch_models(api_key, provider=provider, custom_url=custom_url)
     _TBOT_PARAMS = {"temperature", "max_tokens", "tools"}
@@ -4745,7 +4780,11 @@ def model_selector(current_id, api_key, provider="openrouter", custom_url=""):
 
 
 def session_selector():
-    import termios, tty
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: session selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
 
     all_files = sorted(
         [f for f in LOG_DIR.glob("*.log") if f.is_file()],
@@ -4928,7 +4967,11 @@ def _render_provider_selector(providers, filtered, idx, current_id):
 
 
 def provider_selector(current_id):
-    import termios, tty
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: provider selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
 
     providers = {k: v for k, v in PROVIDERS.items()}
     sorted_keys = sorted(providers.keys())
@@ -5072,7 +5115,11 @@ def _render_preset_selector(presets, idx):
 
 
 def preset_selector():
-    import termios, tty
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: preset selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
 
     presets = list_presets()
     if not presets:
@@ -5189,7 +5236,11 @@ def _render_file_selector(files, filtered, query, idx, selected):
 
 
 def file_selector(initial_query=""):
-    import termios, tty
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: file selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
 
     all_files = _collect_files()
     if not all_files:
@@ -5345,6 +5396,7 @@ SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps user
 # Communication Style
 - Output text to communicate with the user; tool results are displayed automatically.
 - Your responses render as GitHub-flavored markdown in a terminal.
+- Use standard GFM pipe tables for tabular data (e.g., `| col1 | col2 |`). Do NOT use Unicode box-drawing characters (┌─┬┐│└┴┘) in your output — they will be rendered automatically by the terminal.
 - Only use emojis if the user explicitly asks. Never use Bash/code comments to communicate.
 - If you cannot help, offer alternatives briefly (1-2 sentences). Explain WHY briefly when it helps the user understand.
 - Reference code as `file_path:line_number` for clickable navigation.
