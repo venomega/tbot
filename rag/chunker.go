@@ -376,17 +376,23 @@ func chunkGoFile(path string) ([]*Chunk, error) {
 }
 
 var (
-	jsFuncRegex     = regexp.MustCompile(`(?:async\s+)?function\s*\*?\s*(\w+)\s*\(`)
-	jsClassRegex    = regexp.MustCompile(`class\s+(\w+)`)
-	jsMethodRegex   = regexp.MustCompile(`(\w+)\s*\([^)]*\)\s*\{`)
-	rustFnRegex     = regexp.MustCompile(`(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)`)
-	rustStructRegex = regexp.MustCompile(`(?:pub\s+)?struct\s+(\w+)`)
-	rustImplRegex   = regexp.MustCompile(`(?:pub\s+)?impl(?:\s*<[^>]*>)?\s+(\w+)`)
-	rustTraitRegex  = regexp.MustCompile(`(?:pub\s+)?trait\s+(\w+)`)
-	mdHeadingRegex  = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
-	chapterRegex    = regexp.MustCompile(`(?i)^(chapter|capítulo|lección|lesson|unit|unidad|parte)\s+\d+`)
-	allCapsLine     = regexp.MustCompile(`^[A-ZÁÉÍÓÚÜÑ\s]{4,}$`)
+	jsFuncRegex      = regexp.MustCompile(`(?:async\s+)?function\s*\*?\s*(\w+)\s*\(`)
+	jsClassRegex     = regexp.MustCompile(`class\s+(\w+)`)
+	jsMethodRegex    = regexp.MustCompile(`(\w+)\s*\([^)]*\)\s*\{`)
+	rustFnRegex      = regexp.MustCompile(`(?:pub\s+)?(?:unsafe\s+)?fn\s+(\w+)`)
+	rustStructRegex  = regexp.MustCompile(`(?:pub\s+)?struct\s+(\w+)`)
+	rustImplRegex    = regexp.MustCompile(`(?:pub\s+)?impl(?:\s*<[^>]*>)?\s+(\w+)`)
+	rustTraitRegex   = regexp.MustCompile(`(?:pub\s+)?trait\s+(\w+)`)
+	mdHeadingRegex   = regexp.MustCompile(`^(#{1,6})\s+(.+)$`)
+	chapterRegex     = regexp.MustCompile(`(?i)^(chapter|capítulo|lección|lesson|unit|unidad|parte)\s+\d+`)
+	allCapsLine      = regexp.MustCompile(`^[A-ZÁÉÍÓÚÜÑ\s]{4,}$`)
+	separatorRegex   = regexp.MustCompile(`^(---|\*\*\*|___)\s*$`)
+	boldTitleRegex   = regexp.MustCompile(`^(\*{1,3}|_{1,3})(.+)(\*{1,3}|_{1,3})\s*$`)
 )
+
+// default chunk size/overlap for documents (can be overridden via CLI)
+var defaultChunkSize = 100
+var defaultOverlap = 50
 
 func chunkJSFile(path string) ([]*Chunk, error) {
 	return chunkBraceFile(path, "javascript", jsFuncRegex, jsClassRegex)
@@ -576,6 +582,35 @@ func extractRustImports(lines []string) []string {
 	return imports
 }
 
+// isSectionHeader checks if a line looks like a section heading.
+// Returns the section name if it is a header, empty string otherwise.
+func isSectionHeader(line string) (bool, string) {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false, ""
+	}
+	// 1. Standard markdown headings: # Title
+	if m := mdHeadingRegex.FindStringSubmatch(line); m != nil {
+		return true, m[2]
+	}
+	// 2. Chapter/part patterns: "Parte 1", "Capítulo 2", "Lección 3", etc.
+	if chapterRegex.MatchString(trimmed) {
+		return true, trimmed
+	}
+	// 3. ALL CAPS lines (longer than 10 chars)
+	if len(trimmed) > 10 && allCapsLine.MatchString(trimmed) {
+		return true, trimmed
+	}
+	// 4. Bold/italic title lines: **Title**, *Title*, __Title__
+	if m := boldTitleRegex.FindStringSubmatch(trimmed); m != nil {
+		inner := strings.TrimSpace(m[2])
+		if len(inner) > 3 {
+			return true, inner
+		}
+	}
+	return false, ""
+}
+
 func chunkMD(path string) ([]*Chunk, error) {
 	src, err := os.ReadFile(path)
 	if err != nil {
@@ -587,8 +622,10 @@ func chunkMD(path string) ([]*Chunk, error) {
 	var headingName string
 
 	for i, line := range lines {
-		m := mdHeadingRegex.FindStringSubmatch(line)
-		if m != nil {
+		trimmed := strings.TrimSpace(line)
+
+		// Check for separator lines: ---, ***, ___
+		if separatorRegex.MatchString(trimmed) {
 			if start < i {
 				text := strings.Join(lines[start-1:i-1], "\n")
 				text = strings.TrimSpace(text)
@@ -605,9 +642,33 @@ func chunkMD(path string) ([]*Chunk, error) {
 				}
 			}
 			start = i + 1
-			headingName = m[2]
+			headingName = "" // separator clears the heading name
+			continue
+		}
+
+		// Check for section headers (markdown headings, chapter patterns, ALL CAPS, bold titles)
+		if isHeader, name := isSectionHeader(line); isHeader {
+			if start < i {
+				text := strings.Join(lines[start-1:i-1], "\n")
+				text = strings.TrimSpace(text)
+				if text != "" {
+					chunks = append(chunks, &Chunk{
+						Path:  path,
+						Start: start,
+						End:   i,
+						Type:  "section",
+						Name:  headingName,
+						Lang:  "markdown",
+						Text:  text,
+					})
+				}
+			}
+			start = i + 1
+			headingName = name
 		}
 	}
+
+	// Last chunk (remaining content after last header)
 	if start <= len(lines) {
 		text := strings.Join(lines[start-1:], "\n")
 		text = strings.TrimSpace(text)
@@ -623,10 +684,116 @@ func chunkMD(path string) ([]*Chunk, error) {
 			})
 		}
 	}
+
+	// Fallback: if no sections found, use paragraph-based splitting
 	if len(chunks) == 0 {
-		return chunkLinear(path, 100, 50)
+		return chunkParagraph(path, defaultChunkSize)
+	}
+
+	// Apply overlap between adjacent chunks if configured
+	if defaultOverlap > 0 {
+		chunks = applyOverlap(chunks, lines, defaultOverlap)
+	}
+
+	return chunks, nil
+}
+
+// chunkParagraph splits a document by double newlines (paragraphs),
+// merging small paragraphs up to minSize lines.
+func chunkParagraph(path string, minSize int) ([]*Chunk, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	content := string(src)
+	paragraphs := strings.Split(content, "\n\n")
+	var chunks []*Chunk
+	line := 1
+	var pending *Chunk
+
+	for _, p := range paragraphs {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			line++ // account for blank line
+			continue
+		}
+		numLines := strings.Count(p, "\n") + 1
+
+		if pending != nil {
+			// Try merging small paragraphs
+			pendingLines := pending.End - pending.Start + 1
+			if pendingLines+numLines <= minSize*2 {
+				// Merge into pending chunk
+				pending.Text = strings.TrimSpace(pending.Text + "\n\n" + p)
+				pending.End = line + numLines - 1
+				line += numLines + 1
+				continue
+			}
+			// Pending is big enough, flush it
+			chunks = append(chunks, pending)
+			pending = nil
+		}
+
+		// Skip very small paragraphs (likely formatting artifacts)
+		if numLines < 3 && len(p) < 80 {
+			line += numLines + 1
+			continue
+		}
+
+		pending = &Chunk{
+			Path:  path,
+			Start: line,
+			End:   line + numLines - 1,
+			Type:  "paragraph",
+			Lang:  "markdown",
+			Text:  p,
+		}
+		line += numLines + 1
+	}
+
+	if pending != nil {
+		chunks = append(chunks, pending)
+	}
+
+	if len(chunks) == 0 {
+		return chunkLinear(path, defaultChunkSize, defaultOverlap)
 	}
 	return chunks, nil
+}
+
+// applyOverlap adds lines from before each chunk as context.
+// The chunk's Start/End metadata remains the same, but the Text
+// includes up to `overlap` extra lines from before the chunk start.
+func applyOverlap(chunks []*Chunk, lines []string, overlap int) []*Chunk {
+	if len(chunks) <= 1 || overlap <= 0 {
+		return chunks
+	}
+	result := make([]*Chunk, len(chunks))
+	for i, c := range chunks {
+		// Extend text backward by up to `overlap` lines
+		textStart := c.Start - overlap
+		if textStart < 1 {
+			textStart = 1
+		}
+		// Don't go earlier than the previous chunk's start (to avoid huge bloat)
+		if i > 0 && textStart < chunks[i-1].Start {
+			textStart = chunks[i-1].Start
+		}
+		text := strings.Join(lines[textStart-1:c.End], "\n")
+		result[i] = &Chunk{
+			Path:    c.Path,
+			Start:   c.Start,
+			End:     c.End,
+			Type:    c.Type,
+			Name:    c.Name,
+			Parent:  c.Parent,
+			Imports: c.Imports,
+			Symbols: c.Symbols,
+			Lang:    c.Lang,
+			Text:    text,
+		}
+	}
+	return result
 }
 
 func chunkTxt(path string) ([]*Chunk, error) {
@@ -696,7 +863,7 @@ func chunkTxt(path string) ([]*Chunk, error) {
 		}
 	}
 	if len(chunks) == 0 {
-		return chunkLinear(path, 100, 50)
+		return chunkLinear(path, defaultChunkSize, defaultOverlap)
 	}
 	return chunks, nil
 }

@@ -19,8 +19,22 @@ func main() {
 	switch cmd {
 	case "index":
 		path := "."
-		if len(os.Args) > 2 {
-			path = os.Args[2]
+		// Parse flags: --chunk-size N --overlap N
+		args := os.Args[2:]
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--chunk-size" && i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil && v > 0 {
+					defaultChunkSize = v
+				}
+				i++
+			} else if args[i] == "--overlap" && i+1 < len(args) {
+				if v, err := strconv.Atoi(args[i+1]); err == nil && v >= 0 {
+					defaultOverlap = v
+				}
+				i++
+			} else {
+				path = args[i]
+			}
 		}
 		abs, err := filepath.Abs(path)
 		if err != nil {
@@ -37,6 +51,7 @@ func main() {
 			os.Exit(1)
 		}
 		fmt.Fprintf(os.Stderr, "Indexing %s...\n", abs)
+		fmt.Fprintf(os.Stderr, "  chunk-size=%d  overlap=%d\n", defaultChunkSize, defaultOverlap)
 		idx, err := indexDir(abs)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "index error: %v\n", err)

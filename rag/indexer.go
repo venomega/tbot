@@ -124,16 +124,45 @@ func indexDir(root string) (*Index, error) {
 
 	bm25Params := buildBM25(allChunks, defaultK1, defaultB)
 
+	// Build a global term → numeric index mapping for compact storage,
+	// and an IDFValues array for O(1) lookup during scoring.
+	termIdx := uint32(0)
+	numTerms := len(bm25Params.IDF)
+	termIndex := make(map[string]uint32, numTerms)
+	idfValues := make([]float64, numTerms)
+	for term := range bm25Params.IDF {
+		termIndex[term] = termIdx
+		idfValues[termIdx] = bm25Params.IDF[term]
+		termIdx++
+	}
+	bm25Params.IDFValues = idfValues
+
 	chunks := make([]*Chunk, len(allChunks))
+	inverted := make(map[string][]int)
 	for i, cd := range allChunks {
+		// Pack term frequencies into compact uint32 slices
+		packed := make([]uint32, 0, len(cd.Freqs))
+		for term, freq := range cd.Freqs {
+			tidx := termIndex[term]
+			if freq > maxPackedFreq {
+				freq = maxPackedFreq // clamp, extremely rare
+			}
+			packed = append(packed, packFreq(tidx, uint32(freq)))
+			// Build inverted index
+			inverted[term] = append(inverted[term], i)
+		}
+		cd.Chunk.PackedFreqs = packed
+		cd.Chunk.NumTokens = len(cd.Tokens)
 		chunks[i] = cd.Chunk
 	}
 
 	idx := &Index{
-		Version:    2,
+		Version:    3,
 		Chunks:     chunks,
 		BM25Params: bm25Params,
 		Files:      fileMTimes,
+		TermIndex:  termIndex,
+		Inverted:   inverted,
 	}
 
 	fmt.Fprintf(os.Stderr, "  Indexed %d files → %d chunks (%d errors)\n", totalFiles, len(chunks), totalErrors)

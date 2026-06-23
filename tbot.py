@@ -784,13 +784,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "rag_search",
-            "description": "Search the codebase index using BM25 (keyword-based, no LLM). Returns relevant code/document chunks as JSON. Call rag_index first if the index doesn't exist.",
+            "description": "Search the RAG index using BM25 (keyword-based, no LLM). Returns relevant chunks with snippet context (the best matching lines with actual text). Call rag_index first if the index doesn't exist. The snippet IS the relevant text — no need to read files separately. Ideal for knowledge base Q&A.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Search query (keywords, function names, concepts)",
+                        "description": "Search query (keywords, function names, concepts, or questions)",
                     },
                     "top_k": {
                         "type": "integer",
@@ -2258,31 +2258,57 @@ def handle_rag_search(args):
     elapsed = time.time() - t0
     if "error" in result:
         return f"Search error: {result['error']}"
+
+    def format_result(r, idx):
+        """Format a single search result with snippet text."""
+        name = r.get("name", "") or ""
+        snippet = r.get("snippet", "") or ""
+        text = r.get("text", "") or ""
+        score = r.get("score", 0)
+        path = r.get("path", "?")
+        start = r.get("start", "?")
+        end = r.get("end", "?")
+        lang = r.get("lang", "")
+        parts = [f"[Resultado {idx}] {path}:{start}-{end} | score={score:.2f}"]
+        if name:
+            parts[0] += f" | «{name}»"
+        if lang:
+            parts[0] += f" ({lang})"
+        # Include snippet (best matching region) — this is what the model needs
+        if snippet:
+            # Truncate very long snippets to avoid context overflow
+            if len(snippet) > 1500:
+                snippet = snippet[:1500] + "\n... [truncated]"
+            parts.append("  ── contexto ──")
+            parts.append(snippet)
+            parts.append("  ─────────────")
+        # Only include full text if no snippet (fallback for old index)
+        elif text:
+            if len(text) > 2000:
+                text = text[:2000] + "\n... [truncated]"
+            parts.append("  ── texto ──")
+            parts.append(text)
+            parts.append("  ───────────")
+        return "\n".join(parts)
+
+    # Case 1: _run_rag already parsed it as list of dicts
     if isinstance(result, list):
         if not result:
-            return f"No results found. ({elapsed:.3f}s)"
-        lines = []
-        for r in result:
-            lines.append(
-                f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
-            )
-        out = "\n".join(lines[:top_k])
-        return f"{out}\n({elapsed:.3f}s)"
+            return f"No se encontraron resultados. ({elapsed:.3f}s)"
+        out = "\n\n".join(format_result(r, i + 1) for i, r in enumerate(result[:top_k]))
+        return f"{out}\n\n({elapsed:.3f}s)"
+
+    # Case 2: raw JSON string that needs parsing
     if "raw" in result:
         raw = result["raw"]
         if raw == "[]":
-            return f"No results found. ({elapsed:.3f}s)"
+            return f"No se encontraron resultados. ({elapsed:.3f}s)"
         try:
             data = json.loads(raw)
             if not data:
-                return f"No results found. ({elapsed:.3f}s)"
-            lines = []
-            for r in data:
-                lines.append(
-                    f"{r.get('path', '?')}:{r.get('start', '?')} score={r.get('score', 0):.1f} [{r.get('type', '?')}] {r.get('name', '')}"
-                )
-            out = "\n".join(lines[:top_k])
-            return f"{out}\n({elapsed:.3f}s)"
+                return f"No se encontraron resultados. ({elapsed:.3f}s)"
+            out = "\n\n".join(format_result(r, i + 1) for i, r in enumerate(data[:top_k]))
+            return f"{out}\n\n({elapsed:.3f}s)"
         except json.JSONDecodeError:
             return raw[:2000]
     return str(result)[:2000]
