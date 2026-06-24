@@ -83,23 +83,34 @@ func main() {
 				topK = v
 			}
 		}
-		if !indexExists() {
-			// Auto-index before search
-			fmt.Fprintf(os.Stderr, "No index found, indexing current directory...\n")
-			idx, err := indexDir(".")
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "index error: %v\n", err)
-				os.Exit(1)
-			}
-			if err := saveIndex(idx); err != nil {
-				fmt.Fprintf(os.Stderr, "save error: %v\n", err)
-				os.Exit(1)
+		var idx *Index
+		if indexExists() {
+			existing, loadErr := loadIndex()
+			if loadErr == nil && existing.Version == indexVersion {
+				idx = existing
+			} else {
+				if loadErr == nil {
+					fmt.Fprintf(os.Stderr, "Index version mismatch (found %d, need %d), rebuilding...\n",
+						existing.Version, indexVersion)
+				} else {
+					fmt.Fprintf(os.Stderr, "Corrupt index, rebuilding...\n")
+				}
+				os.Remove(indexPath())
+				os.Remove(jsonPath())
 			}
 		}
-		idx, err := loadIndex()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "load index: %v\n", err)
-			os.Exit(1)
+		if idx == nil {
+			fmt.Fprintf(os.Stderr, "Indexing current directory...\n")
+			var indexErr error
+			idx, indexErr = indexDir(".")
+			if indexErr != nil {
+				fmt.Fprintf(os.Stderr, "index error: %v\n", indexErr)
+				os.Exit(1)
+			}
+			if saveErr := saveIndex(idx); saveErr != nil {
+				fmt.Fprintf(os.Stderr, "save error: %v\n", saveErr)
+				os.Exit(1)
+			}
 		}
 		result, err := searchIndex(idx, query, topK)
 		if err != nil {

@@ -254,6 +254,8 @@ func chunkGoFile(path string) ([]*Chunk, error) {
 	}
 
 	var chunks []*Chunk
+	// Track type definitions so methods can reference their parent context
+	typeDefs := make(map[string]string)
 
 	// Module header (package + imports + doc)
 	if f.Doc != nil || len(imports) > 0 {
@@ -320,6 +322,8 @@ func chunkGoFile(path string) ([]*Chunk, error) {
 						Lang:    "go",
 						Text:    text,
 					})
+					// Store for method context
+					typeDefs[typeName] = text
 
 				case *ast.ValueSpec:
 					if len(s.Names) == 0 {
@@ -356,6 +360,27 @@ func chunkGoFile(path string) ([]*Chunk, error) {
 			}
 			text := getText(src, fset, d.Pos(), d.End())
 			symbols := []string{d.Name.Name}
+
+			// Prepend parent type header as context for methods
+			if parent != "" {
+				if parentText, ok := typeDefs[parent]; ok {
+					// Include the parent type header (just the first line or two)
+					firstLine := parentText
+					if idx := strings.IndexByte(parentText, '\n'); idx > 0 {
+						firstLine = parentText[:idx]
+					}
+					text = "/* parent: " + parent + " */ " + firstLine + "\n" + text
+				} else if strings.HasPrefix(parent, "*") {
+					// Pointer receiver: try without the *
+					if parentText, ok := typeDefs[parent[1:]]; ok {
+						firstLine := parentText
+						if idx := strings.IndexByte(parentText, '\n'); idx > 0 {
+							firstLine = parentText[:idx]
+						}
+						text = "/* parent: " + parent[1:] + " */ " + firstLine + "\n" + text
+					}
+				}
+			}
 
 			chunks = append(chunks, &Chunk{
 				Path:    path,
@@ -491,7 +516,10 @@ func chunkBraceFile(path, lang string, funcRe, classRe *regexp.Regexp) ([]*Chunk
 
 	var stack []braceBlock
 	depth := 0
-	inClass := false
+
+	// Track class declarations for method context
+	classStack := make([]string, 0) // stack of class names (supports nesting)
+	classText := make(map[string]string) // className → header text
 
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
@@ -511,6 +539,11 @@ func chunkBraceFile(path, lang string, funcRe, classRe *regexp.Regexp) ([]*Chunk
 
 		if blockType != "" {
 			stack = append(stack, braceBlock{name: name, start: i + 1, blockType: blockType, depth: depth})
+			if blockType == "class" {
+				classStack = append(classStack, name)
+				// Store the class declaration line as context
+				classText[name] = trimmed
+			}
 		}
 
 		for _, r := range line {
@@ -530,11 +563,19 @@ func chunkBraceFile(path, lang string, funcRe, classRe *regexp.Regexp) ([]*Chunk
 			if i+1-bb.start >= 3 {
 				chunkType := bb.blockType
 				parent := ""
-				if chunkType == "function" && inClass {
+				if chunkType == "function" && len(classStack) > 0 {
 					chunkType = "method"
-					parent = findClassInRange(lines, bb.start)
+					parent = classStack[len(classStack)-1]
 				}
 				text := strings.Join(lines[bb.start-1:i], "\n")
+
+				// Prepend parent class header as context for methods
+				if parent != "" {
+					if parentText, ok := classText[parent]; ok {
+						text = parentText + "\n" + text
+					}
+				}
+
 				chunks = append(chunks, &Chunk{
 					Path:    path,
 					Start:   bb.start,
@@ -547,10 +588,10 @@ func chunkBraceFile(path, lang string, funcRe, classRe *regexp.Regexp) ([]*Chunk
 					Text:    text,
 				})
 			}
-		}
-
-		if classMatch != nil {
-			inClass = true
+			// Pop from class stack when class block ends
+			if bb.blockType == "class" && len(classStack) > 0 && classStack[len(classStack)-1] == bb.name {
+				classStack = classStack[:len(classStack)-1]
+			}
 		}
 	}
 

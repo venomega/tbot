@@ -9,6 +9,10 @@ import (
 	"sync"
 )
 
+// Current index version. Increment when tokenization/index format changes
+// so stale indices are automatically rebuilt.
+const indexVersion = 4
+
 func shouldSkip(name string) bool {
 	skipDirs := map[string]bool{
 		".git": true, ".svn": true, ".hg": true, "node_modules": true,
@@ -25,6 +29,8 @@ func shouldSkip(name string) bool {
 	return false
 }
 
+// indexDir indexes a directory, with incremental support.
+// If an existing index is found for the same root, only changed files are re-indexed.
 func indexDir(root string) (*Index, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
@@ -38,7 +44,12 @@ func indexDir(root string) (*Index, error) {
 		return nil, fmt.Errorf("%s is not a directory", root)
 	}
 
-	var files []string
+	// ── Paso 1: Escanear árbol de archivos ──
+	type fileInfo struct {
+		path  string
+		mtime int64
+	}
+	var currentFiles []fileInfo
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -52,48 +63,121 @@ func indexDir(root string) (*Index, error) {
 		if info.Size() == 0 || info.Size() > 500*1024 {
 			return nil
 		}
-		files = append(files, path)
+		currentFiles = append(currentFiles, fileInfo{
+			path:  path,
+			mtime: info.ModTime().Unix(),
+		})
 		return nil
 	})
 
+	// ── Paso 2: Cargar índice existente (si hay) para diff incremental ──
+	var existingIdx *Index
+	existingFileMTimes := make(map[string]int64)
+
+	if indexExists() {
+		existingIdx, err = loadIndex()
+		if err == nil && existingIdx.RootPath == root && existingIdx.Version == indexVersion {
+			existingFileMTimes = existingIdx.Files
+		} else {
+			existingIdx = nil // incompatible or error, rebuild from scratch
+		}
+	}
+
+	// ── Paso 3: Determinar qué archivos procesar ──
+	type workItem struct {
+		path  string
+		rel   string
+		mtime int64
+	}
+
+	// Pre-computar rel paths para búsqueda rápida
+	currentRelPaths := make(map[string]int64, len(currentFiles))
+	for _, f := range currentFiles {
+		rel, _ := filepath.Rel(root, f.path)
+		currentRelPaths[rel] = f.mtime
+	}
+
+	var toProcess []workItem
+	var unchangedRelPaths []string // archivos que podemos reusar del índice anterior
+
+	if existingIdx != nil {
+		for _, f := range currentFiles {
+			rel, _ := filepath.Rel(root, f.path)
+			oldMtime, exists := existingFileMTimes[rel]
+			if exists && oldMtime == f.mtime {
+				unchangedRelPaths = append(unchangedRelPaths, rel)
+			} else {
+				toProcess = append(toProcess, workItem{
+					path:  f.path,
+					rel:   rel,
+					mtime: f.mtime,
+				})
+			}
+		}
+		// Detectar archivos eliminados (log solo)
+		for rel := range existingFileMTimes {
+			if _, stillExists := currentRelPaths[rel]; !stillExists {
+				fmt.Fprintf(os.Stderr, "  [incremental] %s deleted, will be removed\n", rel)
+			}
+		}
+	} else {
+		for _, f := range currentFiles {
+			rel, _ := filepath.Rel(root, f.path)
+			toProcess = append(toProcess, workItem{
+				path:  f.path,
+				rel:   rel,
+				mtime: f.mtime,
+			})
+		}
+	}
+
+	// ── Paso 4: Chunkear y tokenizar archivos nuevos/modificados ──
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 1 {
 		numWorkers = 1
 	}
 
-	type result struct {
-		path   string
+	type chunkResult struct {
+		rel    string
 		chunks []*Chunk
 		err    error
 	}
 
-	work := make(chan string, len(files))
-	results := make(chan result, len(files))
+	work := make(chan workItem, len(toProcess))
+	results := make(chan chunkResult, len(toProcess))
 	var wg sync.WaitGroup
 
 	for w := 0; w < numWorkers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for path := range work {
-				chunks, err := chunkFile(path)
-				results <- result{path: path, chunks: chunks, err: err}
+			for item := range work {
+				chunks, err := chunkFile(item.path)
+				if err == nil && len(chunks) > 0 {
+					// Set relative paths
+					for _, c := range chunks {
+						c.Path = item.rel
+					}
+				}
+				results <- chunkResult{rel: item.rel, chunks: chunks, err: err}
 			}
 		}()
 	}
 
-	for _, f := range files {
-		work <- f
+	for _, item := range toProcess {
+		work <- item
 	}
 	close(work)
 	wg.Wait()
 	close(results)
 
+	// ── Paso 5: Ensamblar todos los chunks ──
 	var allChunks []*chunkData
 	fileMTimes := make(map[string]int64)
-	totalFiles := 0
+	totalNewFiles := 0
 	totalErrors := 0
 
+	// 5a: Chunks nuevos/modificados
 	for r := range results {
 		if r.err != nil {
 			totalErrors++
@@ -102,12 +186,8 @@ func indexDir(root string) (*Index, error) {
 		if len(r.chunks) == 0 {
 			continue
 		}
-		totalFiles++
-		rel, _ := filepath.Rel(root, r.path)
+		totalNewFiles++
 		for _, c := range r.chunks {
-			if rel != "" {
-				c.Path = rel
-			}
 			tokens := tokenize(c.Text)
 			freqs := countTokens(tokens)
 			allChunks = append(allChunks, &chunkData{
@@ -116,16 +196,51 @@ func indexDir(root string) (*Index, error) {
 				Freqs:  freqs,
 			})
 		}
-		info, err := os.Stat(r.path)
-		if err == nil {
-			fileMTimes[rel] = info.ModTime().Unix()
+		// Buscar el mtime original
+		for _, item := range toProcess {
+			if item.rel == r.rel {
+				fileMTimes[r.rel] = item.mtime
+				break
+			}
 		}
 	}
 
+	// 5b: Chunks sin cambios (reusados del índice anterior)
+	// Como el tokenizer cambió (versión 4), necesitamos re-tokenizar los chunks
+	// existentes. Esto es mucho más barato que re-chunkear (solo O(texto) vs. AST).
+	if existingIdx != nil && len(unchangedRelPaths) > 0 {
+		// Construir mapa {relPath → []*Chunk} para lookup O(1)
+		chunksByRel := make(map[string][]*Chunk)
+		for _, c := range existingIdx.Chunks {
+			chunksByRel[c.Path] = append(chunksByRel[c.Path], c)
+		}
+
+		for _, rel := range unchangedRelPaths {
+			mtime, ok := existingFileMTimes[rel]
+			if !ok {
+				continue
+			}
+			for _, c := range chunksByRel[rel] {
+				tokens := tokenize(c.Text)
+				freqs := countTokens(tokens)
+				allChunks = append(allChunks, &chunkData{
+					Chunk:  c,
+					Tokens: tokens,
+					Freqs:  freqs,
+				})
+			}
+			fileMTimes[rel] = mtime
+		}
+	}
+
+	if len(allChunks) == 0 {
+		return nil, fmt.Errorf("no files indexed (0 chunks)")
+	}
+
+	// ── Paso 6: Construir BM25 params ──
 	bm25Params := buildBM25(allChunks, defaultK1, defaultB)
 
-	// Build a global term → numeric index mapping for compact storage,
-	// and an IDFValues array for O(1) lookup during scoring.
+	// ── Paso 7: Construir term index e inverted index ──
 	termIdx := uint32(0)
 	numTerms := len(bm25Params.IDF)
 	termIndex := make(map[string]uint32, numTerms)
@@ -140,15 +255,13 @@ func indexDir(root string) (*Index, error) {
 	chunks := make([]*Chunk, len(allChunks))
 	inverted := make(map[string][]int)
 	for i, cd := range allChunks {
-		// Pack term frequencies into compact uint32 slices
 		packed := make([]uint32, 0, len(cd.Freqs))
 		for term, freq := range cd.Freqs {
 			tidx := termIndex[term]
 			if freq > maxPackedFreq {
-				freq = maxPackedFreq // clamp, extremely rare
+				freq = maxPackedFreq
 			}
 			packed = append(packed, packFreq(tidx, uint32(freq)))
-			// Build inverted index
 			inverted[term] = append(inverted[term], i)
 		}
 		cd.Chunk.PackedFreqs = packed
@@ -157,7 +270,8 @@ func indexDir(root string) (*Index, error) {
 	}
 
 	idx := &Index{
-		Version:    3,
+		Version:    indexVersion,
+		RootPath:   root,
 		Chunks:     chunks,
 		BM25Params: bm25Params,
 		Files:      fileMTimes,
@@ -165,6 +279,8 @@ func indexDir(root string) (*Index, error) {
 		Inverted:   inverted,
 	}
 
-	fmt.Fprintf(os.Stderr, "  Indexed %d files → %d chunks (%d errors)\n", totalFiles, len(chunks), totalErrors)
+	totalFiles := totalNewFiles + len(unchangedRelPaths)
+	fmt.Fprintf(os.Stderr, "  Indexed %d files → %d chunks (%d new, %d cached, %d errors)\n",
+		totalFiles, len(chunks), totalNewFiles, len(unchangedRelPaths), totalErrors)
 	return idx, nil
 }
