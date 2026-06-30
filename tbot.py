@@ -3753,32 +3753,92 @@ def _strip_ansi(text):
 
 
 def _visible_width(s):
-    """Return the visible width of string `s` in a monospace terminal.
+    """Return the visible width of string ``s`` in a monospace terminal.
 
-    Accounts for:
-    - East Asian Wide (W) and Fullwidth (F) characters → 2 columns
-    - Zero-width characters (combining marks, variation selectors, ZWJ, etc.) → 0 columns
-    - Everything else → 1 column
+    Follows the same general rules as the standard ``wcwidth`` library, with
+    additional heuristics for emoji that are rendered as double-width even
+    when their East-Asian Width property is Neutral or Ambiguous.
+
+    Rules applied (in order of precedence):
+      1. ANSI escape sequences are stripped first (width 0).
+      2. C0 controls (U+0000–U+001F) → 0
+         (Tab U+0009 is counted as 0; the terminal handles cursor movement.)
+      3. DEL (U+007F) and C1 controls (U+0080–U+009F) → 0
+      4. Surrogates (U+D800–U+DFFF) → 0 (*should* never appear in valid text)
+      5. Combining marks (Mn, Me) → 0
+         (Includes all variation selectors: VS1–VS16, VS17–VS256.)
+      6. Format characters (Cf) → 0
+         (ZWJ, ZWNJ, LRM, RLM, soft hyphen, interlinear annotation, tags, etc.)
+      7. Line/paragraph separators (Zl, Zp) → 0
+      8. Hangul Jamo fillers U+115F (initial) and U+1160 (medial) → 0
+      9. East-Asian Wide (W) or Fullwidth (F) → 2
+     10. Neutral (N) or Ambiguous (A) characters *followed by* U+FE0F
+         (Variation Selector-16, which requests emoji presentation) → 2
+     11. Space separators (Zs) → 1 (even NBSP and other fixed spaces)
+     12. Everything else → 1
     """
     import unicodedata
+    s = _strip_ansi(s)          # invisible ANSI sequences → 0 width
     width = 0
-    for ch in s:
-        cat = unicodedata.category(ch)
-        # Zero-width categories: Mn (Nonspacing Mark), Me (Enclosing Mark),
-        # Cf (Format chars like ZWJ, ZWNJ, variation selectors, soft hyphen),
-        # Cc (Control chars)
-        if cat in ('Mn', 'Me', 'Cf', 'Cc'):
+    i = 0
+    while i < len(s):
+        cp = ord(s[i])
+        cat = unicodedata.category(s[i])
+
+        # ── always-zero categories ──────────────────────────────
+        if cat in ('Mn', 'Me', 'Cf'):            # combining marks, format chars
+            i += 1
             continue
-        eaw = unicodedata.east_asian_width(ch)
+        if cat in ('Cc', 'Cs', 'Zl', 'Zp'):       # controls, surrogates, separators
+            i += 1
+            continue
+
+        # ── Hangul Jamo fillers (invisible in modern usage) ─────
+        if cp in (0x115F, 0x1160):
+            i += 1
+            continue
+
+        # ── East-Asian Width check ──────────────────────────────
+        eaw = unicodedata.east_asian_width(s[i])
         if eaw in ('W', 'F'):
             width += 2
-        else:
+            i += 1
+            continue
+
+        # ── Emoji with explicit VS16 (U+FE0F) ──────────────────
+        # Many characters with EAW=N or EAW=A are rendered as
+        # double-width emoji when followed by the variation selector.
+        if eaw in ('N', 'A') and i + 1 < len(s) and s[i + 1] == '\ufe0f':
+            width += 2
+            # Also consume the VS16 (it is Mn and would be skipped anyway)
+            i += 2
+            continue
+
+        # ── Space separators (Zs) ──────────────────────────────
+        # NBSP, en-space, em-space, etc. – all take 1 column.
+        if cat == 'Zs':
             width += 1
+            i += 1
+            continue
+
+        # ── Default: 1 column ───────────────────────────────────
+        width += 1
+        i += 1
+
     return width
 
 
 def _render_inline_fmt(text, base_ansi, reset):
-    """Apply ANSI formatting for inline markdown elements (bold, italic, code, links)."""
+    """Apply ANSI formatting for inline markdown elements (bold, italic, code, links).
+
+    NOTE: The ``osc8=False`` link path does NOT emit OSC-8 hyperlink escape sequences,
+    because some terminals/ pipelines may strip the ESC byte and leave raw ``]8;;…``
+    visible in table cells.  Without OSC-8 the link text is simply underlined + the URL
+    is shown in gray.
+    """
+    # Strip any pre-existing ANSI escapes (model might inject raw OSC-8, etc.)
+    text = _strip_ansi(text)
+
     osc8 = _supports_osc8()
     # Inline code: `code`
     text = re.sub(r'`([^`]+)`', rf'\033[33m\1{reset}{base_ansi}', text)
@@ -3795,17 +3855,20 @@ def _render_inline_fmt(text, base_ansi, reset):
     # Subscript: ~text~ and HTML <sub>text</sub> (avoid ~~strikethrough~~)
     text = re.sub(r'(?<!~)~(?!~)(.+?)(?<!~)~(?!~)', rf'\033[34m\1{reset}{base_ansi}', text)
     text = re.sub(r'<sub>(.+?)</sub>', rf'\033[34m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
-    # Links: [text](url) — OSC 8 label + bare URL fallback only if terminal lacks OSC 8
+    # Links: [text](url)
     if osc8:
+        # OSC-8 hyperlink – terminal will render the link clickable
         text = re.sub(
             r'\[([^\]]+)\]\(([^)]+)\)',
             rf'\033]8;;\2\033\\\033[4;34m\1{reset}{base_ansi}\033]8;;\033\\',
             text,
         )
     else:
+        # No OSC-8: just show underlined text + gray URL (no escape sequences
+        # that could become visible garbage on terminals that strip ESC bytes)
         text = re.sub(
             r'\[([^\]]+)\]\(([^)]+)\)',
-            rf'\033]8;;\2\033\\\033[4;34m\1{reset}{base_ansi}\033]8;;\033\\ \033[90m\2{reset}{base_ansi}',
+            rf'\033[4;34m\1{reset}{base_ansi} \033[90m\2{reset}{base_ansi}',
             text,
         )
     # Strikethrough: ~~text~~
