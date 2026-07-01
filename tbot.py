@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tbot - Terminal chatbot for OpenRouter with PC tool support."""
 
-import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, signal, threading
+import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, threading
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
 import requests
@@ -4670,17 +4670,14 @@ def save_history():
 
 
 def _setup_sigwinch():
-    """Handle terminal resize (SIGWINCH) so readline redraws correctly."""
-    if readline is None:
-        return
-
-    def _on_resize(sig, action):
-        try:
-            readline.redisplay()
-        except Exception:
-            pass
-
-    signal.signal(signal.SIGWINCH, _on_resize)
+    """Handle terminal resize (SIGWINCH) so readline redraws correctly.
+    
+    Python's readline module installs its own SIGWINCH handler that calls
+    rl_resize_terminal() + rl_redisplay(). We do NOT override it — doing so
+    would skip rl_resize_terminal(), causing readline to use stale dimensions
+    and corrupt the screen on history navigation after resize.
+    """
+    pass
 
 
 def show_banner(cfg):
