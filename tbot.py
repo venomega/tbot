@@ -1290,6 +1290,30 @@ def _list_outputs(cmd, cwd):
     return "\n" + "\n".join(lines) if lines else ""
 
 
+def _save_termios():
+    """Save current terminal settings so they can be restored later."""
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        if os.isatty(fd):
+            return (fd, termios.tcgetattr(fd))
+    except (OSError, ImportError, termios.error, ValueError):
+        pass
+    return None
+
+
+def _restore_termios(state):
+    """Restore terminal settings previously saved with _save_termios()."""
+    if state is None:
+        return
+    fd, attrs = state
+    try:
+        import termios
+        termios.tcsetattr(fd, termios.TCSADRAIN, attrs)
+    except (OSError, ImportError, termios.error):
+        pass
+
+
 def handle_bash(args):
     cmd = _pick(args, "command", "cmd")
     if not cmd:
@@ -1299,10 +1323,16 @@ def handle_bash(args):
     workdir = args.get("workdir")
     timeout_s = timeout_ms / 1000
     cwd = str(_resolve_path(workdir)) if workdir else str(CURRENT_DIR)
+    # Save terminal state before running the command. This prevents commands
+    # that mess with termios (e.g. passwd, ssh) from leaving the terminal in a
+    # broken state when they time out or crash.
+    saved_term = _save_termios()
     try:
         r = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=cwd
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout_s, cwd=cwd,
+            stdin=subprocess.DEVNULL
         )
+        _restore_termios(saved_term)
         out = r.stdout
         if r.stderr:
             out += "\n--- stderr ---\n" + r.stderr
@@ -1313,8 +1343,10 @@ def handle_bash(args):
         result = out.strip() or f"(no output)  [exit {r.returncode}]"
         return _truncate_output(result + f"\n\n<cwd>{CURRENT_DIR}</cwd>")
     except subprocess.TimeoutExpired:
+        _restore_termios(saved_term)
         return f"Command timed out after {timeout_s}s (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
     except Exception as e:
+        _restore_termios(saved_term)
         return f"Error: {e} (exit: -1)\n\n<cwd>{CURRENT_DIR}</cwd>"
 
 
@@ -3543,9 +3575,11 @@ def resolve_key(cfg):
 
 
 def show_error(title, detail, hint=""):
-    width = min(
-        72, os.get_terminal_size().columns if hasattr(os, "get_terminal_size") else 72
-    )
+    try:
+        cols = os.get_terminal_size().columns if hasattr(os, "get_terminal_size") else 72
+    except (OSError, ValueError):
+        cols = 72
+    width = min(72, cols)
     print(f"\n{C.RED}╭─{'─' * (width - 4)}─╮{C.RESET}")
     print(
         f"{C.RED}│{C.RESET} {C.BOLD}{C.RED}✗ {title}{C.RESET}{' ' * (width - len(title) - 7)}{C.RED}│{C.RESET}"
