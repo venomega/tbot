@@ -1007,6 +1007,99 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "runner_control",
+            "description": "Start, stop, pause, or resume the task runner daemon. The runner polls for pending/review tasks and executes them automatically.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["start", "stop", "pause", "resume"],
+                        "description": "start=iniciar runner en background, stop=detener, pause=pausar, resume=reanudar"
+                    }
+                },
+                "required": ["action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "runner_status",
+            "description": "Get runner daemon status (alive/paused/stopped) and task counts by status (pending/running/review/completed/failed).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "json": {
+                        "type": "boolean",
+                        "description": "Return detailed JSON with all task IDs"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "runner_task",
+            "description": "Create a new task for the runner. The runner will execute it (doer phase) and optionally review it (if reviewer_agent is set).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "The task prompt/instructions for the LLM"
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": "Name of the agent (system prompt) to use as doer"
+                    },
+                    "reviewer_agent": {
+                        "type": "string",
+                        "description": "Name of the agent to use as reviewer (enables review phase)"
+                    },
+                    "eval_criteria": {
+                        "type": "string",
+                        "description": "Evaluation criteria for the result (checked before review)"
+                    },
+                    "type": {
+                        "type": "string",
+                        "enum": ["onehot", "idle"],
+                        "description": "Task type: onehot (run once) or idle (run on interval)"
+                    },
+                    "interval_secs": {
+                        "type": "integer",
+                        "description": "Interval in seconds for idle tasks (default: 300)"
+                    },
+                    "retries": {
+                        "type": "integer",
+                        "description": "Maximum retries (default: 3)"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "runner_task_status",
+            "description": "Get full details of a specific task including result, evaluation, review_result, and review_evaluation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "The task ID (full or prefix)"
+                    }
+                },
+                "required": ["task_id"]
+            }
+        }
+    },
 ]
 
 # ── Project directory context ────────────────────────────────
@@ -2778,6 +2871,232 @@ def handle_mcp_manage(args):
     return f"Acción desconocida: '{action}'. Usa list, add, remove, o modify."
 
 
+# ── Runner (task runner) tools ────────────────────────────────
+
+_RUNNER_PID = None  # track runner subprocess if started from here
+
+
+def _get_runner_status_text():
+    """Get human-readable runner status."""
+    try:
+        import runner as _runner_mod
+        storage = _runner_mod.Storage()
+        tasks = storage.list_tasks()
+        counts = {}
+        for t in tasks:
+            s = t.get("status", "?")
+            counts[s] = counts.get(s, 0) + 1
+
+        pid_file = _runner_mod.PID_FILE
+        paused_file = _runner_mod.PAUSED_FILE
+
+        alive = False
+        if pid_file.exists():
+            try:
+                pid = int(pid_file.read_text().strip())
+                os.kill(pid, 0)
+                alive = True
+            except (OSError, ValueError, ProcessLookupError):
+                pass
+
+        paused = paused_file.exists()
+        return alive, paused, counts
+    except Exception as e:
+        return False, False, {}
+
+
+def handle_runner_control(args):
+    action = args.get("action", "")
+    try:
+        import subprocess
+        import signal
+        from datetime import datetime, timezone
+        import runner as _runner_mod
+
+        runner_py = str(Path(__file__).resolve().parent / "runner.py")
+
+        if action == "start":
+            # Check if already running
+            alive, _, _ = _get_runner_status_text()
+            if alive:
+                return "El runner ya está activo."
+
+            # Start in background
+            log_dir = _runner_mod.RUNNER_DIR
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_file = str(log_dir / "runner-nohup.log")
+            proc = subprocess.Popen(
+                [sys.executable, runner_py, "run", "--interval", "10"],
+                stdout=open(log_file, "a"),
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            global _RUNNER_PID
+            _RUNNER_PID = proc.pid
+            return f"Runner iniciado (pid {proc.pid}). Usa runner_status para verificar."
+
+        elif action == "stop":
+            if _RUNNER_PID:
+                try:
+                    os.kill(_RUNNER_PID, signal.SIGTERM)
+                    _RUNNER_PID = None
+                    return "Runner detenido (vía PID tracking)."
+                except ProcessLookupError:
+                    _RUNNER_PID = None
+
+            # Fallback: try PID file
+            pid_file = _runner_mod.PID_FILE
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    os.kill(pid, signal.SIGTERM)
+                    return f"Runner detenido (pid {pid})."
+                except (OSError, ValueError, ProcessLookupError):
+                    return "Runner no estaba activo."
+            return "Runner no estaba activo."
+
+        elif action == "pause":
+            _runner_mod.PAUSED_FILE.write_text(
+                datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            )
+            _runner_mod.Storage().pause_all()
+            return "Runner pausado. Las tareas pendientes/review se reanudarán al hacer resume."
+
+        elif action == "resume":
+            _runner_mod.PAUSED_FILE.unlink(missing_ok=True)
+            _runner_mod.Storage().resume_all()
+            return "Runner reanudado."
+
+        return f"Acción desconocida: '{action}'. Usa start, stop, pause, o resume."
+
+    except Exception as e:
+        return f"Error en runner_control: {e}"
+
+
+def handle_runner_status(args):
+    try:
+        alive, paused, counts = _get_runner_status_text()
+
+        lines = []
+        if not alive and not paused:
+            lines.append("Runner: INACTIVO")
+        elif alive and paused:
+            lines.append("Runner: ACTIVO (PAUSADO)")
+        elif alive:
+            lines.append("Runner: ACTIVO")
+        else:
+            lines.append("Runner: INACTIVO (paused file exists)")
+
+        if counts:
+            lines.append("")
+            lines.append("Tareas:")
+            for status in ("pending", "running", "review", "completed", "failed", "paused"):
+                c = counts.get(status, 0)
+                if c > 0:
+                    lines.append(f"  {status}: {c}")
+            lines.append(f"  total: {sum(counts.values())}")
+
+        if args.get("json"):
+            import json
+            import runner as _runner_mod
+            data = {"alive": alive, "paused": paused, "counts": counts}
+            if alive:
+                data["tasks"] = _runner_mod.Storage().list_tasks()
+            return json.dumps(data, indent=2, ensure_ascii=False)
+
+        return "\n".join(lines) if lines else "Runner: INACTIVO (sin datos)"
+
+    except Exception as e:
+        return f"Error obteniendo estado del runner: {e}"
+
+
+def handle_runner_task(args):
+    try:
+        import runner as _runner_mod
+        storage = _runner_mod.Storage()
+        now = _runner_mod._ts()
+        task = {
+            "id": _runner_mod._new_id(),
+            "type": args.get("type", "onehot"),
+            "status": "pending",
+            "prompt": args["prompt"],
+            "agent": args.get("agent"),
+            "interval_secs": args.get("interval_secs", 300),
+            "last_run": None,
+            "next_run": now,
+            "created_at": now,
+            "completed_at": None,
+            "result": None,
+            "evaluation": None,
+            "retries": 0,
+            "max_retries": args.get("retries", 3),
+            "tags": [],
+            "evaluation_criteria": args.get("eval_criteria"),
+            "reviewer_agent": args.get("reviewer_agent"),
+            "review_prompt": None,
+            "review_result": None,
+            "review_evaluation": None,
+        }
+        storage.add_task(task)
+        return (
+            f"Tarea creada: {task['id']}\n"
+            f"  Prompt: {args['prompt'][:80]}...\n"
+            f"  Tipo: {task['type']}\n"
+            + (f"  Revisor: {args['reviewer_agent']}\n" if args.get("reviewer_agent") else "")
+            + "\nUsa runner_status para monitorear, runner_task_status con el ID para ver resultado."
+        )
+    except Exception as e:
+        return f"Error creando tarea: {e}"
+
+
+def handle_runner_task_status(args):
+    task_id = args.get("task_id", "")
+    try:
+        import runner as _runner_mod
+        storage = _runner_mod.Storage()
+
+        # Try exact match first, then prefix match
+        task = storage.get_task(task_id)
+        if not task:
+            tasks = storage.list_tasks()
+            matches = [t for t in tasks if t["id"].startswith(task_id)]
+            if len(matches) == 1:
+                task = matches[0]
+            elif len(matches) > 1:
+                return f"Múltiples tareas coinciden con '{task_id}':\n" + "\n".join(
+                    f"  {t['id'][:20]} [{t.get('status','?')}] {t.get('prompt','')[:60]}"
+                    for t in matches
+                )
+            else:
+                return f"Tarea no encontrada: {task_id}"
+
+        # Build summary
+        lines = [
+            f"ID:      {task['id']}",
+            f"Estado:  {task.get('status', '?')}",
+            f"Tipo:    {task.get('type', '?')}",
+            f"Prompt:  {task.get('prompt', '')[:120]}",
+        ]
+        if task.get("agent"):
+            lines.append(f"Agente:  {task['agent']}")
+        if task.get("reviewer_agent"):
+            lines.append(f"Revisor: {task['reviewer_agent']}")
+            if task.get("review_evaluation"):
+                lines.append(f"Review:  {task['review_evaluation'][:200]}")
+        if task.get("evaluation"):
+            lines.append(f"Eval:    {task['evaluation'][:200]}")
+        if task.get("result"):
+            lines.append(f"Result:  {task['result'][:300]}")
+        if task.get("retries", 0) > 0:
+            lines.append(f"Retries: {task['retries']}/{task.get('max_retries', 3)}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"Error obteniendo tarea: {e}"
+
+
 TOOL_HANDLERS = {
     "invalid": handle_invalid,
     "question": handle_question,
@@ -2801,6 +3120,10 @@ TOOL_HANDLERS = {
     "fact_remove": handle_fact_remove,
     "episodic_search": handle_episodic_search,
     "mcp_manage": handle_mcp_manage,
+    "runner_control": handle_runner_control,
+    "runner_status": handle_runner_status,
+    "runner_task": handle_runner_task,
+    "runner_task_status": handle_runner_task_status,
 }
 
 
