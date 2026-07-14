@@ -4192,27 +4192,19 @@ def _render_inline_fmt(text, base_ansi, reset):
     because some terminals/ pipelines may strip the ESC byte and leave raw ``]8;;…``
     visible in table cells.  Without OSC-8 the link text is simply underlined + the URL
     is shown in gray.
+
+    Order matters: links are processed FIRST (before bold/italic/code) because those
+    other elements insert ANSI codes containing literal ``[`` characters. If the link
+    regex runs later, it mistakes ``[`` inside ``\033[95m`` for a markdown link opening
+    bracket, corrupting the output.
     """
     # Strip any pre-existing ANSI escapes (model might inject raw OSC-8, etc.)
     text = _strip_ansi(text)
 
     osc8 = _supports_osc8()
-    # Inline code: `code`
-    text = re.sub(r'`([^`]+)`', rf'\033[33m\1{reset}{base_ansi}', text)
-    # Bold: **text** or __text__
-    text = re.sub(r'\*\*(.+?)\*\*', rf'\033[1m\1{reset}{base_ansi}', text)
-    text = re.sub(r'__(.+?)__', rf'\033[1m\1{reset}{base_ansi}', text)
-    # Italic: *text* (single asterisk)
-    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', rf'\033[3m\1{reset}{base_ansi}', text)
-    # Italic: _text_ (word boundaries)
-    text = re.sub(r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', rf'\033[3m\1{reset}{base_ansi}', text)
-    # Superscript: ^text^ and HTML <sup>text</sup>
-    text = re.sub(r'\^(.+?)\^', rf'\033[33m\1{reset}{base_ansi}', text)
-    text = re.sub(r'<sup>(.+?)</sup>', rf'\033[33m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
-    # Subscript: ~text~ and HTML <sub>text</sub> (avoid ~~strikethrough~~)
-    text = re.sub(r'(?<!~)~(?!~)(.+?)(?<!~)~(?!~)', rf'\033[34m\1{reset}{base_ansi}', text)
-    text = re.sub(r'<sub>(.+?)</sub>', rf'\033[34m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
-    # Links: [text](url)
+    # ── Links FIRST (before any other formatting) ────────────────
+    # Links are processed first because bold/italic/code insert ANSI codes
+    # like \033[95m whose '[' would confuse the link regex.
     if osc8:
         # OSC-8 hyperlink – terminal will render the link clickable
         text = re.sub(
@@ -4228,6 +4220,21 @@ def _render_inline_fmt(text, base_ansi, reset):
             rf'\033[4;34m\1{reset}{base_ansi} \033[90m\2{reset}{base_ansi}',
             text,
         )
+    # Inline code: `code`
+    text = re.sub(r'`([^`]+)`', rf'\033[33m\1{reset}{base_ansi}', text)
+    # Bold: **text** or __text__
+    text = re.sub(r'\*\*(.+?)\*\*', rf'\033[1m\1{reset}{base_ansi}', text)
+    text = re.sub(r'__(.+?)__', rf'\033[1m\1{reset}{base_ansi}', text)
+    # Italic: *text* (single asterisk)
+    text = re.sub(r'(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)', rf'\033[3m\1{reset}{base_ansi}', text)
+    # Italic: _text_ (word boundaries)
+    text = re.sub(r'(?<!\w)_(?!_)(.+?)(?<!_)_(?!\w)', rf'\033[3m\1{reset}{base_ansi}', text)
+    # Superscript: ^text^ and HTML <sup>text</sup>
+    text = re.sub(r'\^(.+?)\^', rf'\033[33m\1{reset}{base_ansi}', text)
+    text = re.sub(r'<sup>(.+?)</sup>', rf'\033[33m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
+    # Subscript: ~text~ and HTML <sub>text</sub> (avoid ~~strikethrough~~)
+    text = re.sub(r'(?<!~)~(?!~)(.+?)(?<!~)~(?!~)', rf'\033[34m\1{reset}{base_ansi}', text)
+    text = re.sub(r'<sub>(.+?)</sub>', rf'\033[34m\1{reset}{base_ansi}', text, flags=re.IGNORECASE)
     # Strikethrough: ~~text~~
     text = re.sub(r'~~(.+?)~~', rf'\033[9m\1{reset}{base_ansi}', text)
     return text
@@ -6978,6 +6985,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     while len(messages) > before_tc:
                         messages.pop()
                     break
+
+                # todowrite resets the tool-only round counter (signals progress)
+                if any(tc["function"]["name"] == "todowrite" for tc in tool_calls):
+                    tool_only_rounds = 0
 
                 # --- stuck round detection (todowrite loops) ---
                 last_n = min(len(tool_calls), len(messages))
