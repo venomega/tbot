@@ -4,6 +4,7 @@
 import os, sys, json, time, subprocess, platform, re, html, socket, urllib.parse, base64, functools, threading
 import argparse, textwrap, atexit, tempfile, shutil, shlex
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 try:
@@ -1100,6 +1101,41 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "parallel_execute",
+            "description": "Execute multiple read-only tool calls in parallel for faster results. Use when you need to read/search multiple files or resources simultaneously. Only works with read-only tools (read, glob, grep, webfetch, websearch, skill, rag_search, episodic_search, fact_read).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool_calls": {
+                        "type": "array",
+                        "description": "List of tool calls to execute in parallel",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {
+                                    "type": "string",
+                                    "description": "Tool name (read, glob, grep, webfetch, websearch, skill, rag_search, episodic_search, fact_read)"
+                                },
+                                "args": {
+                                    "type": "object",
+                                    "description": "Tool arguments as JSON object"
+                                },
+                                "tag": {
+                                    "type": "string",
+                                    "description": "Optional label to identify this result (e.g., 'auth-module', 'config-file')"
+                                }
+                            },
+                            "required": ["tool", "args"]
+                        }
+                    }
+                },
+                "required": ["tool_calls"]
+            }
+        }
+    },
 ]
 
 # ── Project directory context ────────────────────────────────
@@ -1141,6 +1177,7 @@ _READ_ONLY_TOOLS = frozenset(
         "invalid",
         "fact_read",
         "episodic_search",
+        "parallel_execute",  # meta-tool that only runs read-only tools
     }
 )
 
@@ -3097,6 +3134,86 @@ def handle_runner_task_status(args):
         return f"Error obteniendo tarea: {e}"
 
 
+def handle_parallel_execute(args):
+    """Execute multiple read-only tool calls in parallel.
+    
+    Args format:
+        tool_calls: [
+            {"tool": "read", "args": {"filePath": "foo.py"}, "tag": "optional-label"},
+            {"tool": "glob", "args": {"pattern": "**/*.py"}},
+            ...
+        ]
+    
+    Returns formatted results with tags and timing.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    tool_calls = args.get("tool_calls", [])
+    if not tool_calls:
+        return "Error: no tool_calls provided"
+    
+    if len(tool_calls) > 20:
+        return f"Error: too many parallel calls ({len(tool_calls)}), max 20"
+    
+    # Validate all tools are read-only
+    invalid = [tc for tc in tool_calls if tc.get("tool") not in _READ_ONLY_TOOLS or tc.get("tool") == "parallel_execute"]
+    if invalid:
+        names = [tc.get("tool", "?") for tc in invalid]
+        return f"Error: parallel_execute only supports read-only tools. Invalid: {', '.join(names)}"
+    
+    def _run_one(idx, tc):
+        """Execute a single tool call. Returns (idx, tag, result, elapsed)."""
+        import time as _time
+        tool_name = tc["tool"]
+        tool_args = tc.get("args", {})
+        tag = tc.get("tag", "")
+        
+        start = _time.time()
+        handler = _resolve_handler(tool_name)
+        if not handler:
+            return idx, tag, f"Error: unknown tool '{tool_name}'", 0
+        
+        try:
+            result = handler(tool_args)
+            elapsed = _time.time() - start
+            return idx, tag, result, elapsed
+        except Exception as e:
+            elapsed = _time.time() - start
+            return idx, tag, f"Error: {e}", elapsed
+    
+    # Execute all in parallel
+    total_start = time.time()
+    results = [None] * len(tool_calls)
+    
+    with ThreadPoolExecutor(max_workers=min(len(tool_calls), 10)) as executor:
+        future_map = {
+            executor.submit(_run_one, i, tc): i
+            for i, tc in enumerate(tool_calls)
+        }
+        for future in as_completed(future_map):
+            idx, tag, result, elapsed = future.result()
+            # Truncate if needed
+            if len(result) > MAX_TOOL_OUTPUT:
+                result = result[:MAX_TOOL_OUTPUT] + f"\n... (truncated, {len(result)} total chars)"
+            results[idx] = (tag, result, elapsed)
+    
+    total_elapsed = time.time() - total_start
+    
+    # Format output
+    output_parts = []
+    output_parts.append(f"═══ Parallel Execution: {len(tool_calls)} tools in {total_elapsed:.2f}s ═══\n")
+    
+    for i, (tag, result, elapsed) in enumerate(results):
+        tc = tool_calls[i]
+        tool_name = tc["tool"]
+        tag_str = f" [{tag}]" if tag else ""
+        output_parts.append(f"── {tool_name}{tag_str} ({elapsed:.2f}s) ──")
+        output_parts.append(result)
+        output_parts.append("")  # blank line between results
+    
+    return "\n".join(output_parts)
+
+
 TOOL_HANDLERS = {
     "invalid": handle_invalid,
     "question": handle_question,
@@ -3124,6 +3241,7 @@ TOOL_HANDLERS = {
     "runner_status": handle_runner_status,
     "runner_task": handle_runner_task,
     "runner_task_status": handle_runner_task_status,
+    "parallel_execute": handle_parallel_execute,
 }
 
 
@@ -4619,10 +4737,43 @@ def parse_stream(resp, resp_color="95"):
 MAX_TOOLS_PER_ROUND = 10
 
 
+def _resolve_handler(name, messages=None):
+    """Resolve a tool name to its handler function.
+    
+    If messages is provided, skill tool handlers will inject instructions
+    into the conversation (used in sequential/trusted mode).
+    """
+    handler = TOOL_HANDLERS.get(name)
+    if not handler and name.startswith("skill_"):
+        skill_name = name[6:]
+        if messages is not None:
+            handler = lambda a, _n=skill_name, _msgs=messages: skill_tool_handler(_n, a, _msgs)
+        else:
+            handler = lambda a, _n=skill_name: skill_tool_handler(_n, a)
+    if not handler and name.startswith("mcp__"):
+        handler = lambda a, _qn=name: handle_mcp_tool_call(_qn, a)
+    return handler
+
+
+def _tool_display_name(tc):
+    """Return a short display string for a tool call."""
+    name = tc["function"]["name"]
+    try:
+        args = json.loads(tc["function"]["arguments"]) if tc["function"]["arguments"] else {}
+    except json.JSONDecodeError:
+        args = {}
+    desc = args.get("description", "")
+    args_str = json.dumps(args)[:200]
+    return desc or args_str
+
+
 def execute_tool_calls(tool_calls, messages, cfg):
     global _todo_has_write_since_last
     pending_system = []
     pending_user = []  # user messages (images) to append after ALL tool responses
+
+    # ── Phase 1: Parse all tool calls ──
+    parsed = []
     for tc in tool_calls:
         name = tc["function"]["name"]
         try:
@@ -4633,19 +4784,81 @@ def execute_tool_calls(tool_calls, messages, cfg):
             )
         except json.JSONDecodeError:
             args = {}
+        parsed.append((tc, name, args))
 
+    # ── Phase 2: Separate read-only vs write tools ──
+    read_indices = [i for i, (_, name, _) in enumerate(parsed) if _is_read_only_tool(name)]
+    write_indices = [i for i, (_, name, _) in enumerate(parsed) if not _is_read_only_tool(name)]
+
+    # Shared container for results: list of (result, ok) indexed by original position
+    results: list[tuple[str, bool] | None] = [None] * len(parsed)
+
+    # ── Phase 3: Execute read-only tools IN PARALLEL ──
+    if read_indices:
+        # Display & log all read-only calls first
+        for i in read_indices:
+            tc, name, args = parsed[i]
+            args_str = json.dumps(args)[:200]
+            desc = args.get("description", "")
+            print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{desc or args_str}{C.RESET}")
+            _log_write(f"── {name} {args_str}", role="tool", tool_name=name)
+
+        # User confirmation (batch: single prompt for all read-only)
+        all_ok = True
+        if not cfg.get("trust_mode"):
+            names_str = ", ".join(parsed[i][1] for i in read_indices)
+            try:
+                ans = input(f"  {C.YELLOW}run ({names_str})?{C.RESET} [Y/n/q] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return False
+            if ans == "q":
+                return False
+            all_ok = ans in ("", "y", "yes")
+
+        if all_ok:
+            # Build list of (index, tc, name, args) for parallel execution
+            parallel_batch = [(i, *parsed[i]) for i in read_indices]
+
+            def _run_one(index, tc, name, args):
+                """Execute a single read-only tool. Returns (index, result_string, ok_flag)."""
+                handler = _resolve_handler(name)
+                if not handler:
+                    return index, f"Error: unknown tool '{name}'", False
+                try:
+                    result = handler(args)
+                    if len(result) > MAX_TOOL_OUTPUT:
+                        result = (
+                            result[:MAX_TOOL_OUTPUT]
+                            + f"\n... (truncated, {len(result)} total chars)"
+                        )
+                    return index, result, True
+                except KeyboardInterrupt:
+                    return index, "cancelled", False
+                except Exception as e:
+                    return index, f"Error: {e}", False
+
+            with ThreadPoolExecutor(max_workers=min(len(parallel_batch), 10)) as executor:
+                future_map = {
+                    executor.submit(_run_one, idx, tc, name, args): idx
+                    for idx, tc, name, args in parallel_batch
+                }
+                for future in as_completed(future_map):
+                    idx, result_str, ok = future.result()
+                    results[idx] = (result_str, ok)
+        else:
+            for i in read_indices:
+                results[i] = ("TOOL_CALL_DECLINED", False)
+
+    # ── Phase 4: Execute write tools SEQUENTIALLY ──
+    for i in write_indices:
+        tc, name, args = parsed[i]
         args_str = json.dumps(args)[:200]
         desc = args.get("description", "")
         print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{desc or args_str}{C.RESET}")
         _log_write(f"── {name} {args_str}", role="tool", tool_name=name)
 
-        handler = TOOL_HANDLERS.get(name)
-        if not handler and name.startswith("skill_"):
-            handler = lambda a, _n=name[6:], _msgs=messages: skill_tool_handler(
-                _n, a, _msgs
-            )
-        if not handler and name.startswith("mcp__"):
-            handler = lambda a, _qn=name: handle_mcp_tool_call(_qn, a)
+        handler = _resolve_handler(name, messages=messages)
         if not handler:
             result = f"Error: unknown tool '{name}'"
             ok = False
@@ -4679,12 +4892,27 @@ def execute_tool_calls(tool_calls, messages, cfg):
             else:
                 result = "TOOL_CALL_DECLINED"
 
-        if name == "edit":
-            _emit_edit_diff()
-        if name == "todowrite" and result != "TOOL_CALL_DECLINED":
-            _display_task_md()
-        _log_write(f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}", role="tool", tool_name=name)
+            if name == "edit":
+                _emit_edit_diff()
+            if name == "todowrite" and result != "TOOL_CALL_DECLINED":
+                _display_task_md()
+            if name not in _READ_ONLY_TOOLS and ok:
+                _todo_has_write_since_last = True
+
+        results[i] = (result, ok)
+
+    # ── Phase 5: Append results to messages in ORIGINAL order ──
+    for i, (tc, name, args) in enumerate(parsed):
+        result, ok = results[i]
+
+        _log_write(
+            f"→ {result[:1000]}{'...' if len(result) > 1000 else ''}",
+            role="tool",
+            tool_name=name,
+        )
         messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+
+        # Image reads produce user messages (collected, appended after all tool responses)
         if name == "read" and result.startswith("data:image/"):
             fpath = args.get("filePath", "?")
             pending_user.append(
@@ -4699,8 +4927,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     ],
                 }
             )
-        if name not in _READ_ONLY_TOOLS and ok:
-            _todo_has_write_since_last = True
+
     # Append user messages (images) AFTER all tool responses to keep tool_calls
     # contiguous — required by providers like DeepSeek
     for msg in pending_user:
@@ -5866,7 +6093,16 @@ SYSTEM_PROMPT_DEFAULT = """You are tbot, an interactive CLI tool that helps user
 Available tools: {tools}
 
 General rules:
-- Parallelize independent tool calls (multiple in one response). Chain dependent calls sequentially.
+- **PARALLEL READS**: Use `parallel_execute` to read/search multiple files simultaneously. Example:
+  ```
+  parallel_execute(tool_calls=[
+    {"tool": "read", "args": {"filePath": "src/auth.py"}, "tag": "auth"},
+    {"tool": "read", "args": {"filePath": "src/db.py"}, "tag": "database"},
+    {"tool": "grep", "args": {"pattern": "def login"}, "tag": "login-refs"}
+  ])
+  ```
+  This runs all 3 reads in parallel (~3x faster than sequential).
+- Chain dependent calls sequentially (edit → read → edit).
 - Tool output is truncated at {max_tool_output} characters. If you hit the limit, paginate (read with offset) or refine your query.
 - Re-reading a file is allowed — content from previous rounds is stale, re-read is fresh.
 - Prefer grep/glob for code search; prefer RAG for semantic/concept search across the codebase.
