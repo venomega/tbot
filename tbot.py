@@ -7101,6 +7101,7 @@ MAX_TOOL_ONLY_ROUNDS = 120
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
+    _conv_start_time = time.time()
     try:
         max_chars = _compute_max_history_chars(cfg)
         while (
@@ -7316,6 +7317,11 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             f"The model used {max_rounds} consecutive tool calls without producing a final response.",
             "This may indicate a bug in the model or an infinite loop. Try a different model.",
         )
+    # Bell if conversation took more than 60 seconds
+    _conv_elapsed = time.time() - _conv_start_time
+    if _conv_elapsed > 60:
+        sys.stdout.write("\a")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
