@@ -3175,6 +3175,8 @@ def handle_parallel_execute(args):
         
         try:
             result = handler(tool_args)
+            if result is None:
+                result = ""
             elapsed = _time.time() - start
             return idx, tag, result, elapsed
         except Exception as e:
@@ -3191,7 +3193,13 @@ def handle_parallel_execute(args):
             for i, tc in enumerate(tool_calls)
         }
         for future in as_completed(future_map):
-            idx, tag, result, elapsed = future.result()
+            idx = future_map[future]
+            try:
+                _, tag, result, elapsed = future.result()
+            except Exception as e:
+                tag = ""
+                result = f"Error: {e}"
+                elapsed = 0
             # Truncate if needed
             if len(result) > MAX_TOOL_OUTPUT:
                 result = result[:MAX_TOOL_OUTPUT] + f"\n... (truncated, {len(result)} total chars)"
@@ -4827,6 +4835,8 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     return index, f"Error: unknown tool '{name}'", False
                 try:
                     result = handler(args)
+                    if result is None:
+                        result = ""
                     if len(result) > MAX_TOOL_OUTPUT:
                         result = (
                             result[:MAX_TOOL_OUTPUT]
@@ -4844,7 +4854,12 @@ def execute_tool_calls(tool_calls, messages, cfg):
                     for idx, tc, name, args in parallel_batch
                 }
                 for future in as_completed(future_map):
-                    idx, result_str, ok = future.result()
+                    idx = future_map[future]
+                    try:
+                        _, result_str, ok = future.result()
+                    except Exception as e:
+                        result_str = f"Error: {e}"
+                        ok = False
                     results[idx] = (result_str, ok)
         else:
             for i in read_indices:
@@ -4892,9 +4907,9 @@ def execute_tool_calls(tool_calls, messages, cfg):
             else:
                 result = "TOOL_CALL_DECLINED"
 
-            if name == "edit":
+            if name == "edit" and ok:
                 _emit_edit_diff()
-            if name == "todowrite" and result != "TOOL_CALL_DECLINED":
+            if name == "todowrite" and ok and result != "TOOL_CALL_DECLINED":
                 _display_task_md()
             if name not in _READ_ONLY_TOOLS and ok:
                 _todo_has_write_since_last = True
@@ -5263,13 +5278,38 @@ def save_history():
 
 def _setup_sigwinch():
     """Handle terminal resize (SIGWINCH) so readline redraws correctly.
-    
-    Python's readline module installs its own SIGWINCH handler that calls
-    rl_resize_terminal() + rl_redisplay(). We do NOT override it — doing so
-    would skip rl_resize_terminal(), causing readline to use stale dimensions
-    and corrupt the screen on history navigation after resize.
+
+    Python's readline installs its own SIGWINCH handler, but after a tmux
+    resize it can mis-calculate the display prompt length and reprint the
+    prompt (e.g. ">>> ") on screen.  We replace it with a handler that:
+      1. Lets the original handler run (so rl_resize_terminal() is called).
+      2. Then forces a clean rl_redisplay() which re-reads COLUMNS/LINES
+         and redraws the current input line correctly.
     """
-    pass
+    if readline is None:
+        return
+
+    import signal as _signal
+
+    # Save whatever Python/readline installed before us
+    _prev = _signal.getsignal(_signal.SIGWINCH)
+
+    def _on_sigwinch(signum, frame):
+        # Let the previous handler (readline's) run first
+        if callable(_prev) and _prev not in (_signal.SIG_DFL, _signal.SIG_IGN):
+            try:
+                _prev(signum, frame)
+            except Exception:
+                pass
+        # Now force readline to redraw with the new terminal size.
+        # readline.redisplay() re-reads COLUMNS/LINES internally and
+        # redraws the prompt + input buffer cleanly.
+        try:
+            readline.redisplay()
+        except Exception:
+            pass
+
+    _signal.signal(_signal.SIGWINCH, _on_sigwinch)
 
 
 def show_banner(cfg):
