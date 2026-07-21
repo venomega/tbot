@@ -4648,6 +4648,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
             handler = lambda a, _qn=name: handle_mcp_tool_call(_qn, a)
         if not handler:
             result = f"Error: unknown tool '{name}'"
+            ok = False
         else:
             if cfg.get("trust_mode"):
                 ok = True
@@ -6820,7 +6821,7 @@ Replace this with instructions for the model.
         send_conversation(messages, cfg, pop_on_first_error=True)
 
 
-MAX_TOOL_ONLY_ROUNDS = 60
+MAX_TOOL_ONLY_ROUNDS = 120
 
 
 def send_conversation(messages, cfg, pop_on_first_error=False):
@@ -6924,6 +6925,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 else:
                     tool_only_rounds += 1
                     if tool_only_rounds >= MAX_TOOL_ONLY_ROUNDS:
+                        print(f"\n{C.YELLOW}  MAX_TOOL_ONLY_ROUNDS limit reached{C.RESET}")
                         messages.append(
                             {
                                 "role": "system",
