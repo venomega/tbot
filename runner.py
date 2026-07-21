@@ -1038,6 +1038,7 @@ class TaskRunner:
                         tid, interval_secs,
                     )
                     self._notify(task["id"], "Tarea completada", prompt[:120])
+                    self._bell()
                 else:
                     task["status"] = "completed"
                     task["retries"] = old_retries
@@ -1045,6 +1046,7 @@ class TaskRunner:
                     task["completed_at"] = _ts()
                     log.info("%s Tarea completada (%d rounds)", tid, rounds)
                     self._notify(task["id"], "Tarea completada", prompt[:120])
+                    self._bell()
             else:
                 attempt = old_retries + 1
                 if attempt >= max_retries:
@@ -1071,6 +1073,7 @@ class TaskRunner:
                         task["id"], "Tarea falló",
                         f"{prompt[:120]} ({attempt}/{max_retries})",
                     )
+                    self._bell()
                 else:
                     task["status"] = "pending"
                     task["retries"] = attempt
@@ -1094,6 +1097,7 @@ class TaskRunner:
                     tid,
                 )
                 self._notify(task["id"], "Tarea completada", prompt[:120])
+                self._bell()
             else:
                 # Construir prompt de revisión
                 review_prompt_text = task.get("review_prompt") or _DEFAULT_REVIEW_PROMPT
@@ -1146,6 +1150,7 @@ class TaskRunner:
                     task["completed_at"] = _ts()
                     log.info("%s Revisión OK — tarea completada", tid)
                     self._notify(task["id"], "Tarea completada", prompt[:120])
+                    self._bell()
                 else:
                     # Extraer feedback para el doer
                     review_eval_text = review_text.strip() if review_text.strip() else "❌ Revisión no produjo resultado"
@@ -1168,6 +1173,7 @@ class TaskRunner:
                             task["id"], "Tarea falló",
                             f"{prompt[:120]} (revisión {attempt}/{max_retries})",
                         )
+                        self._bell()
                     else:
                         task["status"] = "pending"  # volver a doer con feedback
                         task["retries"] = attempt
@@ -1234,6 +1240,14 @@ class TaskRunner:
                     timeout=5,
                     capture_output=True,
                 )
+        except Exception:
+            pass
+
+    def _bell(self):
+        """Emit terminal bell (\a) para alertar al usuario."""
+        try:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
         except Exception:
             pass
 
