@@ -6925,7 +6925,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 else:
                     tool_only_rounds += 1
                     if tool_only_rounds >= MAX_TOOL_ONLY_ROUNDS:
-                        print(f"\n{C.YELLOW}  MAX_TOOL_ONLY_ROUNDS limit reached{C.RESET}")
+                        print(f"\n{C.YELLOW}  MAX_TOOL_ONLY_ROUNDS={MAX_TOOL_ONLY_ROUNDS} limit reached.{C.RESET}")
                         messages.append(
                             {
                                 "role": "system",
