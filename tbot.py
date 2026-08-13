@@ -110,6 +110,11 @@ PROVIDERS = {
         "url": "https://api.fireworks.ai/inference/v1",
         "env_key": "FIREWORKS_API_KEY",
     },
+    "google": {
+        "name": "Google (Gemini)",
+        "url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "env_key": "GEMINI_API_KEY",
+    },
     "custom": {
         "name": "Custom API",
     },
@@ -4681,6 +4686,9 @@ def parse_stream(resp, resp_color="95"):
                             entry["function"]["name"] += fn["name"]
                         if "arguments" in fn:
                             entry["function"]["arguments"] += fn["arguments"]
+                    # Gemini 3+ thought_signature support
+                    if "extra_content" in tc:
+                        entry["extra_content"] = tc["extra_content"]
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
     except (socket.timeout, OSError):
@@ -7249,6 +7257,10 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     }
                     for tc in tool_calls
                 ]
+                # Gemini 3+ thought_signature: preserve extra_content on tool_calls
+                for i, tc in enumerate(tool_calls):
+                    if "extra_content" in tc:
+                        assistant_msg["tool_calls"][i]["extra_content"] = tc["extra_content"]
                 before_tc = len(messages)
                 messages.append(assistant_msg)
                 # Log assistant response to episodic memory

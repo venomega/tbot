@@ -601,7 +601,7 @@ class TaskExecutor:
 
                 # IMPORTANTE: Añadir mensaje assistant con tool_calls ANTES de los tool results
                 # El formato API requiere: user → assistant(tool_calls) → tool(result)
-                messages.append({
+                assistant_msg = {
                     "role": "assistant",
                     "content": content or None,
                     "tool_calls": [
@@ -612,7 +612,12 @@ class TaskExecutor:
                         }
                         for tc in clean_calls
                     ],
-                })
+                }
+                # Gemini 3+ thought_signature: preserve extra_content on tool_calls
+                for i, tc in enumerate(clean_calls):
+                    if "extra_content" in tc:
+                        assistant_msg["tool_calls"][i]["extra_content"] = tc["extra_content"]
+                messages.append(assistant_msg)
 
                 # Ejecutar tools
                 tc_buf = io.StringIO()
