@@ -648,6 +648,14 @@ TOOLS = [
                         "type": "string",
                         "description": "The command that triggered this task",
                     },
+                    "output_file": {
+                        "type": "string",
+                        "description": "Path where the FULL (untruncated) task output is saved. The parent receives only a ~1500-char summary + this path. Default: ./task_description.md. Use a unique path per parallel task to avoid overwrites.",
+                    },
+                    "context_file": {
+                        "type": "string",
+                        "description": "Path to a shared context file (e.g. ./CONTEXT.md) prepended to the subagent prompt so the orchestrator doesn't repeat context in every call. Default: ./CONTEXT.md (used automatically if it exists). Set to empty string to disable.",
+                    },
                 },
                 "required": ["description", "prompt", "subagent_type"],
             },
@@ -1861,23 +1869,77 @@ def handle_task(args):
         return "Error: prompt is required"
     cfg = load_cfg()
     cfg["api_key"] = resolve_key(cfg)
-    cmd = [sys.executable, sys.argv[0], "-m", cfg["model"], "-x", prompt]
+
+    # ── Shared context injection (orchestrator pattern, punto 5) ──
+    # If a CONTEXT.md-style file exists, prepend it to the subagent prompt so
+    # the orchestrator doesn't have to repeat shared context in every call
+    # (which would bloat the orchestrator's own context window).
+    ctx_path = args.get("context_file") or "./CONTEXT.md"
+    ctx_file = Path(ctx_path)
+    if ctx_file.exists():
+        try:
+            shared = ctx_file.read_text(encoding="utf-8", errors="replace")
+            if shared.strip():
+                prompt = (
+                    f"# Shared context (from {ctx_path})\n{shared}\n\n"
+                    f"# Your specific task\n{prompt}"
+                )
+        except Exception:
+            pass
+
+    # Write the (possibly large) prompt to a temp file and pass --task-file,
+    # to avoid hitting OS command-line length limits.
+    _tmp = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".txt", prefix="tbot_task_", delete=False, encoding="utf-8"
+    )
+    _tmp.write(prompt)
+    _tmp.close()
+    prompt_file = _tmp.name
+
+    cmd = [sys.executable, sys.argv[0], "-m", cfg["model"], "--task-file", prompt_file]
     if not cfg.get("tools_enabled", True):
         cmd.append("--no-tools")
     if cfg.get("trust_mode"):
         cmd.append("--trust")
     env = {**os.environ, "TBOT_DEPTH": str(depth + 1)}
+    timeout = cfg.get("task_timeout", 900)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout, env=env
+            )
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
         out = r.stdout
         if r.stderr:
             out += "\n--- stderr ---\n" + r.stderr[-1000:]
         out += f"\n--- exit code: {r.returncode} ---"
+        # ── Persist FULL output to a file (punto 2) — avoids 32K truncation loss ──
+        out_path = args.get("output_file") or "./task_description.md"
+        try:
+            Path(out_path).write_text(out, encoding="utf-8")
+            saved_note = f"Full output ({len(out)} chars) saved to {out_path}."
+        except Exception as e:
+            saved_note = f"(could not save output file: {e})"
+        summary = out.strip()[:1500]
         if r.returncode != 0:
-            return f"Task '{desc}' failed (exit {r.returncode}):\n{out[:3000]}"
-        return f"Task '{desc}' returned:\n{_truncate_output(out.strip())}"
+            return (
+                f"Task '{desc}' failed (exit {r.returncode}). {saved_note}\n"
+                f"Summary (first 1500 chars):\n{summary}"
+            )
+        return (
+            f"Task '{desc}' completed. {saved_note}\n"
+            f"Summary (first 1500 chars):\n{summary}"
+        )
     except subprocess.TimeoutExpired:
-        return f"Task '{desc}' timed out after 300s"
+        try:
+            os.unlink(prompt_file)
+        except Exception:
+            pass
+        return f"Task '{desc}' timed out after {timeout}s"
     except Exception as e:
         return f"Task '{desc}' error: {e}"
 
@@ -2633,6 +2695,10 @@ def _init_mcp(cfg):
     """
     global _mcp_manager
     if not _HAS_MCP:
+        return
+
+    if not cfg.get("mcp_enabled", True):
+        print(f"  {C.GRAY}MCP ⊘ deshabilitado en el inicio (--no-mcp){C.RESET}")
         return
 
     mcp_configs = cfg.get("mcp_servers", [])
@@ -3961,6 +4027,8 @@ def default_cfg():
         "memory_user_limit": 2200,
         "episodic_retention_days": 90,
         "mcp_servers": [],
+        "mcp_enabled": True,
+        "task_timeout": 900,
     }
 
 
@@ -4802,9 +4870,20 @@ def execute_tool_calls(tool_calls, messages, cfg):
             args = {}
         parsed.append((tc, name, args))
 
-    # ── Phase 2: Separate read-only vs write tools ──
+    # ── Phase 2: Separate read-only vs task vs write tools ──
     read_indices = [i for i, (_, name, _) in enumerate(parsed) if _is_read_only_tool(name)]
-    write_indices = [i for i, (_, name, _) in enumerate(parsed) if not _is_read_only_tool(name)]
+    task_indices = [i for i, (_, name, _) in enumerate(parsed) if name == "task"]
+    if cfg.get("trust_mode"):
+        # Trusted mode: tasks run in parallel (Phase 3b); exclude from the
+        # sequential write phase below.
+        write_indices = [
+            i for i, (_, name, _) in enumerate(parsed)
+            if (not _is_read_only_tool(name)) and name != "task"
+        ]
+    else:
+        # Interactive mode: tasks run sequentially with confirmation (below).
+        write_indices = [i for i, (_, name, _) in enumerate(parsed) if not _is_read_only_tool(name)]
+        task_indices = []
 
     # Shared container for results: list of (result, ok) indexed by original position
     results: list[tuple[str, bool] | None] = [None] * len(parsed)
@@ -4872,6 +4951,55 @@ def execute_tool_calls(tool_calls, messages, cfg):
         else:
             for i in read_indices:
                 results[i] = ("TOOL_CALL_DECLINED", False)
+
+    # ── Phase 3b: Execute task tools IN PARALLEL (orchestrator fan-out) ──
+    # Tasks are autonomous subprocesses (each its own context window). Running
+    # them concurrently lets the orchestrator fan out independent investigations
+    # instead of blocking one-at-a-time. Only reached in trust_mode (see Phase 2).
+    if task_indices:
+        # Display & log all task (fan-out) calls first, like read/write phases
+        for i in task_indices:
+            tc, name, args = parsed[i]
+            args_str = json.dumps(args)[:200]
+            desc = args.get("description", "")
+            print(f"\n{C.GRAY}── {C.CYAN}{name}{C.RESET} {C.GRAY}{desc or args_str}{C.RESET}")
+            _log_write(f"── {name} {args_str}", role="tool", tool_name=name)
+
+        batch = [(i, *parsed[i]) for i in task_indices]
+
+        def _run_task(index, tc, name, args):
+            handler = _resolve_handler(name)
+            if not handler:
+                return index, f"Error: unknown tool '{name}'", False
+            try:
+                result = handler(args)
+                if result is None:
+                    result = ""
+                if len(result) > MAX_TOOL_OUTPUT:
+                    result = (
+                        result[:MAX_TOOL_OUTPUT]
+                        + f"\n... (truncated, {len(result)} total chars)"
+                    )
+                return index, result, True
+            except KeyboardInterrupt:
+                return index, "cancelled", False
+            except Exception as e:
+                return index, f"Error: {e}", False
+
+        with ThreadPoolExecutor(max_workers=min(len(batch), 10)) as executor:
+            future_map = {
+                executor.submit(_run_task, idx, tc, name, args): idx
+                for idx, tc, name, args in batch
+            }
+            for future in as_completed(future_map):
+                idx = future_map[future]
+                try:
+                    _, result_str, ok = future.result()
+                except Exception as e:
+                    result_str = f"Error: {e}"
+                    ok = False
+                results[idx] = (result_str, ok)
+        _todo_has_write_since_last = True
 
     # ── Phase 4: Execute write tools SEQUENTIALLY ──
     for i in write_indices:
@@ -6371,10 +6499,16 @@ def main():
     parser.add_argument("-s", "--system", help="System prompt")
     parser.add_argument("--no-tools", action="store_true", help="Disable tool calling")
     parser.add_argument(
+        "--no-mcp", action="store_true", help="Disable MCP server initialization at startup"
+    )
+    parser.add_argument(
         "--trust", action="store_true", help="Auto-approve tool execution"
     )
     parser.add_argument(
         "-x", "--task", help="Run a single task non-interactively and exit"
+    )
+    parser.add_argument(
+        "-f", "--task-file", help="Read the -x task prompt from a file (avoids CLI length limits for large prompts)"
     )
     args = parser.parse_args()
 
@@ -6386,18 +6520,29 @@ def main():
         cfg["system_prompt"] = args.system
     if args.no_tools:
         cfg["tools_enabled"] = False
+    if args.no_mcp:
+        cfg["mcp_enabled"] = False
     if args.trust:
         cfg["trust_mode"] = True
 
     # ── non-interactive task mode ──
-    if args.task:
+    if args.task or args.task_file is not None:
+        task_text = args.task or ""
+        if args.task_file:
+            try:
+                task_text = Path(args.task_file).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except Exception as e:
+                print(f"{C.RED}Error reading task file: {e}{C.RESET}")
+                return
         cfg["tools_enabled"] = True
         cfg["trust_mode"] = True
         messages = _init_messages(cfg)
         _log_init()
         atexit.register(_log_close)
-        _log_write(f">>> {args.task}", role="user")
-        messages.append({"role": "user", "content": args.task})
+        _log_write(f">>> {task_text[:200]}", role="user")
+        messages.append({"role": "user", "content": task_text})
         send_conversation(messages, cfg)
         return
 
