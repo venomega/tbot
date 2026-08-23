@@ -11,7 +11,8 @@ import (
 
 // Current index version. Increment when tokenization/index format changes
 // so stale indices are automatically rebuilt.
-const indexVersion = 4
+// v5: tokenizer ahora normaliza acentos, divide camelCase y filtra stop-words.
+const indexVersion = 5
 
 func shouldSkip(name string) bool {
 	skipDirs := map[string]bool{
@@ -206,7 +207,7 @@ func indexDir(root string) (*Index, error) {
 	}
 
 	// 5b: Chunks sin cambios (reusados del índice anterior)
-	// Como el tokenizer cambió (versión 4), necesitamos re-tokenizar los chunks
+	// Como el tokenizer cambió (versión 5), necesitamos re-tokenizar los chunks
 	// existentes. Esto es mucho más barato que re-chunkear (solo O(texto) vs. AST).
 	if existingIdx != nil && len(unchangedRelPaths) > 0 {
 		// Construir mapa {relPath → []*Chunk} para lookup O(1)
