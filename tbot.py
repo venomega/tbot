@@ -6204,10 +6204,15 @@ def _replace_history_last(line):
 
 
 def _collapse_for_history(text, max_len=200):
-    """Collapse multi-line text to a single line for readline history storage."""
+    """Collapse multi-line text to a single line for readline history storage.
+
+    The history entry is truncated for display (max_len), but the full text
+    is still sent to the model via send_conversation. readline needs a single
+    line, so we collapse newlines to spaces and cut at max_len.
+    """
     one_line = " ".join(text.split())
     if len(one_line) > max_len:
-        one_line = one_line[:max_len] + "..."
+        one_line = one_line[:max_len] + "…"
     return one_line
 
 
@@ -6903,26 +6908,17 @@ def main():
                         print(f"{C.GREEN}last message updated ({len(arg)} chars){C.RESET}")
                         send_conversation(messages, cfg, pop_on_first_error=False)
                 else:
-                    last_user = -1
-                    for i in range(len(messages) - 1, -1, -1):
-                        if messages[i]["role"] == "user":
-                            last_user = i
-                            break
                     initial = ""
                     print(f"{C.YELLOW}opening editor...{C.RESET}")
                     content = open_editor(initial)
-                    if content:
+                    if content or content == "":
                         # ── Expandir @@ con fzf ──
                         if "@@" in content and shutil.which("fzf"):
                             sel = _fzf_file_selector()
                             if sel:
                                 content = content.replace("@@", sel)
                         # ──────────────────────────
-                        appended = last_user == -1
-                        if last_user != -1:
-                            messages[last_user]["content"] = content
-                        else:
-                            messages.append({"role": "user", "content": content})
+                        messages.append({"role": "user", "content": content})
                         lines = content.split("\n")
                         print(
                             f"{C.GREEN}message ({len(lines)} lines, {len(content)} chars){C.RESET}"
@@ -6931,7 +6927,7 @@ def main():
                             print(content)
                         # Store collapsed version in readline history
                         _replace_history_last(_collapse_for_history(content))
-                        send_conversation(messages, cfg, pop_on_first_error=appended)
+                        send_conversation(messages, cfg, pop_on_first_error=True)
                     else:
                         print(f"{C.YELLOW}cancelled{C.RESET}")
             elif cmd == "skills":
