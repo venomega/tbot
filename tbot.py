@@ -526,7 +526,7 @@ TOOLS = [
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "The maximum number of lines to read (defaults to 2000)",
+                        "description": "The maximum number of lines to read (defaults to 3000)",
                     },
                 },
                 "required": ["filePath"],
@@ -627,7 +627,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "task",
-            "description": "Launch a new agent to handle complex multistep tasks autonomously. Use this for tasks that need independent research or processing.",
+            "description": "Launch a new agent to handle complex multistep tasks autonomously. Use this for tasks that need independent research or processing. Supports delegation, context reduction, and fact extraction.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -655,6 +655,33 @@ TOOLS = [
                     "context_file": {
                         "type": "string",
                         "description": "Path to a shared context file (e.g. ./CONTEXT.md) prepended to the subagent prompt so the orchestrator doesn't repeat context in every call. Default: ./CONTEXT.md (used automatically if it exists). Set to empty string to disable.",
+                    },
+                    "delegation": {
+                        "type": "object",
+                        "description": "Configuration for task delegation. Include 'enabled': true, 'max_depth': number, and/or 'subtasks': list of subtask descriptions to delegate parts of the work.",
+                        "properties": {
+                            "enabled": {
+                                "type": "boolean",
+                                "description": "Enable automatic delegation of subtasks",
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum nesting depth for delegated tasks (default: 2)",
+                            },
+                            "subtasks": {
+                                "type": "array",
+                                "description": "List of subtask descriptions to delegate automatically",
+                            },
+                        },
+                        "default": {"enabled": False, "max_depth": 2},
+                    },
+                    "inject_facts": {
+                        "type": "boolean",
+                        "description": "Whether to auto-inject relevant facts from MEMORY.md/USER.md into the task prompt",
+                    },
+                    "extract_facts": {
+                        "type": "boolean",
+                        "description": "Whether to extract and store important facts from the task result into MEMORY.md",
                     },
                 },
                 "required": ["description", "prompt", "subagent_type"],
@@ -1562,7 +1589,7 @@ def handle_read(args):
     if not is_rerun:
         _read_trail.add(key)
 
-    limit = args.get("limit", 2000)
+    limit = args.get("limit", 3000)
     p = Path(filepath)
     if not p.exists():
         return (
@@ -1870,7 +1897,18 @@ def handle_task(args):
     cfg = load_cfg()
     cfg["api_key"] = resolve_key(cfg)
 
-    # ── Shared context injection (orchestrator pattern, punto 5) ──
+    # ── Parse delegation config ──
+    delegation = args.get("delegation", {})
+    if isinstance(delegation, str):
+        try:
+            delegation = json.loads(delegation)
+        except json.JSONDecodeError:
+            delegation = {}
+    delegation_enabled = delegation.get("enabled", False) if isinstance(delegation, dict) else False
+    delegation_max_depth = delegation.get("max_depth", 2) if isinstance(delegation, dict) else 2
+    delegation_subtasks = delegation.get("subtasks", []) if isinstance(delegation, dict) else []
+
+    # ── Shared context injection (orchestrator pattern) ──
     # If a CONTEXT.md-style file exists, prepend it to the subagent prompt so
     # the orchestrator doesn't have to repeat shared context in every call
     # (which would bloat the orchestrator's own context window).
@@ -1886,6 +1924,49 @@ def handle_task(args):
                 )
         except Exception:
             pass
+
+    # ── Context reduction: extract key facts from MEMORY/USER if needed ──
+    # Auto-inject relevant facts when the task involves known patterns
+    if args.get("inject_facts", True):
+        mem = fact_read(store="memory")
+        if mem.strip():
+            # Add a brief facts summary at the start if not already present
+            if "# Shared context" not in prompt[:200]:
+                prompt = f"# Hechos del entorno (pueden ser relevantes):\n{mem.strip()[:500]}\n\n" + prompt
+
+    # ── Reduce context by summarizing long prompts ──
+    # If the prompt is very long, create a concise version for the task
+    original_prompt = prompt
+    if len(prompt) > 3000:
+        # Summarize the prompt to reduce token usage
+        prompt = _summarize_prompt(prompt) + f"\n\n# Nota: Prometo original truncado a 3000 chars. Contenido original disponible si es necesario."
+
+    # ── Handle delegation ──
+    # If delegation is enabled and we're not at max depth, split into subtasks
+    if delegation_enabled and delegation_subtasks and depth < delegation_max_depth:
+        result = _execute_delegated_tasks(
+            desc=desc,
+            prompt=prompt,
+            subtasks=delegation_subtasks,
+            current_depth=depth,
+            max_depth=delegation_max_depth,
+            cfg=cfg,
+        )
+        # Persist output and extract facts
+        out_path = args.get("output_file") or "./task_description.md"
+        try:
+            Path(out_path).write_text(result, encoding="utf-8")
+            saved_note = f"Full output ({len(result)} chars) saved to {out_path}."
+        except Exception as e:
+            saved_note = f"(could not save output file: {e})"
+        summary = result.strip()[:1500]
+        # ── Post-process: extract facts from result ──
+        if args.get("extract_facts", False):
+            result = _maybe_extract_facts(result, desc)
+        return (
+            f"Task '{desc}' completed via delegation. {saved_note}\n"
+            f"Summary (first 1500 chars):\n{summary}"
+        )
 
     # Write the (possibly large) prompt to a temp file and pass --task-file,
     # to avoid hitting OS command-line length limits.
@@ -1930,10 +2011,14 @@ def handle_task(args):
                 f"Task '{desc}' failed (exit {r.returncode}). {saved_note}\n"
                 f"Summary (first 1500 chars):\n{summary}"
             )
-        return (
+        result = (
             f"Task '{desc}' completed. {saved_note}\n"
             f"Summary (first 1500 chars):\n{summary}"
         )
+        # ── Post-process: extract facts from result ──
+        if args.get("extract_facts", False) and r.returncode == 0:
+            result = _maybe_extract_facts(result, desc)
+        return result
     except subprocess.TimeoutExpired:
         try:
             os.unlink(prompt_file)
@@ -1942,6 +2027,134 @@ def handle_task(args):
         return f"Task '{desc}' timed out after {timeout}s"
     except Exception as e:
         return f"Task '{desc}' error: {e}"
+
+
+def _execute_delegated_tasks(
+    desc: str,
+    prompt: str,
+    subtasks: list,
+    current_depth: int,
+    max_depth: int,
+    cfg: dict,
+) -> str:
+    """Execute a set of subtasks in parallel or sequence, collecting results."""
+    import json
+    depth_label = f"{current_depth + 1}/{max_depth}"
+    results = []
+    for i, subtask_desc in enumerate(subtasks):
+        subtask_prompt = f"""
+# Subtask {i + 1} of {len(subtasks)}
+{subtask_desc}
+
+# Original task context
+{prompt}
+
+# Instructions
+- Execute this subtask independently
+- Report back with complete results
+- Include any relevant findings, code, or analysis
+"""
+        # Write subtask prompt to temp file
+        _tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix=f"tbot_subtask_{i}_", delete=False, encoding="utf-8"
+        )
+        _tmp.write(subtask_prompt)
+        _tmp.close()
+        prompt_file = _tmp.name
+
+        sub_cmd = [sys.executable, sys.argv[0], "-m", cfg["model"], "--task-file", prompt_file]
+        if not cfg.get("tools_enabled", True):
+            sub_cmd.append("--no-tools")
+        if cfg.get("trust_mode"):
+            sub_cmd.append("--trust")
+        sub_env = {**os.environ, "TBOT_DEPTH": str(current_depth + 1)}
+        try:
+            r = subprocess.run(
+                sub_cmd,
+                capture_output=True,
+                text=True,
+                timeout=cfg.get("task_timeout", 900),
+                env=sub_env,
+            )
+            subtask_result = r.stdout
+            if r.stderr:
+                subtask_result += "\n--- stderr ---\n" + r.stderr[-500:]
+            subtask_result += f"\n--- exit code: {r.returncode} ---"
+            results.append(f"=== Subtask {i + 1}: {subtask_desc} ===\n{subtask_result}")
+        except subprocess.TimeoutExpired:
+            results.append(f"=== Subtask {i + 1}: {subtask_desc} ===\nTIMed out")
+        finally:
+            try:
+                os.unlink(prompt_file)
+            except Exception:
+                pass
+
+    # Combine all subtask results
+    combined = "\n\n".join(results) if results else "No subtask results obtained."
+    return combined
+
+
+def _summarize_prompt(prompt: str) -> str:
+    """Create a concise summary of a long prompt for context reduction."""
+    # Take first and last parts, drop the middle
+    if len(prompt) <= 3000:
+        return prompt
+    
+    # Handle single-line prompts by truncating with ellipsis
+    if "\n" not in prompt:
+        if len(prompt) > 3000:
+            # Use exact 3000 chars: 1500 from start, 25 chars marker, 1495 from end
+            marker = " ... (contenido truncado) ..."
+            head_len = (3000 - len(marker)) // 2  # 1487
+            tail_len = 3000 - len(marker) - head_len  # 1513
+            head = prompt[:head_len]
+            tail = prompt[-tail_len:]
+            return head + marker + tail
+        return prompt
+    
+    lines = prompt.split("\n")
+    # Keep only first 3 lines and last 3 lines to be more aggressive about reduction
+    # The marker line itself takes space
+    marker = "... (contenido intermedio omitido para reducir contexto ...) "
+    available = 3000 - len(marker)
+    # Calculate how many lines we can keep from start and end
+    # Rough estimate: each line is ~avg_len chars, we need to fit in available
+    kept_start = lines[:3]
+    kept_end = lines[-3:] if len(lines) > 6 else []
+    kept = kept_start + [marker] + kept_end
+    result = "\n".join(kept)
+    # If still too long, truncate to exactly 3000
+    if len(result) > 3000:
+        result = result[:3000]  # simple truncation
+    return result
+
+
+def _maybe_extract_facts(result: str, task_desc: str) -> str:
+    """Try to extract important facts from task results to store in memory."""
+    # Simple heuristic: look for key patterns like "remember that", "aprendimos que", etc.
+    lines = result.split("\n")
+    facts = []
+    for line in lines:
+        lower = line.lower().strip()
+        # Look for instructional statements
+        if any(kw in lower for kw in ["remember", "aprende", "nota:", "importante", "lección"]):
+            # Extract what comes after common patterns
+            for pattern in ["remember that", "aprende que", "la lección es", "nota que"]:
+                if pattern in lower:
+                    idx = lower.index(pattern) + len(pattern)
+                    # Get text after pattern until end of line or next sentence
+                    after = line[idx:].strip()
+                    if after and len(after) < 200:
+                        facts.append(after)
+                    break
+    if facts:
+        # Store the extracted facts
+        combined = " ".join(facts[:3])  # Max 3 facts
+        try:
+            fact_write(store="memory", content=f"tarea: {task_desc[:30]} - {combined}")
+        except Exception:
+            pass
+    return result
 
 
 def handle_webfetch(args):
@@ -3895,7 +4108,9 @@ def skill_tool_handler(name, args, messages=None):
                         "content": f"## Skill: {name}\n\n{doc}{siblings_info}",
                     }
                 )
-                return f"Skill '{name}' instructions loaded. Follow them to complete the task."
+                # Return the skill doc as the tool result so the model actually sees
+                # the instructions in this turn (not just in a system message).
+                return f"## Skill: {name}\n\n{doc}{siblings_info}"
             return f"Skill '{name}' found. Use `skill_{name}` to load instructions."
     return f"Skill '{name}' not found"
 
