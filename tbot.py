@@ -7535,18 +7535,42 @@ def _summarize_history_via_api(messages, cfg):
     summarizer_prompt = (
         "You are a summarizer for a CLI coding assistant. You will receive "
         "a conversation history (no system prompt).\n\n"
-        "Produce a SINGLE JSON object with these keys:\n"
-        '  - "intent": what the user wanted (<= 200 chars)\n'
-        '  - "decisions": list of decisions taken (<= 5 items)\n'
-        '  - "files_modified": list of file paths changed (<= 10 items)\n'
-        '  - "pending_tasks": list of unfinished items (<= 5 items)\n'
-        '  - "notes": any extra context the assistant must know (<= 300 chars)\n\n'
-        "Reply ONLY with the JSON object. No prose, no markdown fences."
+        "Your task is to produce a JSON object with a \"messages\" array "
+        "containing the summarized conversation history in OpenAI API format.\n\n"
+        "Rules:\n"
+        "1. Each message must have \"role\" (system/user/assistant/tool) and \"content\" (string)\n"
+        "2. Assistant messages may include \"tool_calls\" array "
+        "(each with \"id\", \"type\", \"function\": {\"name\", \"arguments\"})\n"
+        "3. Tool messages must have \"tool_call_id\" and \"content\"\n"
+        "4. Preserve essential facts, decisions, file changes, and pending tasks\n"
+        "5. Summarize verbose responses into concise versions\n"
+        "6. Output ONLY valid JSON, no markdown fences or explanation\n\n"
+        "Example format:\n"
+        '{"messages": [\n'
+        '  {"role": "system", "content": "Context: user wanted Flask server..."},\n'
+        '  {"role": "user", "content": "Create a web server"},\n'
+        '  {"role": "assistant", "content": "Created app.py with Flask server"},\n'
+        '  {"role": "tool", "tool_call_id": "call_xxx", "content": "file written successfully"},\n'
+        '  {"role": "assistant", "content": "Done! Files: app.py"}\n'
+        "]}"
     )
     # Strip the original system prompt from the input: the summarizer does
     # not need it and shipping it would defeat the compaction goal.
+    # Convert messages to text format so the model summarizes rather than "acts"
     convo_only = [m for m in messages if m.get("role") != "system"]
-    summary_input = [{"role": "system", "content": summarizer_prompt}] + convo_only
+    history_text = ""
+    for m in convo_only:
+        role = m["role"]
+        content = m.get("content", "")[:500]  # Truncate long content
+        if role == "tool":
+            tc_id = m.get("tool_call_id", "unknown")
+            history_text += f"Tool (id={tc_id}): {content}\n\n"
+        else:
+            history_text += f"{role.capitalize()}: {content}\n\n"
+    summary_input = [
+        {"role": "system", "content": summarizer_prompt},
+        {"role": "user", "content": "Summarize this conversation:\n" + history_text},
+    ]
     api_key = cfg.get("api_key")
     if not api_key:
         return {"error": "no_api_key"}
@@ -7563,7 +7587,7 @@ def _summarize_history_via_api(messages, cfg):
         "model": cfg["model"],
         "messages": summary_input,
         "temperature": 0.2,
-        "max_tokens": 1024,
+        "max_tokens": 2048,
         "stream": False,
     }
     try:
@@ -7642,39 +7666,46 @@ def _compact_with_retry(messages, cfg, max_attempts=3):
         result = _summarize_history_via_api(messages, cfg)
         if isinstance(result, str):
             # Success: rebuild messages.
-            # The summarizer returned a JSON describing intent/decisions/
-            # files/pending. We preserve the ORIGINAL system prompt (the
-            # big one) and append the summary as an extra system message
-            # right after it, then keep the last 3 messages verbatim.
+            # The summarizer returned a JSON with "messages" array in OpenAI format.
+            # We parse it and use those messages directly as the new history.
             try:
                 raw = result.strip()
-                summary_blob = raw  # fallback if not JSON
-                try:
-                    parsed = json.loads(raw)
-                    if isinstance(parsed, dict):
-                        # Re-serialize the JSON dict so the model sees the
-                        # structured summary in the rebuilt history.
-                        summary_blob = json.dumps(parsed, ensure_ascii=False)
-                except Exception:
-                    # Non-JSON output: just use the raw text as the summary.
-                    pass
+                parsed = json.loads(raw)
 
-                sys_msg = (
-                    messages[0] if messages and messages[0].get("role") == "system" else None
-                )
-                recent = messages[-3:] if len(messages) >= 3 else messages[:]
-                new_msgs = []
-                if sys_msg:
-                    new_msgs.append(sys_msg)
-                new_msgs.append({
-                    "role": "system",
-                    "content": f"[Summary of earlier conversation: {summary_blob}]",
-                })
-                new_msgs.extend(recent)
-                if len(new_msgs) <= 1:
-                    return False
+                # Extract messages array from the summary
+                if isinstance(parsed, dict) and "messages" in parsed:
+                    summary_messages = parsed["messages"]
+                elif isinstance(parsed, list):
+                    summary_messages = parsed
+                else:
+                    # Non-standard format: wrap raw text as summary
+                    summary_messages = [{
+                        "role": "system",
+                        "content": f"[Summary: {raw}]"
+                    }]
+
+                # Skip the system message from the summary (we'll inject default system prompt later)
+                summary_messages = [m for m in summary_messages if m.get("role") != "system"]
+
+                # If no messages left after filtering, create a minimal summary
+                if not summary_messages:
+                    summary_messages.append({
+                        "role": "system",
+                        "content": "[Summary: conversation was summarized]"
+                    })
+
+                # Replace history with summarized messages (no system message)
                 messages.clear()
-                messages.extend(new_msgs)
+                messages.extend(summary_messages)
+
+                return True
+            except json.JSONDecodeError:
+                # Non-JSON output: use raw text as a system message
+                messages.clear()
+                messages.append({
+                    "role": "system",
+                    "content": f"[Summary: {result}]"
+                })
                 return True
             except Exception:
                 return False
@@ -7819,6 +7850,12 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                         f"summarize the conversation...{C.RESET}"
                     )
                     if _compact_with_retry(messages, cfg):
+                        # Summarization succeeded - inject system prompt at position 0
+                        # The summary already has a system message with context, so we
+                        # prepend the default system prompt (which has instructions/tools)
+                        sys_prompt = load_system_prompt(cfg)
+                        if sys_prompt:
+                            messages.insert(0, {"role": "system", "content": sys_prompt})
                         print(
                             f"{C.YELLOW}  Summarization done, retrying with the "
                             f"compact history.{C.RESET}"
