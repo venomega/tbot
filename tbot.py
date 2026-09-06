@@ -7518,8 +7518,159 @@ Replace this with instructions for the model.
 MAX_TOOL_ONLY_ROUNDS = 120
 
 
+def _summarize_history_via_api(messages, cfg):
+    """Ask the model itself to summarize the conversation.
+
+    Uses a tiny prompt that asks for a compact JSON preserving user intent,
+    key facts, decisions, files touched, and pending tasks. Returns the raw
+    summary text on success, or a dict with "error" key on failure.
+    Retry policy is handled by the caller (_compact_with_retry).
+    """
+    summarizer_prompt = (
+        "You are a summarizer. Compress the following conversation into a "
+        "concise JSON object that preserves: user intent, key facts, "
+        "decisions made, files modified, and pending tasks. Drop tool "
+        "outputs and any verbatim file contents. Reply ONLY with the JSON, "
+        "no prose, no markdown fences."
+    )
+    summary_input = [{"role": "system", "content": summarizer_prompt}] + messages
+    api_key = cfg.get("api_key")
+    if not api_key:
+        return {"error": "no_api_key"}
+    base_url = _provider_url(cfg)
+    if not base_url:
+        return {"error": "no_url"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/user/tbot",
+        "X-Title": "tbot",
+    }
+    payload = {
+        "model": cfg["model"],
+        "messages": summary_input,
+        "temperature": 0.2,
+        "max_tokens": 1024,
+        "stream": False,
+    }
+    try:
+        resp = requests.post(
+            base_url + "/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=_CONNECTION_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        return {"error": "timeout"}
+    except requests.exceptions.SSLError:
+        return {"error": "ssl"}
+    except requests.exceptions.ConnectionError:
+        return {"error": "connection"}
+    except requests.exceptions.ProxyError:
+        return {"error": "proxy"}
+    except Exception as e:
+        return {"error": "unknown", "detail": str(e)}
+
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+            err = data.get("error", {})
+            if isinstance(err, dict):
+                msg = err.get("message", str(err))
+                err_code = err.get("code")
+            else:
+                msg = str(err)
+                err_code = None
+        except Exception:
+            msg = resp.text[:300]
+            err_code = None
+        msg_lc = (msg or "").lower()
+        is_ctx_overflow = resp.status_code == 400 and (
+            err_code == "context_length_exceeded"
+            or "context_length_exceeded" in msg_lc
+            or "context window" in msg_lc
+            or "prompt is too long" in msg_lc
+            or "maximum context length" in msg_lc
+            or "reduce the length of" in msg_lc
+            or "too many tokens" in msg_lc
+        )
+        if resp.status_code in (429, 529):
+            return {"error": "rate_limit", "detail": msg, "status": resp.status_code}
+        if is_ctx_overflow:
+            return {"error": "context_overflow", "detail": msg, "status": resp.status_code}
+        return {"error": f"http_{resp.status_code}", "detail": msg}
+
+    try:
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return {"error": "parse_failed", "detail": str(e)}
+
+
+def _compact_with_retry(messages, cfg, max_attempts=3):
+    """Try summarization first; retry only on non-overflow failures.
+
+    Strategy:
+      1. Try _summarize_history_via_api().
+      2. If it returns a string (success) -> rebuild messages with the
+         summary and return True.
+      3. If it returns "context_overflow" -> bail out to truncate fallback
+         (we never want to loop on the same overflow).
+      4. If it returns any other error (rate_limit, timeout, http_5xx,
+         parse_failed, no_api_key...) -> retry up to max_attempts with
+         exponential backoff, because the underlying conversation did not
+         change and the next attempt has a real chance of succeeding.
+      5. After exhausting retries or hitting context_overflow -> return
+         False so the caller falls back to _auto_compact_messages().
+    """
+    delay = base_delay_compaction  # local alias for backoff
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        result = _summarize_history_via_api(messages, cfg)
+        if isinstance(result, str):
+            # Success: rebuild messages with the summary
+            try:
+                sys_msg = (
+                    messages[0] if messages and messages[0].get("role") == "system" else None
+                )
+                recent = messages[-3:] if len(messages) >= 3 else messages[:]
+                summary_msg = {
+                    "role": "system",
+                    "content": f"[Summary of earlier conversation: {result.strip()}]",
+                }
+                new_msgs = ([sys_msg] if sys_msg else []) + [summary_msg] + recent
+                messages.clear()
+                messages.extend(new_msgs)
+                return True
+            except Exception:
+                return False
+        # result is a dict with "error"
+        err_kind = result.get("error") if isinstance(result, dict) else "unknown"
+        last_err = err_kind
+        # Context overflow on summarization itself -> cannot be fixed by
+        # retrying the same call (the input didn't shrink). Bail out.
+        if err_kind == "context_overflow":
+            return False
+        # No point retrying if there is no key/url configured.
+        if err_kind in ("no_api_key", "no_url"):
+            return False
+        if attempt < max_attempts:
+            wait = delay * (2 ** (attempt - 1))
+            print(
+                f"\n{C.YELLOW}  Summarization attempt {attempt}/{max_attempts} "
+                f"failed ({err_kind}), retrying in {wait:.0f}s...{C.RESET}"
+            )
+            time.sleep(wait)
+        else:
+            print(
+                f"\n{C.YELLOW}  Summarization failed after {max_attempts} attempts "
+                f"({err_kind}). Falling back to truncate.{C.RESET}"
+            )
+    return False
+
+
 def _auto_compact_messages(messages):
-    """Trim older messages when context overflow is detected.
+    """Fallback: truncate older messages when summarization is unavailable.
 
     Keeps the system message (index 0) and the last ~6 messages (so the
     conversation retains recent intent). The dropped turn is replaced with
@@ -7592,6 +7743,7 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         stream_retries = 0
         stream_interrupted_delay = 5.0
         context_compacted = False
+        base_delay_compaction = 1.0
         tool_only_rounds = 0
         stuck_rounds = 0
     except KeyboardInterrupt:
@@ -7623,15 +7775,27 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     time.sleep(delay)
                     continue
                 # Context overflow: cannot be fixed by retrying the same request.
-                # Try once to auto-compact by dropping older messages (keep system +
-                # last few turns). On the first error of the conversation only,
-                # otherwise it would loop forever.
+                # Try summarization first (with retry on non-overflow errors).
+                # If summarization fails or itself overflows, fall back to
+                # truncating older messages. On the first overflow of the
+                # conversation only, otherwise it would loop forever.
                 if err_kind == "context_overflow" and not context_compacted:
-                    _auto_compact_messages(messages)
                     context_compacted = True
                     print(
-                        f"\n{C.YELLOW}  Context overflow: trimmed older messages, retrying...{C.RESET}"
+                        f"\n{C.YELLOW}  Context overflow: asking the model to "
+                        f"summarize the conversation...{C.RESET}"
                     )
+                    if _compact_with_retry(messages, cfg):
+                        print(
+                            f"{C.YELLOW}  Summarization done, retrying with the "
+                            f"compact history.{C.RESET}"
+                        )
+                    else:
+                        _auto_compact_messages(messages)
+                        print(
+                            f"{C.YELLOW}  Context overflow: trimmed older "
+                            f"messages, retrying...{C.RESET}"
+                        )
                     continue
                 show_error(
                     result.get("title", "Error"),
