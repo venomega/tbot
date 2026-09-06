@@ -7516,24 +7516,37 @@ Replace this with instructions for the model.
 
 
 MAX_TOOL_ONLY_ROUNDS = 120
+BASE_DELAY_COMPACTION = 1.0  # exponential backoff base for _compact_with_retry
 
 
 def _summarize_history_via_api(messages, cfg):
     """Ask the model itself to summarize the conversation.
 
-    Uses a tiny prompt that asks for a compact JSON preserving user intent,
-    key facts, decisions, files touched, and pending tasks. Returns the raw
-    summary text on success, or a dict with "error" key on failure.
-    Retry policy is handled by the caller (_compact_with_retry).
+    The summarizer does NOT receive the original (potentially huge) system
+    prompt — that would defeat the point of compacting. Instead, it only
+    sees the user/assistant/tool messages and produces a single JSON
+    describing intent, decisions, files touched, and pending tasks. The
+    caller is responsible for attaching the real system prompt to the
+    rebuilt history.
+
+    Returns the raw summary text on success, or a dict with "error" key on
+    failure. Retry policy is handled by the caller (_compact_with_retry).
     """
     summarizer_prompt = (
-        "You are a summarizer. Compress the following conversation into a "
-        "concise JSON object that preserves: user intent, key facts, "
-        "decisions made, files modified, and pending tasks. Drop tool "
-        "outputs and any verbatim file contents. Reply ONLY with the JSON, "
-        "no prose, no markdown fences."
+        "You are a summarizer for a CLI coding assistant. You will receive "
+        "a conversation history (no system prompt).\n\n"
+        "Produce a SINGLE JSON object with these keys:\n"
+        '  - "intent": what the user wanted (<= 200 chars)\n'
+        '  - "decisions": list of decisions taken (<= 5 items)\n'
+        '  - "files_modified": list of file paths changed (<= 10 items)\n'
+        '  - "pending_tasks": list of unfinished items (<= 5 items)\n'
+        '  - "notes": any extra context the assistant must know (<= 300 chars)\n\n'
+        "Reply ONLY with the JSON object. No prose, no markdown fences."
     )
-    summary_input = [{"role": "system", "content": summarizer_prompt}] + messages
+    # Strip the original system prompt from the input: the summarizer does
+    # not need it and shipping it would defeat the compaction goal.
+    convo_only = [m for m in messages if m.get("role") != "system"]
+    summary_input = [{"role": "system", "content": summarizer_prompt}] + convo_only
     api_key = cfg.get("api_key")
     if not api_key:
         return {"error": "no_api_key"}
@@ -7623,22 +7636,43 @@ def _compact_with_retry(messages, cfg, max_attempts=3):
       5. After exhausting retries or hitting context_overflow -> return
          False so the caller falls back to _auto_compact_messages().
     """
-    delay = base_delay_compaction  # local alias for backoff
+    delay = BASE_DELAY_COMPACTION  # local alias for backoff
     last_err = None
     for attempt in range(1, max_attempts + 1):
         result = _summarize_history_via_api(messages, cfg)
         if isinstance(result, str):
-            # Success: rebuild messages with the summary
+            # Success: rebuild messages.
+            # The summarizer returned a JSON describing intent/decisions/
+            # files/pending. We preserve the ORIGINAL system prompt (the
+            # big one) and append the summary as an extra system message
+            # right after it, then keep the last 3 messages verbatim.
             try:
+                raw = result.strip()
+                summary_blob = raw  # fallback if not JSON
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        # Re-serialize the JSON dict so the model sees the
+                        # structured summary in the rebuilt history.
+                        summary_blob = json.dumps(parsed, ensure_ascii=False)
+                except Exception:
+                    # Non-JSON output: just use the raw text as the summary.
+                    pass
+
                 sys_msg = (
                     messages[0] if messages and messages[0].get("role") == "system" else None
                 )
                 recent = messages[-3:] if len(messages) >= 3 else messages[:]
-                summary_msg = {
+                new_msgs = []
+                if sys_msg:
+                    new_msgs.append(sys_msg)
+                new_msgs.append({
                     "role": "system",
-                    "content": f"[Summary of earlier conversation: {result.strip()}]",
-                }
-                new_msgs = ([sys_msg] if sys_msg else []) + [summary_msg] + recent
+                    "content": f"[Summary of earlier conversation: {summary_blob}]",
+                })
+                new_msgs.extend(recent)
+                if len(new_msgs) <= 1:
+                    return False
                 messages.clear()
                 messages.extend(new_msgs)
                 return True
@@ -7743,7 +7777,6 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         stream_retries = 0
         stream_interrupted_delay = 5.0
         context_compacted = False
-        base_delay_compaction = 1.0
         tool_only_rounds = 0
         stuck_rounds = 0
     except KeyboardInterrupt:
