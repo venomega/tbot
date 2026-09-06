@@ -41,6 +41,8 @@ _MEMORY_SUBCMDS = ["show", "edit", "gate", "search"]
 _EPISODIC_SUBCMDS = ["search", "stats", "prune"]
 _MCP_SUBCMDS = ["status", "connect", "disconnect", "reconnect", "discover"]
 
+_CONNECTION_TIMEOUT = 30
+
 _total_tokens = 0
 _last_cost = 0
 _acc_cost = 0
@@ -4409,13 +4411,13 @@ def chat_completion(messages, cfg, stream=True, tools=None):
             headers=headers,
             json=payload,
             stream=stream,
-            timeout=10,
+            timeout=_CONNECTION_TIMEOUT,
         )
     except requests.exceptions.Timeout:
         return {
             "error": "timeout",
             "title": "Connection timed out",
-            "detail": f"The request to {provider_name} timed out after 10s.",
+            "detail": f"The request to {provider_name} timed out after {_CONNECTION_TIMEOUT}s.",
             "hint": "Check your internet connection. The client will retry automatically.",
         }
     except requests.exceptions.SSLError as e:
@@ -4451,9 +4453,61 @@ def chat_completion(messages, cfg, stream=True, tools=None):
         try:
             data = resp.json()
             err = data.get("error", {})
-            msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+            if isinstance(err, dict):
+                msg = err.get("message", str(err))
+                err_code = err.get("code")  # e.g. "context_length_exceeded"
+                err_type = err.get("type")  # e.g. "invalid_request_error"
+            else:
+                msg = str(err)
+                err_code = None
+                err_type = None
         except Exception:
             msg = resp.text[:300]
+            err_code = None
+            err_type = None
+        # Rate-limit detection: HTTP 429 (and sometimes 529) => wait 60s before retry
+        if resp.status_code in (429, 529):
+            if cfg.get("provider") == "custom":
+                hint = "Rate limit hit. The client will wait 60s before retrying automatically."
+            else:
+                hint = (
+                    f"Rate limit hit on {provider_name}. "
+                    "The client will wait 60s before retrying automatically."
+                )
+            return {
+                "error": "rate_limit",
+                "title": f"Rate limited (HTTP {resp.status_code})",
+                "detail": msg,
+                "hint": hint,
+            }
+        # Context-length / prompt-too-long detection.
+        # Heuristics: OpenAI-compatible APIs put `code: "context_length_exceeded"` in the
+        # error body, others surface it in the message ("context window", "prompt is too long",
+        # "too many tokens", "maximum context length", etc.).
+        msg_lc = (msg or "").lower()
+        is_ctx_overflow = (
+            resp.status_code == 400
+            and (
+                err_code == "context_length_exceeded"
+                or "context_length_exceeded" in msg_lc
+                or "context window" in msg_lc
+                or "prompt is too long" in msg_lc
+                or "maximum context length" in msg_lc
+                or "reduce the length of" in msg_lc
+                or "too many tokens" in msg_lc
+            )
+        )
+        if is_ctx_overflow:
+            return {
+                "error": "context_overflow",
+                "title": "Context length exceeded",
+                "detail": msg,
+                "hint": (
+                    "The conversation + tool outputs exceed the model's context window. "
+                    "tbot will automatically trim older messages and retry. "
+                    "For a clean slate, run /clear."
+                ),
+            }
         if cfg.get("provider") == "custom":
             hint = "Check your API key, custom URL, and model name. Ensure the endpoint supports OpenAI-compatible /chat/completions."
         else:
@@ -7464,6 +7518,43 @@ Replace this with instructions for the model.
 MAX_TOOL_ONLY_ROUNDS = 120
 
 
+def _auto_compact_messages(messages):
+    """Trim older messages when context overflow is detected.
+
+    Keeps the system message (index 0) and the last ~6 messages (so the
+    conversation retains recent intent). The dropped turn is replaced with
+    a synthetic 'compaction marker' so the model knows history was trimmed.
+    Safe to call on already-short message lists (no-op when len <= 7).
+    """
+    try:
+        # Find first system message and last meaningful index
+        if len(messages) <= 7:
+            return
+        keep_from = max(1, len(messages) - 6)
+        sys_msg = messages[0] if messages and messages[0].get("role") == "system" else None
+        dropped = messages[1:keep_from] if sys_msg else messages[:keep_from]
+        kept_tail = messages[keep_from:]
+        if not kept_tail:
+            return
+        marker = {
+            "role": "system",
+            "content": (
+                f"[Compaction: {len(dropped)} earlier message(s) were trimmed to "
+                "fit the model's context window. Earlier tool outputs and turns "
+                "are no longer available.]"
+            ),
+        }
+        if sys_msg:
+            new_msgs = [sys_msg, marker] + kept_tail
+        else:
+            new_msgs = [marker] + kept_tail
+        messages.clear()
+        messages.extend(new_msgs)
+    except Exception:
+        # Never let compaction itself crash the loop
+        pass
+
+
 def send_conversation(messages, cfg, pop_on_first_error=False):
     _conv_start_time = time.time()
     try:
@@ -7493,11 +7584,14 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 tools += mcp_tools
         max_rounds = cfg.get("max_rounds", 200)
         round_n = 0
-        retryable_errors = {"connection", "timeout", "ssl", "proxy"}
+        retryable_errors = {"connection", "timeout", "ssl", "proxy", "rate_limit"}
         max_retries = 3
         base_delay = 1.0
-        max_stream_retries = 5
+        rate_limit_delay = 60.0
+        max_stream_retries = 10
         stream_retries = 0
+        stream_interrupted_delay = 5.0
+        context_compacted = False
         tool_only_rounds = 0
         stuck_rounds = 0
     except KeyboardInterrupt:
@@ -7511,12 +7605,33 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                 result = chat_completion(messages, cfg, stream=True, tools=tools)
                 if "error" not in result:
                     break
-                if attempt < max_retries and result.get("error") in retryable_errors:
-                    delay = base_delay * (2**attempt)
-                    print(
-                        f"\n  {C.YELLOW}Connection lost ({result['error']}), retrying in {delay:.0f}s... (attempt {attempt + 1}/{max_retries}){C.RESET}"
-                    )
+                err_kind = result.get("error")
+                if attempt < max_retries and err_kind in retryable_errors:
+                    if err_kind == "rate_limit":
+                        delay = rate_limit_delay
+                        wait_msg = (
+                            f"\n{C.YELLOW}Rate limited, waiting {delay:.0f}s before retry... "
+                            f"(attempt {attempt + 1}/{max_retries}){C.RESET}"
+                        )
+                    else:
+                        delay = base_delay * (2**attempt)
+                        wait_msg = (
+                            f"\n  {C.YELLOW}Connection lost ({err_kind}), retrying in {delay:.0f}s... "
+                            f"(attempt {attempt + 1}/{max_retries}){C.RESET}"
+                        )
+                    print(wait_msg)
                     time.sleep(delay)
+                    continue
+                # Context overflow: cannot be fixed by retrying the same request.
+                # Try once to auto-compact by dropping older messages (keep system +
+                # last few turns). On the first error of the conversation only,
+                # otherwise it would loop forever.
+                if err_kind == "context_overflow" and not context_compacted:
+                    _auto_compact_messages(messages)
+                    context_compacted = True
+                    print(
+                        f"\n{C.YELLOW}  Context overflow: trimmed older messages, retrying...{C.RESET}"
+                    )
                     continue
                 show_error(
                     result.get("title", "Error"),
@@ -7544,12 +7659,13 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
                     break
                 if content:
                     print(
-                        f"\n{C.YELLOW}  Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
+                        f"\n{C.YELLOW}  Stream interrupted, reconnecting in {stream_interrupted_delay:.0f}s... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
                     )
                 else:
                     print(
-                        f"\n  {C.YELLOW}Stream interrupted, reconnecting... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
+                        f"\n  {C.YELLOW}Stream interrupted, reconnecting in {stream_interrupted_delay:.0f}s... (retry {stream_retries}/{max_stream_retries}){C.RESET}"
                     )
+                time.sleep(stream_interrupted_delay)
                 round_n -= 1
                 continue
             if _tot or content or tool_calls:
