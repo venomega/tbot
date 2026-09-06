@@ -5006,7 +5006,7 @@ def parse_stream(resp, resp_color="95"):
                             _log_fh.flush()
                         except Exception:
                             pass
-                for tc in delta.get("tool_calls", []):
+                for tc in (delta.get("tool_calls") or []):
                     idx = tc.get("index", 0)
                     if idx not in tool_calls:
                         tool_calls[idx] = {
@@ -7567,7 +7567,7 @@ def _summarize_history_via_api(messages, cfg):
     history_text = ""
     for m in convo_only:
         role = m["role"]
-        content = m.get("content", "")[:500]  # Truncate long content
+        content = (m.get("content") or "")[:500]  # Truncate long content
         if role == "tool":
             tc_id = m.get("tool_call_id", "unknown")
             history_text += f"Tool (id={tc_id}): {content}\n\n"
