@@ -7573,6 +7573,13 @@ def _summarize_history_via_api(messages, cfg):
             history_text += f"Tool (id={tc_id}): {content}\n\n"
         else:
             history_text += f"{role.capitalize()}: {content}\n\n"
+            # Include tool_calls info if present (lost otherwise)
+            tool_calls = m.get("tool_calls")
+            if tool_calls:
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    args = fn.get("arguments", "")[:200]  # Truncate long args
+                    history_text += f"  [tool_call: {fn.get('name')} args={args}]\n\n"
     summary_input = [
         {"role": "system", "content": summarizer_prompt},
         {"role": "user", "content": "Summarize this conversation:\n" + history_text},
