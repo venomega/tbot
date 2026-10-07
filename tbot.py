@@ -2353,44 +2353,39 @@ def handle_websearch(args):
             {
                 "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://duckduckgo.com/",
-                "DNT": "1",
             }
         )
-        sess.get("https://duckduckgo.com/", timeout=8)
-        resp = sess.post(
-            "https://html.duckduckgo.com/html/", data={"q": query}, timeout=10
+        # DuckDuckGo blocks non-JS POST requests; use the Lite GET endpoint.
+        resp = sess.get(
+            f"https://lite.duckduckgo.com/lite/?q={urllib.parse.quote(query)}",
+            timeout=20,
         )
         resp.raise_for_status()
     except Exception as e:
         return f"Search failed: {e}"
     results = []
-    blocks = re.split(r'<div[^>]*class="[^"]*result__body[^"]*"', resp.text)[1:]
-    for block in blocks[:num_results]:
-        href = None
-        for pat in [
-            r'href="(https?://[^"]+)"[^>]*>[^<]*<[^>]+class="result__a"',
-            r'class="result__a"[^>]+href="(https?://[^"]*)"',
-            r'class="result__a"[^>]+href="(//[^"]*)"',
-        ]:
-            m = re.search(pat, block)
-            if m:
-                href = html.unescape(m.group(1))
-                break
-        if not href:
+    # DuckDuckGo Lite returns a table of <a class='result-link'> links.
+    for i, a in enumerate(
+        re.finditer(
+            r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]+class=['\"]?result-link['\"][^>]*>(.*?)</a>",
+            resp.text,
+            re.DOTALL,
+        )
+    ):
+        if i >= num_results:
+            break
+        href = html.unescape(a.group(1))
+        title = re.sub(r"<[^>]+>", "", a.group(2)).strip()
+        if not title:
             continue
         href = _resolve_ddg_url(href)
-        tm = re.search(r'class="result__a"[^>]*>(.*?)</a>', block, re.DOTALL)
-        title = re.sub(r"<[^>]+>", "", tm.group(1)).strip() if tm else ""
-        sm = re.search(
-            r'class="result__snippet"[^>]*>(.*?)</(?:span|div)>', block, re.DOTALL
-        )
-        snippet = re.sub(r"<[^>]+>", "", sm.group(1)).strip() if sm else ""
-        title = html.unescape(title)
-        snippet = html.unescape(snippet)
-        if title:
-            results.append((title, snippet, href))
+        # Skip Bing/MS advertising redirect URLs.
+        if "ad_provider" in href or "ad_domain" in href:
+            continue
+        # Skip generic "more info" / help pages.
+        if title.lower() == "more info" or "duckduckgo-help-pages" in href:
+            continue
+        results.append((title, "", href))
     if not results:
         return "No results found."
     out = []
