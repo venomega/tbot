@@ -117,6 +117,11 @@ PROVIDERS = {
         "url": "https://generativelanguage.googleapis.com/v1beta/openai",
         "env_key": "GEMINI_API_KEY",
     },
+    "anthropic": {
+        "name": "Anthropic (Claude)",
+        "url": "https://api.anthropic.com",
+        "env_key": "ANTHROPIC_API_KEY",
+    },
     "custom": {
         "name": "Custom API",
     },
@@ -4517,6 +4522,369 @@ def chat_completion(messages, cfg, stream=True, tools=None):
     return {"stream": resp}
 
 
+# ── Anthropic (Claude) Messages API ─────────────────────────────
+
+
+def chat_completion_anthropic(messages, cfg, stream=True, tools=None):
+    """Call Anthropic Messages API (non-OpenAI-compatible format)."""
+    api_key = cfg.get("api_key")
+    if not api_key:
+        provider_name = _provider_name(cfg)
+        return {
+            "error": "no_api_key",
+            "title": "API key not configured",
+            "detail": f"No API key found for {provider_name}. Run `/provider` to configure it.",
+            "hint": f"Set the API key in the config or use the provider setup command.",
+        }
+
+    base_url = _provider_url(cfg)
+    if not base_url:
+        return {
+            "error": "no_url",
+            "title": "Provider URL not configured",
+            "detail": "No base URL configured for this provider.",
+            "hint": "Run `/provider custom` to set up the URL and API key.",
+        }
+
+    # Anthropic separates system prompt from messages
+    system = None
+    anthropic_messages = []
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content", "")
+        if role == "system":
+            system = content
+            continue
+        anthropic_messages.append({"role": role, "content": content})
+
+    headers = {
+        "x-api-key": api_key,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": cfg["model"],
+        "messages": anthropic_messages,
+        "temperature": cfg["temperature"],
+        "max_tokens": _compute_max_tokens(cfg, messages),
+        "stream": stream,
+    }
+    if system:
+        payload["system"] = system
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = {"type": "auto"}
+
+    provider_name = _provider_name(cfg)
+    try:
+        resp = requests.post(
+            base_url + "/v1/messages",
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=_CONNECTION_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        return {
+            "error": "timeout",
+            "title": "Connection timed out",
+            "detail": f"The request to {provider_name} timed out after {_CONNECTION_TIMEOUT}s.",
+            "hint": "Check your internet connection. The client will retry automatically.",
+        }
+    except requests.exceptions.SSLError as e:
+        return {
+            "error": "ssl",
+            "title": "SSL certificate error",
+            "detail": f"Could not verify the SSL certificate: {e}",
+            "hint": "Check your system date/time. If on Termux, try: pkg install ca-certificates",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "error": "connection",
+            "title": f"Could not connect to {provider_name}",
+            "detail": "No route to host. Your device may be offline or the service is blocked.",
+            "hint": "Check your internet connection with: ping api.anthropic.com\nIf on Termux, try: pkg install openssl && pkg reinstall python",
+        }
+    except requests.exceptions.ProxyError:
+        return {
+            "error": "proxy",
+            "title": "Proxy connection failed",
+            "detail": "Could not connect through the configured proxy.",
+            "hint": "Check your proxy settings or disable the proxy and try again.",
+        }
+    except Exception as e:
+        return {
+            "error": "unknown",
+            "title": "Unexpected error",
+            "detail": str(e),
+            "hint": "This is an unexpected error. Check your setup and try again.",
+        }
+
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+            err = data.get("error", {})
+            if isinstance(err, dict):
+                msg = err.get("message", str(err))
+                err_type = err.get("type")
+            else:
+                msg = str(err)
+                err_type = None
+        except Exception:
+            msg = resp.text[:300]
+            err_type = None
+        # Rate-limit detection: HTTP 429
+        if resp.status_code in (429, 529):
+            hint = f"Rate limit hit on {provider_name}. The client will wait 60s before retrying automatically."
+            return {
+                "error": "rate_limit",
+                "title": f"Rate limited (HTTP {resp.status_code})",
+                "detail": msg,
+                "hint": hint,
+            }
+        msg_lc = (msg or "").lower()
+        is_ctx_overflow = (
+            resp.status_code == 400
+            and (
+                "context_length_exceeded" in msg_lc
+                or "context window" in msg_lc
+                or "prompt is too long" in msg_lc
+                or "maximum context length" in msg_lc
+                or "reduce the length of" in msg_lc
+                or "too many tokens" in msg_lc
+                or "maximum_tokens" in msg_lc
+                or "exceeds the maximum" in msg_lc
+            )
+        )
+        if is_ctx_overflow:
+            return {
+                "error": "context_overflow",
+                "title": "Context length exceeded",
+                "detail": msg,
+                "hint": (
+                    "The conversation + tool outputs exceed the model's context window. "
+                    "tbot will automatically trim older messages and retry. "
+                    "For a clean slate, run /clear."
+                ),
+            }
+        hint = f"Check your API key, model name, and {provider_name} status."
+        return {
+            "error": f"http_{resp.status_code}",
+            "title": f"HTTP {resp.status_code}",
+            "detail": msg,
+            "hint": hint,
+        }
+
+    return {"stream": resp}
+
+
+def parse_stream_anthropic(resp, resp_color="95"):
+    """Parse Anthropic Messages API streaming SSE events."""
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    token_count = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    cost = 0
+    interrupted = False
+    _color_printed = False
+    line_buf = ""
+    in_code_block = False
+    table_buf = []
+
+    sock = None
+    try:
+        conn = getattr(resp.raw, "connection", None)
+        sock = getattr(conn, "sock", None) if conn else None
+    except Exception:
+        pass
+
+    try:
+        iterator = resp.iter_lines()
+    except Exception:
+        return None, None, None, 0, 0, 0, 0, True
+
+    received = False
+    try:
+        for raw in iterator:
+            if not raw:
+                continue
+            if not received:
+                received = True
+                if sock:
+                    try:
+                        sock.settimeout(3.0)
+                    except Exception:
+                        sock = None
+            try:
+                raw = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not raw.startswith("data: "):
+                continue
+            chunk = raw[6:].strip()
+            if chunk == "[DONE]":
+                try:
+                    resp.raw.drain_conn()
+                except Exception:
+                    pass
+                break
+            try:
+                data = json.loads(chunk)
+            except json.JSONDecodeError:
+                continue
+
+            event_type = data.get("type")
+
+            # ── Usage / token counts ──────────────────────────
+            usage = data.get("usage")
+            if usage:
+                pt = usage.get("input_tokens", 0)
+                ct = usage.get("output_tokens", 0)
+                if pt:
+                    prompt_tokens = pt
+                if ct:
+                    completion_tokens = ct
+                if pt or ct:
+                    total_tokens = (pt or 0) + (ct or 0)
+
+            # ── Content delta ─────────────────────────────────
+            if event_type == "content_block_delta":
+                delta = data.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    c = delta.get("text")
+                    if c:
+                        content_parts.append(c)
+                        token_count += 1
+                        if not _color_printed:
+                            _color_printed = True
+                        line_buf += c
+                        while "\n" in line_buf:
+                            idx = line_buf.index("\n")
+                            line = line_buf[:idx]
+                            line_buf = line_buf[idx + 1:]
+                            rendered, in_code_block = _render_md_line(
+                                line, resp_color, in_code_block
+                            )
+                            if rendered is None:
+                                table_buf.append(line)
+                            else:
+                                if table_buf:
+                                    for t_line in _render_table(table_buf, resp_color):
+                                        print(t_line, flush=True)
+                                    table_buf = []
+                                if rendered:
+                                    print(rendered, flush=True)
+                                else:
+                                    print(flush=True)
+                            if _log_fh is not None:
+                                try:
+                                    _log_fh.write(c)
+                                    _log_fh.flush()
+                                except Exception:
+                                    pass
+                elif delta.get("type") == "input_json_delta":
+                    # Tool call argument accumulation
+                    index = data.get("index", 0)
+                    partial_json = delta.get("partial_json", "")
+                    if index not in tool_calls:
+                        tool_calls[index] = {
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    entry = tool_calls[index]
+                    entry["function"]["arguments"] += partial_json
+
+            # ── Content block start (tool call name + id) ─────
+            elif event_type == "content_block_start":
+                content_block = data.get("content_block", {})
+                index = data.get("index", 0)
+                if index not in tool_calls:
+                    tool_calls[index] = {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls[index]
+                if content_block.get("type") == "tool_use":
+                    entry["id"] = content_block.get("id", "")
+                    entry["function"]["name"] = content_block.get("name", "")
+
+            # ── Message delta (stop reason, usage) ────────────
+            elif event_type == "message_delta":
+                delta = data.get("delta", {})
+                stop_reason = delta.get("stop_reason")
+                usage = delta.get("usage")
+                if usage:
+                    pt = usage.get("input_tokens", 0)
+                    ct = usage.get("output_tokens", 0)
+                    if pt:
+                        prompt_tokens = pt
+                    if ct:
+                        completion_tokens = ct
+                    total_tokens = (pt or 0) + (ct or 0)
+
+            # ── Message start / stop ──────────────────────────
+            elif event_type in ("message_start", "message_stop"):
+                pass
+
+    except (socket.timeout, OSError):
+        interrupted = True
+
+    if _color_printed and not interrupted:
+        if line_buf:
+            rendered, in_code_block = _render_md_line(
+                line_buf, resp_color, in_code_block
+            )
+            if rendered is None:
+                table_buf.append(line_buf)
+            else:
+                if table_buf:
+                    for t_line in _render_table(table_buf, resp_color):
+                        print(t_line, flush=True)
+                    table_buf = []
+                if rendered:
+                    print(rendered, flush=True)
+                else:
+                    print(flush=True)
+        if table_buf:
+            for t_line in _render_table(table_buf, resp_color):
+                print(t_line, flush=True)
+            table_buf = []
+        print(C.RESET, end="", flush=True)
+
+    if content_parts and _log_fh is not None and not interrupted:
+        try:
+            _log_fh.write("\n")
+            _log_fh.flush()
+        except Exception:
+            pass
+
+    if not completion_tokens:
+        completion_tokens = token_count
+    content = "".join(content_parts)
+    reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
+    calls = list(tool_calls.values()) if tool_calls else None
+    if calls:
+        for c in calls:
+            _log_write(
+                f"tool_call: {c['function']['name']}({c['function']['arguments'][:200]})"
+            )
+    return (
+        content,
+        reasoning_content,
+        calls,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost,
+        interrupted,
+    )
+
+
 # ── Stream parsing ──────────────────────────────────────────────
 
 
@@ -7826,7 +8194,12 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
-                result = chat_completion(messages, cfg, stream=True, tools=tools)
+                if cfg.get("provider") == "anthropic":
+                    result = chat_completion_anthropic(
+                        messages, cfg, stream=True, tools=tools
+                    )
+                else:
+                    result = chat_completion(messages, cfg, stream=True, tools=tools)
                 if "error" not in result:
                     break
                 err_kind = result.get("error")
@@ -7886,8 +8259,12 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             if "error" in result:
                 break
             global _total_tokens, _last_cost, _acc_cost
-            content, reasoning_content, tool_calls, pt, ct, _tot, _cost, interrupted = parse_stream(
-                result["stream"], resp_color=cfg.get("resp_color", "95")
+            content, reasoning_content, tool_calls, pt, ct, _tot, _cost, interrupted = (
+                parse_stream_anthropic(result["stream"], resp_color=cfg.get("resp_color", "95"))
+                if cfg.get("provider") == "anthropic"
+                else parse_stream(
+                    result["stream"], resp_color=cfg.get("resp_color", "95")
+                )
             )
             result["stream"].close()
             if interrupted:
