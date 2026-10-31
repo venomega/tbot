@@ -122,6 +122,11 @@ PROVIDERS = {
         "url": "https://api.anthropic.com",
         "env_key": "ANTHROPIC_API_KEY",
     },
+    "kilo-free": {
+        "name": "Kilo Free",
+        "url": "https://api.kilo.ai/api/gateway",
+        "env_key": "KILO_API_KEY",
+    },
     "custom": {
         "name": "Custom API",
     },
@@ -4275,6 +4280,8 @@ def save_cfg(cfg):
 
 def resolve_key(cfg):
     provider = cfg.get("provider", "openrouter")
+    # kilo-free works without an API key (free tier). Make the key optional.
+    optional_key = provider == "kilo-free"
     if provider == "custom":
         key = cfg.get("api_key")
         if not key:
@@ -4299,6 +4306,8 @@ def resolve_key(cfg):
             save_cfg(cfg)
         return key
     print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
+    if optional_key:
+        print(f"(Leave blank to use the free tier without an API key.)")
     print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
     try:
         key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
@@ -4306,6 +4315,10 @@ def resolve_key(cfg):
         print()
         sys.exit(1)
     if not key:
+        if optional_key:
+            cfg["api_key"] = ""
+            save_cfg(cfg)
+            return ""
         print(f"{C.RED}No key provided.{C.RESET}")
         sys.exit(1)
     cfg["api_key"] = key
@@ -4654,6 +4667,139 @@ def chat_completion_anthropic(messages, cfg, stream=True, tools=None):
                 or "too many tokens" in msg_lc
                 or "maximum_tokens" in msg_lc
                 or "exceeds the maximum" in msg_lc
+            )
+        )
+        if is_ctx_overflow:
+            return {
+                "error": "context_overflow",
+                "title": "Context length exceeded",
+                "detail": msg,
+                "hint": (
+                    "The conversation + tool outputs exceed the model's context window. "
+                    "tbot will automatically trim older messages and retry. "
+                    "For a clean slate, run /clear."
+                ),
+            }
+        hint = f"Check your API key, model name, and {provider_name} status."
+        return {
+            "error": f"http_{resp.status_code}",
+            "title": f"HTTP {resp.status_code}",
+            "detail": msg,
+            "hint": hint,
+        }
+
+    return {"stream": resp}
+
+
+# ── Kilo Free (OpenAI-like, stripped down) ───────────────────────
+
+def chat_completion_kilo_free(messages, cfg, stream=True, tools=None):
+    """Call Kilo Free API (OpenAI-like /chat/completions, minimal payload).
+    API key is optional — the endpoint works without one."""
+    api_key = cfg.get("api_key")  # optional
+
+    base_url = _provider_url(cfg)
+    if not base_url:
+        return {
+            "error": "no_url",
+            "title": "Provider URL not configured",
+            "detail": "No base URL configured for this provider.",
+            "hint": "Run /provider custom to set up the URL and API key.",
+        }
+
+    # Minimal OpenAI-like payload: only model + messages (strip unnecessary fields)
+    payload = {
+        "model": cfg["model"],
+        "messages": messages,
+    }
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    provider_name = _provider_name(cfg)
+    try:
+        resp = requests.post(
+            base_url + "/chat/completions",
+            headers=headers,
+            json=payload,
+            stream=stream,
+            timeout=_CONNECTION_TIMEOUT,
+        )
+    except requests.exceptions.Timeout:
+        return {
+            "error": "timeout",
+            "title": "Connection timed out",
+            "detail": f"The request to {provider_name} timed out after {_CONNECTION_TIMEOUT}s.",
+            "hint": "Check your internet connection. The client will retry automatically.",
+        }
+    except requests.exceptions.SSLError as e:
+        return {
+            "error": "ssl",
+            "title": "SSL certificate error",
+            "detail": f"Could not verify the SSL certificate: {e}",
+            "hint": "Check your system date/time. If on Termux, try: pkg install ca-certificates",
+        }
+    except requests.exceptions.ConnectionError:
+        return {
+            "error": "connection",
+            "title": f"Could not connect to {provider_name}",
+            "detail": "No route to host. Your device may be offline or the service is blocked.",
+            "hint": "Check your internet connection with: ping api.kilo.ai\nIf on Termux, try: pkg install openssl && pkg reinstall python",
+        }
+    except requests.exceptions.ProxyError:
+        return {
+            "error": "proxy",
+            "title": "Proxy connection failed",
+            "detail": "Could not connect through the configured proxy.",
+            "hint": "Check your proxy settings or disable the proxy and try again.",
+        }
+    except Exception as e:
+        return {
+            "error": "unknown",
+            "title": "Unexpected error",
+            "detail": str(e),
+            "hint": "This is an unexpected error. Check your setup and try again.",
+        }
+
+    if resp.status_code != 200:
+        try:
+            data = resp.json()
+            err = data.get("error", {})
+            if isinstance(err, dict):
+                msg = err.get("message", str(err))
+                err_code = err.get("code")
+                err_type = err.get("type")
+            else:
+                msg = str(err)
+                err_code = None
+                err_type = None
+        except Exception:
+            msg = resp.text[:300]
+            err_code = None
+            err_type = None
+        # Rate-limit detection: HTTP 429 (and sometimes 529)
+        if resp.status_code in (429, 529):
+            return {
+                "error": "rate_limit",
+                "title": f"Rate limited (HTTP {resp.status_code})",
+                "detail": msg,
+                "hint": f"Rate limit hit on {provider_name}. The client will wait 60s before retrying automatically.",
+            }
+        # Context-length / prompt-too-long detection.
+        msg_lc = (msg or "").lower()
+        is_ctx_overflow = (
+            resp.status_code == 400
+            and (
+                err_code == "context_length_exceeded"
+                or "context_length_exceeded" in msg_lc
+                or "context window" in msg_lc
+                or "prompt is too long" in msg_lc
+                or "maximum context length" in msg_lc
+                or "reduce the length of" in msg_lc
+                or "too many tokens" in msg_lc
             )
         )
         if is_ctx_overflow:
@@ -5257,6 +5403,87 @@ def _render_md_line(line, resp_color, in_code_block):
     # Regular line with inline formatting
     rendered = _render_inline_fmt(line, base_ansi, reset)
     return f"{base_ansi}{rendered}{reset}", False
+
+
+def parse_stream_kilo_free(resp, resp_color="95"):
+    """Parse Kilo Free non-streaming JSON response (OpenAI-like)."""
+    content_parts = []
+    reasoning_parts = []
+    tool_calls = {}
+    token_count = 0
+    prompt_tokens = 0
+    completion_tokens = 0
+    total_tokens = 0
+    cost = 0
+    interrupted = False
+
+    try:
+        data = resp.json()
+    except Exception:
+        return None, None, None, 0, 0, 0, 0, True
+
+    usage = data.get("usage") or {}
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    tt = usage.get("total_tokens", 0)
+    c = usage.get("cost", 0)
+    if pt:
+        prompt_tokens = pt
+    if ct:
+        completion_tokens = ct
+    if tt:
+        total_tokens = tt
+    if c:
+        cost = c
+
+    choices = data.get("choices", [])
+    if choices:
+        message = choices[0].get("message", {})
+        c_text = message.get("content")
+        if c_text:
+            content_parts.append(c_text)
+            token_count += 1
+            # Render the content line-by-line like the stream parser
+            line_buf = c_text
+            in_code_block = False
+            table_buf = []
+            while '\n' in line_buf:
+                idx = line_buf.index('\n')
+                line = line_buf[:idx]
+                line_buf = line_buf[idx + 1:]
+                rendered, in_code_block = _render_md_line(
+                    line, resp_color, in_code_block
+                )
+                if rendered is None:
+                    table_buf.append(line)
+                else:
+                    if table_buf:
+                        for t_line in _render_table(table_buf, resp_color):
+                            print(t_line, flush=True)
+                        table_buf = []
+                    if rendered:
+                        print(rendered, flush=True)
+                    else:
+                        print(flush=True)
+            if line_buf:
+                rendered, in_code_block = _render_md_line(
+                    line_buf, resp_color, in_code_block
+                )
+                if rendered:
+                    print(rendered, flush=True)
+                else:
+                    print(flush=True)
+
+    return (
+        "".join(content_parts),
+        "".join(reasoning_parts),
+        tool_calls,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        cost,
+        interrupted,
+    )
 
 
 def parse_stream(resp, resp_color="95"):
@@ -7470,7 +7697,10 @@ def main():
                         print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
                         if prov != old_prov:
                             print(f"{C.YELLOW}model reset to default{C.RESET}")
-                            cfg["model"] = default_cfg()["model"]
+                            if prov == "kilo-free":
+                                cfg["model"] = "kilo-auto/free"
+                            else:
+                                cfg["model"] = default_cfg()["model"]
                             save_cfg(cfg)
                     else:
                         names = ", ".join(PROVIDERS.keys())
@@ -7494,7 +7724,10 @@ def main():
                             print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
                             if selected != old_prov:
                                 print(f"{C.YELLOW}model reset to default{C.RESET}")
-                                cfg["model"] = default_cfg()["model"]
+                                if selected == "kilo-free":
+                                    cfg["model"] = "kilo-auto/free"
+                                else:
+                                    cfg["model"] = default_cfg()["model"]
                                 save_cfg(cfg)
                     elif selected == cfg.get("provider"):
                         pass
@@ -8194,10 +8427,15 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
-                if cfg.get("provider") == "anthropic":
-                    result = chat_completion_anthropic(
-                        messages, cfg, stream=True, tools=tools
-                    )
+                if cfg.get("provider") in ("anthropic", "kilo-free"):
+                    if cfg.get("provider") == "anthropic":
+                        result = chat_completion_anthropic(
+                            messages, cfg, stream=True, tools=tools
+                        )
+                    else:
+                        result = chat_completion_kilo_free(
+                            messages, cfg, stream=True, tools=tools
+                        )
                 else:
                     result = chat_completion(messages, cfg, stream=True, tools=tools)
                 if "error" not in result:
@@ -8262,6 +8500,8 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
             content, reasoning_content, tool_calls, pt, ct, _tot, _cost, interrupted = (
                 parse_stream_anthropic(result["stream"], resp_color=cfg.get("resp_color", "95"))
                 if cfg.get("provider") == "anthropic"
+                else parse_stream_kilo_free(result["stream"], resp_color=cfg.get("resp_color", "95"))
+                if cfg.get("provider") == "kilo-free"
                 else parse_stream(
                     result["stream"], resp_color=cfg.get("resp_color", "95")
                 )
