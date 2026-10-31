@@ -4251,6 +4251,7 @@ def default_cfg():
         "mcp_servers": [],
         "mcp_enabled": True,
         "task_timeout": 900,
+        "stream": True,
     }
 
 
@@ -4711,6 +4712,7 @@ def chat_completion_kilo_free(messages, cfg, stream=True, tools=None):
     payload = {
         "model": cfg["model"],
         "messages": messages,
+        "stream": stream,
     }
 
     headers = {
@@ -5406,7 +5408,7 @@ def _render_md_line(line, resp_color, in_code_block):
 
 
 def parse_stream_kilo_free(resp, resp_color="95"):
-    """Parse Kilo Free non-streaming JSON response (OpenAI-like)."""
+    """Parse Kilo Free streaming SSE response (OpenAI-like)."""
     content_parts = []
     reasoning_parts = []
     tool_calls = {}
@@ -5416,63 +5418,129 @@ def parse_stream_kilo_free(resp, resp_color="95"):
     total_tokens = 0
     cost = 0
     interrupted = False
+    _color_printed = False
+    line_buf = ""
+    in_code_block = False
+    table_buf = []
+
+    sock = None
+    try:
+        conn = getattr(resp.raw, "connection", None)
+        sock = getattr(conn, "sock", None) if conn else None
+    except Exception:
+        pass
 
     try:
-        data = resp.json()
+        iterator = resp.iter_lines()
     except Exception:
         return None, None, None, 0, 0, 0, 0, True
 
-    usage = data.get("usage") or {}
-    pt = usage.get("prompt_tokens", 0)
-    ct = usage.get("completion_tokens", 0)
-    tt = usage.get("total_tokens", 0)
-    c = usage.get("cost", 0)
-    if pt:
-        prompt_tokens = pt
-    if ct:
-        completion_tokens = ct
-    if tt:
-        total_tokens = tt
-    if c:
-        cost = c
-
-    choices = data.get("choices", [])
-    if choices:
-        message = choices[0].get("message", {})
-        c_text = message.get("content")
-        if c_text:
-            content_parts.append(c_text)
-            token_count += 1
-            # Render the content line-by-line like the stream parser
-            line_buf = c_text
-            in_code_block = False
-            table_buf = []
-            while '\n' in line_buf:
-                idx = line_buf.index('\n')
-                line = line_buf[:idx]
-                line_buf = line_buf[idx + 1:]
-                rendered, in_code_block = _render_md_line(
-                    line, resp_color, in_code_block
-                )
-                if rendered is None:
-                    table_buf.append(line)
-                else:
-                    if table_buf:
-                        for t_line in _render_table(table_buf, resp_color):
-                            print(t_line, flush=True)
-                        table_buf = []
-                    if rendered:
-                        print(rendered, flush=True)
+    received = False
+    try:
+        for raw in iterator:
+            if not raw:
+                continue
+            if not received:
+                received = True
+                if sock:
+                    try:
+                        sock.settimeout(3.0)
+                    except Exception:
+                        sock = None
+            try:
+                raw = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+            if not raw.startswith("data: "):
+                continue
+            chunk = raw[6:].strip()
+            if chunk == "[DONE]":
+                try:
+                    resp.raw.drain_conn()
+                except Exception:
+                    pass
+                break
+            try:
+                data = json.loads(chunk)
+            except Exception:
+                continue
+            usage = data.get("usage") or {}
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            tt = usage.get("total_tokens", 0)
+            c = usage.get("cost", 0)
+            if pt:
+                prompt_tokens = pt
+            if ct:
+                completion_tokens = ct
+            if tt:
+                total_tokens = tt
+            if c:
+                cost = c
+            choices = data.get("choices", [])
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            rc = delta.get("reasoning_content")
+            if rc:
+                reasoning_parts.append(rc)
+            c_text = delta.get("content")
+            if c_text:
+                content_parts.append(c_text)
+                token_count += 1
+                if not _color_printed:
+                    _color_printed = True
+                line_buf += c_text
+                while '\n' in line_buf:
+                    idx = line_buf.index('\n')
+                    line = line_buf[:idx]
+                    line_buf = line_buf[idx + 1:]
+                    rendered, in_code_block = _render_md_line(
+                        line, resp_color, in_code_block
+                    )
+                    if rendered is None:
+                        table_buf.append(line)
                     else:
-                        print(flush=True)
-            if line_buf:
-                rendered, in_code_block = _render_md_line(
-                    line_buf, resp_color, in_code_block
-                )
+                        if table_buf:
+                            for t_line in _render_table(table_buf, resp_color):
+                                print(t_line, flush=True)
+                            table_buf = []
+                        if rendered:
+                            print(rendered, flush=True)
+                        else:
+                            print(flush=True)
+                if _log_fh is not None:
+                    try:
+                        _log_fh.write(c_text)
+                        _log_fh.flush()
+                    except Exception:
+                        pass
+    except Exception:
+        return None, None, None, 0, 0, 0, 0, True
+
+    if _color_printed and not interrupted:
+        # Flush remaining partial line in buffer
+        if line_buf:
+            rendered, in_code_block = _render_md_line(
+                line_buf, resp_color, in_code_block
+            )
+            if rendered is None:
+                table_buf.append(line_buf)
+            else:
+                if table_buf:
+                    for t_line in _render_table(table_buf, resp_color):
+                        print(t_line, flush=True)
+                    table_buf = []
                 if rendered:
                     print(rendered, flush=True)
                 else:
                     print(flush=True)
+        # Flush any table that ends exactly at the last line
+        if table_buf:
+            for t_line in _render_table(table_buf, resp_color):
+                print(t_line, flush=True)
+            table_buf = []
+        print(C.RESET, end="", flush=True)
 
     return (
         "".join(content_parts),
@@ -8427,17 +8495,18 @@ def send_conversation(messages, cfg, pop_on_first_error=False):
         round_n += 1
         try:
             for attempt in range(max_retries + 1):
+                stream = cfg.get("stream", True)
                 if cfg.get("provider") in ("anthropic", "kilo-free"):
                     if cfg.get("provider") == "anthropic":
                         result = chat_completion_anthropic(
-                            messages, cfg, stream=True, tools=tools
+                            messages, cfg, stream=stream, tools=tools
                         )
                     else:
                         result = chat_completion_kilo_free(
-                            messages, cfg, stream=True, tools=tools
+                            messages, cfg, stream=stream, tools=tools
                         )
                 else:
-                    result = chat_completion(messages, cfg, stream=True, tools=tools)
+                    result = chat_completion(messages, cfg, stream=stream, tools=tools)
                 if "error" not in result:
                     break
                 err_kind = result.get("error")
