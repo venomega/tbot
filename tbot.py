@@ -4687,6 +4687,8 @@ def chat_completion_kilo_free(messages, cfg, stream=True, tools=None):
         "messages": messages,
         "stream": stream,
     }
+    if tools:
+        payload["tools"] = tools
 
     headers = {
         "Content-Type": "application/json",
@@ -5488,6 +5490,23 @@ def parse_stream_kilo_free(resp, resp_color="95"):
                         _log_fh.flush()
                     except Exception:
                         pass
+            for tc in (delta.get("tool_calls") or []):
+                idx = tc.get("index", 0)
+                if idx not in tool_calls:
+                    tool_calls[idx] = {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    }
+                entry = tool_calls[idx]
+                if "id" in tc:
+                    entry["id"] = tc["id"]
+                if "function" in tc:
+                    fn = tc["function"]
+                    if "name" in fn:
+                        entry["function"]["name"] += fn["name"]
+                    if "arguments" in fn:
+                        entry["function"]["arguments"] += fn["arguments"]
     except Exception:
         return None, None, None, 0, 0, 0, 0, True
 
