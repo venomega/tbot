@@ -5952,6 +5952,7 @@ def execute_tool_calls(tool_calls, messages, cfg):
                 if ans == "q":
                     return False
                 ok = ans in ("", "y", "yes")
+            tool_errored = False
             if ok:
                 before = len(messages)
                 try:
@@ -5959,16 +5960,23 @@ def execute_tool_calls(tool_calls, messages, cfg):
                 except KeyboardInterrupt:
                     print(f"\n  {C.YELLOW}cancelled{C.RESET}")
                     return False
-                after = len(messages)
-                for _ in range(after - before):
-                    pending_system.append(messages.pop())
-                if len(result) > MAX_TOOL_OUTPUT:
-                    result = (
-                        result[:MAX_TOOL_OUTPUT]
-                        + f"\n... (truncated, {len(result)} total chars)"
-                    )
+                except Exception as e:
+                    print(f"\n  {C.RED}Error: {e}{C.RESET}")
+                    result = f"Error: {e}"
+                    ok = False
+                    tool_errored = True
+                if ok:
+                    after = len(messages)
+                    for _ in range(after - before):
+                        pending_system.append(messages.pop())
+                    if len(result) > MAX_TOOL_OUTPUT:
+                        result = (
+                            result[:MAX_TOOL_OUTPUT]
+                            + f"\n... (truncated, {len(result)} total chars)"
+                        )
             else:
-                result = "TOOL_CALL_DECLINED"
+                if not tool_errored:
+                    result = "TOOL_CALL_DECLINED"
 
             if name == "edit" and ok:
                 _emit_edit_diff()
