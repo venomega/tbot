@@ -4281,23 +4281,12 @@ def save_cfg(cfg):
 
 def resolve_key(cfg):
     provider = cfg.get("provider", "openrouter")
-    # kilo-free works without an API key (free tier). Make the key optional.
-    optional_key = provider == "kilo-free"
+    # kilo-free works without an API key (free tier): the key is optional and
+    # is never requested here. Prompting only happens in /provider setup.
+    if provider == "kilo-free":
+        return cfg.get("api_key", "") or ""
     if provider == "custom":
-        key = cfg.get("api_key")
-        if not key:
-            print(f"{C.YELLOW}No API key configured for Custom API.{C.RESET}")
-            try:
-                key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                sys.exit(1)
-            if not key:
-                print(f"{C.RED}No key provided.{C.RESET}")
-                sys.exit(1)
-            cfg["api_key"] = key
-            save_cfg(cfg)
-        return key or ""
+        return cfg.get("api_key") or ""
     info = PROVIDERS.get(provider, PROVIDERS["openrouter"])
     env_key = info["env_key"]
     key = cfg.get("api_key") or os.environ.get(env_key)
@@ -4306,25 +4295,9 @@ def resolve_key(cfg):
             cfg["api_key"] = key
             save_cfg(cfg)
         return key
-    print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
-    if optional_key:
-        print(f"(Leave blank to use the free tier without an API key.)")
-    print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
-    try:
-        key = input(f"{C.GREEN}Enter API key: {C.RESET}").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        sys.exit(1)
-    if not key:
-        if optional_key:
-            cfg["api_key"] = ""
-            save_cfg(cfg)
-            return ""
-        print(f"{C.RED}No key provided.{C.RESET}")
-        sys.exit(1)
-    cfg["api_key"] = key
-    save_cfg(cfg)
-    return key
+    # No key configured. Do not prompt here; prompting only happens in /provider.
+    # An empty key results in a "no_api_key" error at request time.
+    return ""
 
 
 def show_error(title, detail, hint=""):
@@ -7768,6 +7741,20 @@ def main():
                         save_cfg(cfg)
                         cfg["api_key"] = resolve_key(cfg)
                         save_cfg(cfg)
+                        if prov != "kilo-free" and not cfg.get("api_key"):
+                            info = PROVIDERS[prov]
+                            env_key = info.get("env_key")
+                            print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
+                            if env_key:
+                                print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
+                            try:
+                                key = input(f"{C.GREEN}Enter API key for {prov}: {C.RESET}").strip()
+                            except (EOFError, KeyboardInterrupt):
+                                print()
+                                key = ""
+                            if key:
+                                cfg["api_key"] = key
+                                save_cfg(cfg)
                         _save_models_cache([])
                         info = PROVIDERS[prov]
                         print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
@@ -7795,6 +7782,20 @@ def main():
                             save_cfg(cfg)
                             cfg["api_key"] = resolve_key(cfg)
                             save_cfg(cfg)
+                            if selected != "kilo-free" and not cfg.get("api_key"):
+                                info = PROVIDERS[selected]
+                                env_key = info.get("env_key")
+                                print(f"{C.YELLOW}No API key configured for {info['name']}.{C.RESET}")
+                                if env_key:
+                                    print(f"Set {C.CYAN}{env_key}{C.RESET} environment variable or enter it now.")
+                                try:
+                                    key = input(f"{C.GREEN}Enter API key for {selected}: {C.RESET}").strip()
+                                except (EOFError, KeyboardInterrupt):
+                                    print()
+                                    key = ""
+                                if key:
+                                    cfg["api_key"] = key
+                                    save_cfg(cfg)
                             _save_models_cache([])
                             info = PROVIDERS[selected]
                             print(f"{C.GREEN}provider → {info['name']}{C.RESET}")
