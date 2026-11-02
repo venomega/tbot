@@ -54,7 +54,7 @@ _kilo_free_request_times = []
 def _enforce_kilo_free_rate_limit():
     """Limit kilo-free provider to 3 requests per minute."""
     now = time.time()
-    _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 60]
+    _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 54]
     if len(_kilo_free_request_times) >= 3:
         oldest = _kilo_free_request_times[0]
         wait = 60.0 - (now - oldest)
@@ -62,7 +62,7 @@ def _enforce_kilo_free_rate_limit():
             print(f"\n{C.YELLOW}  Kilo Free rate limit: 3 requests/minute. Waiting {wait:.0f}s...{C.RESET}", file=sys.stderr)
             time.sleep(wait)
             now = time.time()
-            _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 60]
+            _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 54]
     _kilo_free_request_times.append(time.time())
 
 
