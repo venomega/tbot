@@ -47,6 +47,24 @@ _total_tokens = 0
 _last_cost = 0
 _acc_cost = 0
 
+# ── Kilo Free rate limit (3 requests per minute) ─────────────────
+_kilo_free_request_times = []
+
+
+def _enforce_kilo_free_rate_limit():
+    """Limit kilo-free provider to 3 requests per minute."""
+    now = time.time()
+    _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 60]
+    if len(_kilo_free_request_times) >= 3:
+        oldest = _kilo_free_request_times[0]
+        wait = 60.0 - (now - oldest)
+        if wait > 0:
+            print(f"\n{C.YELLOW}  Kilo Free rate limit: 3 requests/minute. Waiting {wait:.0f}s...{C.RESET}", file=sys.stderr)
+            time.sleep(wait)
+            now = time.time()
+            _kilo_free_request_times[:] = [t for t in _kilo_free_request_times if now - t < 60]
+    _kilo_free_request_times.append(time.time())
+
 
 def _format_cost(cost):
     if not cost:
@@ -4670,6 +4688,7 @@ def chat_completion_anthropic(messages, cfg, stream=True, tools=None):
 def chat_completion_kilo_free(messages, cfg, stream=True, tools=None):
     """Call Kilo Free API (OpenAI-like /chat/completions, minimal payload).
     API key is optional — the endpoint works without one."""
+    _enforce_kilo_free_rate_limit()
     api_key = cfg.get("api_key")  # optional
 
     base_url = _provider_url(cfg)
@@ -5537,7 +5556,7 @@ def parse_stream_kilo_free(resp, resp_color="95"):
     return (
         "".join(content_parts),
         "".join(reasoning_parts),
-        tool_calls,
+        list(tool_calls.values()) if tool_calls else None,
         prompt_tokens,
         completion_tokens,
         total_tokens,
