@@ -4088,26 +4088,93 @@ def _install_skill_from_url(url):
 
 
 def skills_to_tools(skills):
-    tools = []
-    for n, d, s, *_ in skills:
-        desc = f"[ONE-TIME] Load instructions for '{n}' skill. Call ONCE, then follow the instructions — do NOT call again. {d}"
-        params = dict(s)
-        if "required" in params and not params["required"]:
-            del params["required"]
-        tools.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": f"skill_{n}",
-                    "description": desc[:500],
-                    "parameters": params,
+    """Return only two skill router tools: discover + load.
+
+    Instead of exposing one function per skill (which explodes token count
+    with hundreds of skills), we expose a discovery tool that returns a
+    shortlist of matching skills by name/short description, and a load tool
+    that injects the full SKILL.md content of a chosen skill into context.
+    """
+    names = ", ".join(n for n, *_ in skills) if skills else "none"
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "skill_discover",
+                "description": "Search installed skills by keyword. Returns a shortlist of skill names and their short descriptions. Use this to find which skill is relevant to the current task before loading it.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "Keywords describing what you need (e.g. 'deploy railway', 'docker cleanup', 'git ops').",
+                        },
+                        "top_k": {
+                            "type": "integer",
+                            "description": "Maximum number of results to return (default 5, max 20).",
+                            "default": 5,
+                            "minimum": 1,
+                            "maximum": 20,
+                        },
+                    },
+                    "required": ["query"],
                 },
-            }
-        )
-    return tools
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "skill_load",
+                "description": "Load the full instructions of a skill into context. Call this after skill_discover identified the skill you need. Pass the exact skill name.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Exact name of the skill to load (as returned by skill_discover).",
+                        },
+                    },
+                    "required": ["name"],
+                },
+            },
+        },
+    ]
 
 
-def skill_tool_handler(name, args, messages=None):
+def _skill_discover_handler(args, messages=None):
+    """Search installed skills by name or short description.
+
+    Only reads the cached frontmatter metadata (name + description), never
+    the full SKILL.md content, so it stays cheap even with hundreds of skills.
+    """
+    query = args.get("query", "")
+    top_k = min(max(int(args.get("top_k", 5)), 1), 20)
+    if not query:
+        return "No query provided. Pass keywords to search for relevant skills."
+
+    skills = load_skills()
+    q = query.lower()
+    matches = []
+    for n, desc, schema, doc, entry_name in skills:
+        haystack = f"{n} {desc or ''}".lower()
+        if q in haystack:
+            matches.append({"name": n, "description": desc or ""})
+    if not matches:
+        return f"No skills matched query '{query}'. Try different keywords."
+
+    results = matches[:top_k]
+    lines = [f"Skills matching '{query}' ({len(results)} of {len(matches)}):"]
+    for m in results:
+        lines.append(f"  - {m['name']}: {m['description']}")
+    return "\n".join(lines)
+
+
+def _skill_load_handler(args, messages=None):
+    """Load the full SKILL.md content of a single skill into context."""
+    name = args.get("name", "")
+    if not name:
+        return "No skill name provided."
+
     for n, desc, schema, doc, entry_name in load_skills():
         if n == name:
             if messages is not None:
@@ -4134,10 +4201,8 @@ def skill_tool_handler(name, args, messages=None):
                         "content": f"## Skill: {name}\n\n{doc}{siblings_info}",
                     }
                 )
-                # Return the skill doc as the tool result so the model actually sees
-                # the instructions in this turn (not just in a system message).
                 return f"## Skill: {name}\n\n{doc}{siblings_info}"
-            return f"Skill '{name}' found. Use `skill_{name}` to load instructions."
+            return f"Skill '{name}' found. Use skill_load to load instructions."
     return f"Skill '{name}' not found"
 
 
@@ -5767,7 +5832,11 @@ def _resolve_handler(name, messages=None):
     into the conversation (used in sequential/trusted mode).
     """
     handler = TOOL_HANDLERS.get(name)
-    if not handler and name.startswith("skill_"):
+    if name == "skill_discover":
+        handler = lambda a, _msgs=messages: _skill_discover_handler(a, _msgs)
+    elif name == "skill_load":
+        handler = lambda a, _msgs=messages: _skill_load_handler(a, _msgs)
+    elif not handler and name.startswith("skill_") and name not in ("skill_discover", "skill_load"):
         skill_name = name[6:]
         if messages is not None:
             handler = lambda a, _n=skill_name, _msgs=messages: skill_tool_handler(_n, a, _msgs)
@@ -7457,10 +7526,13 @@ Date: {date}  |  Model: {model}  |  Provider: {provider}  |  Trust mode: {trust_
 CWD: {cwd}  |  OS: {os}
 Skills: {skills_dir}
 
-Skills are loaded in two steps:
-  1. `skill(name)` — checks if a skill exists (returns the loader function name)
-  2. `skill_<name>()` — actually loads the skill's instructions into your context
-Call `skill_<name>()` directly if you know the skill exists. Available skills: {skills_list}
+Skills are loaded on demand through two tools:
+  1. `skill_discover("<query>")` — search installed skills by keyword. Returns a shortlist of skill names and short descriptions.
+  2. `skill_load("<name>")` — load the full instructions of a chosen skill into context.
+
+Installed skills (names only, comma-separated): {skills_list}
+
+Before using a skill, run `skill_discover` to find which one fits your task, then `skill_load` to inject its instructions.
 
 # MCP (Model Context Protocol)
 External tools from MCP servers are available with the prefix `mcp__<server>__<tool>`.
