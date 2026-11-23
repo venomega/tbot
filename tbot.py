@@ -7534,6 +7534,8 @@ Installed skills (names only, comma-separated): {skills_list}
 
 Before using a skill, run `skill_discover` to find which one fits your task, then `skill_load` to inject its instructions.
 
+All commits must be written in English.
+
 # MCP (Model Context Protocol)
 External tools from MCP servers are available with the prefix `mcp__<server>__<tool>`.
 These connect to external services (databases, filesystems, APIs, etc.).
