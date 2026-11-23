@@ -84,6 +84,7 @@ SKILLS_DIR = CONFIG_DIR / "skills"
 SYSTEM_PROMPT_FILE = CONFIG_DIR / "system_prompt.txt"
 LOG_DIR = CONFIG_DIR / "log"
 PRESETS_DIR = CONFIG_DIR / "presets"
+SESSIONS_DIR = CONFIG_DIR / "session"
 PROVIDERS = {
     "openrouter": {
         "name": "OpenRouter",
@@ -6280,9 +6281,16 @@ def _completer(text, state):
         matches = [s for s in suggestions if s.startswith(prefix)]
         return matches[state] if state < len(matches) else None
 
-    # ── /session [filter] ──
+    # ── /session [save|load|rm|ls|show|<name>] ──
     if cmd == "session" and args:
-        sessions = sorted([f.name for f in LOG_DIR.glob("*.log") if f.is_file()])
+        sub = arg.split(maxsplit=1)
+        sub_cmd = sub[0].lower() if sub else ""
+        sub_arg = sub[1] if len(sub) > 1 else ""
+        if sub_cmd in ("save", "load", "rm", "show", "ls"):
+            sessions = sorted([f.stem for f in SESSIONS_DIR.glob("*.json") if f.is_file()])
+            matches = [s + " " for s in sessions if s.startswith(sub_arg)]
+            return matches[state] if state < len(matches) else None
+        sessions = sorted([f.stem for f in SESSIONS_DIR.glob("*.json") if f.is_file()])
         matches = [s + " " for s in sessions if s.startswith(prefix)]
         return matches[state] if state < len(matches) else None
 
@@ -6958,13 +6966,198 @@ def preset_selector():
         sys.stdout.flush()
 
 
+# ── Sessions ──────────────────────────────────────────────
+
+
+def _sessions_dir():
+    SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    return SESSIONS_DIR
+
+
+def list_sessions():
+    _sessions_dir()
+    sessions = []
+    for f in sorted(SESSIONS_DIR.iterdir(), key=lambda f: f.stat().st_mtime, reverse=True):
+        if f.suffix == ".json" and f.is_file():
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                sessions.append({
+                    "name": f.stem,
+                    "path": f,
+                    "data": data,
+                    "mtime": f.stat().st_mtime,
+                })
+            except (json.JSONDecodeError, OSError):
+                pass
+    return sessions
+
+
+def save_session(name, messages, cfg):
+    """Save current conversation (messages + config) as a named session."""
+    _sessions_dir()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    data = {
+        "name": name,
+        "model": cfg.get("model", "?"),
+        "provider": cfg.get("provider", "?"),
+        "created_at": now,
+        "updated_at": now,
+        "messages": messages,
+    }
+    path = SESSIONS_DIR / f"{name}.json"
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    return path
+
+
+def load_session(name):
+    """Load a named session's messages. Returns messages list or None."""
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data.get("messages", [])
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def delete_session(name):
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        return False, f"session '{name}' not found"
+    path.unlink()
+    return True, f"session '{name}' removed"
+
+
+def _render_session_selector(sessions, idx):
+    w = _term_width()
+    buf = [
+        f"{C.BOLD}{C.CYAN}session{C.RESET}  {C.GRAY}({len(sessions)} sessions){C.RESET}\r\n"
+    ]
+    buf.append(f"{C.GRAY}{'─' * (w - 2)}{C.RESET}\r\n")
+    if not sessions:
+        buf.append(f"{C.GRAY}no sessions — use /session save <name>{C.RESET}\r\n")
+    else:
+        start = max(0, idx - 5)
+        end = min(len(sessions), start + 12)
+        for i in range(start, end):
+            s = sessions[i]
+            pre = f"{C.CYAN}▸{C.RESET} " if i == idx else "  "
+            model = s["data"].get("model", "?")
+            prov = s["data"].get("provider", "?")
+            n_msgs = len(s["data"].get("messages", []))
+            updated = s["data"].get("updated_at", "")
+            buf.append(
+                f"{pre}{s['name']:<24} {C.YELLOW}{prov:<12}{C.RESET} {C.GREEN}{model}{C.RESET}  "
+                f"{C.GRAY}msgs={n_msgs} updated={updated}{C.RESET}\r\n"
+            )
+    buf.append(f"\r\n{C.GRAY}↑/↓ nav  ↵ resume  Ctrl+C exit{C.RESET}")
+    return "".join(buf)
+
+
+def session_selector():
+    try:
+        import termios, tty
+    except ImportError:
+        print(f"\r{C.RED}error: session selector requires a Unix terminal (termios not available){C.RESET}")
+        return None
+
+    sessions = list_sessions()
+    if not sessions:
+        return None
+    idx = 0
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        termios.tcflush(fd, termios.TCIFLUSH)
+    except (OSError, termios.error):
+        pass
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\033[?25l")
+        while True:
+            sys.stdout.write("\033[H\033[J")
+            sys.stdout.write(_render_session_selector(sessions, idx))
+            sys.stdout.flush()
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":
+                _read_esc(fd)
+            elif ch in ("\r", "\n"):
+                if sessions and idx < len(sessions):
+                    return sessions[idx]["name"]
+                return None
+            elif ch == "\x03":
+                return None
+            elif ch == "\x0e":
+                idx = min(len(sessions) - 1, idx + 1) if sessions else 0
+            elif ch == "\x10":
+                idx = max(0, idx - 1)
+    finally:
+        sys.stdout.write("\033[?25h")
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        sys.stdout.write("\033[H\033[J")
+        sys.stdout.flush()
+
+
+def display_session(name):
+    """Print a named session's full history to screen."""
+    path = SESSIONS_DIR / f"{name}.json"
+    if not path.exists():
+        print(f"{C.RED}session '{name}' not found{C.RESET}")
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"{C.RED}cannot read session: {e}{C.RESET}")
+        return False
+
+    messages = data.get("messages", [])
+    model = data.get("model", "?")
+    provider = data.get("provider", "?")
+    created = data.get("created_at", "")
+    updated = data.get("updated_at", "")
+
+    print(f"\n{C.CYAN}── session: {name} ──{C.RESET}")
+    print(f"{C.GRAY}model: {model}  provider: {provider}  created: {created}  updated: {updated}{C.RESET}")
+    print(f"{C.GRAY}messages: {len(messages)}{C.RESET}")
+    print(f"{C.GRAY}{'─' * 60}{C.RESET}")
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        tool = m.get("tool_name")
+        tool_call_id = m.get("tool_call_id")
+        role_label = role.upper()
+        if tool:
+            role_label += f"[{tool}]"
+        if tool_call_id:
+            role_label += f"[{tool_call_id[:8]}]"
+        color = C.GREEN if role == "user" else (C.BLUE if role == "assistant" else (C.YELLOW if role == "tool" else C.GRAY))
+        print(f"\n{color}▶ {role_label}{C.RESET}")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        print(part.get("text", ""))
+                    elif part.get("type") == "image_url":
+                        url = part.get("image_url", {}).get("url", "")
+                        print(f"[image: {url[:100]}]")
+                else:
+                    print(str(part))
+        else:
+            print(content)
+    print(f"{C.GRAY}{'─' * 60}{C.RESET}")
+    return True
+
+
 def print_help():
     print(f"{C.CYAN}Commands:{C.RESET}")
     print(f"  /help              This help")
     print(f"  /new               Reset conversation")
     print(f"  /model [name]      Show or switch model")
     print(f"  /preset [sub]      Save/load/rm/ls/show presets (provider+model pairs)")
-    print(f"  /session           Search and load session logs")
+    print(f"  /session           Manage named sessions (save/load/rm/ls/show)")
+    print(f"  /session save <n>  Save current conversation as session <n>")
+    print(f"  /session load <n>  Resume session <n> (imports full history)")
     print(f"  /provider [name]   Show or switch provider")
     print(f"  /temp [n]          Show or set temperature")
     print(f"  /sys [prompt]      Show or set system prompt")
@@ -7660,20 +7853,64 @@ def main():
                     else:
                         print(f"{C.YELLOW}cancelled{C.RESET}")
             elif cmd == "session":
-                selected = session_selector()
-                if selected:
-                    try:
-                        text = Path(selected["full_path"]).read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                    except Exception as e:
-                        print(f"{C.RED}cannot read log: {e}{C.RESET}")
-                        continue
-                    print(
-                        f"\n{C.CYAN}── {selected['path']} ({len(text)} chars) ──{C.RESET}"
-                    )
-                    print(text.rstrip())
-                    messages.append({"role": "user", "content": text.rstrip()})
+                sub = arg.split(maxsplit=1) if arg else []
+                sub_cmd = sub[0].lower() if sub else ""
+                sub_arg = sub[1] if len(sub) > 1 else ""
+                if not sub_cmd:
+                    selected = session_selector()
+                    if selected:
+                        messages = load_session(selected)
+                        if messages is None:
+                            print(f"{C.RED}session '{selected}' not found or empty{C.RESET}")
+                        else:
+                            display_session(selected)
+                            print(f"\n{C.GREEN}resumed session '{selected}' — continue typing{C.RESET}")
+                elif sub_cmd == "save":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /session save <name>{C.RESET}")
+                    else:
+                        path = save_session(sub_arg, messages, cfg)
+                        print(f"{C.GREEN}session '{sub_arg}' saved ({len(messages)} messages){C.RESET}")
+                elif sub_cmd == "load":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /session load <name>{C.RESET}")
+                    else:
+                        loaded = load_session(sub_arg)
+                        if loaded is None:
+                            print(f"{C.RED}session '{sub_arg}' not found or empty{C.RESET}")
+                        else:
+                            messages = loaded
+                            display_session(sub_arg)
+                            print(f"\n{C.GREEN}loaded session '{sub_arg}' — continue typing{C.RESET}")
+                elif sub_cmd == "rm":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /session rm <name>{C.RESET}")
+                    else:
+                        ok, msg = delete_session(sub_arg)
+                        print(f"{C.GREEN if ok else C.RED}{msg}{C.RESET}")
+                elif sub_cmd == "ls":
+                    sessions = list_sessions()
+                    if not sessions:
+                        print(f"{C.YELLOW}no sessions — use /session save <name>{C.RESET}")
+                    else:
+                        print(f"{C.CYAN}sessions ({len(sessions)}):{C.RESET}")
+                        for s in sessions:
+                            model = s["data"].get("model", "?")
+                            prov = s["data"].get("provider", "?")
+                            n_msgs = len(s["data"].get("messages", []))
+                            updated = s["data"].get("updated_at", "")
+                            print(
+                                f"  {C.GREEN}{s['name']:<24}{C.RESET} "
+                                f"{C.YELLOW}{prov:<12}{C.RESET} {C.CYAN}{model}{C.RESET}  "
+                                f"{C.GRAY}msgs={n_msgs} updated={updated}{C.RESET}"
+                            )
+                elif sub_cmd == "show":
+                    if not sub_arg:
+                        print(f"{C.YELLOW}usage: /session show <name>{C.RESET}")
+                    else:
+                        display_session(sub_arg)
+                else:
+                    print(f"{C.YELLOW}usage: /session [save|load|rm|ls|show] <name>{C.RESET}")
             elif cmd == "preset":
                 sub = arg.split(maxsplit=1) if arg else []
                 sub_cmd = sub[0].lower() if sub else ""
